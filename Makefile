@@ -1,4 +1,4 @@
-# PireteDocker / deploy workspace — build, install artifacts, test.
+# PireteServer / deploy workspace — build, install artifacts, test.
 # Usage: `make` or `make help`
 
 .PHONY: help all build build-release check test test-unit test-e2e clippy fmt clean \
@@ -21,7 +21,7 @@ INSTALL_BIN ?= $(PREFIX)/bin
 .DEFAULT_GOAL := help
 
 help:
-	@echo "PireteDocker — Makefile targets"
+	@echo "PireteServer — Makefile targets"
 	@echo ""
 	@echo "Rust workspace (debug):"
 	@echo "  make build          - cargo build --workspace (dev, local PC)"

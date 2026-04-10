@@ -1,4 +1,4 @@
-# PireteDocker / deploy workspace
+# PireteServer / deploy workspace
 
 Монорепозиторий: **серверный стек** (приём артефактов по gRPC, HTTP control plane, PostgreSQL, дашборд) и **локальные инструменты** (CLI `client`, заготовка `local-agent`).
 
