@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "proto",
+    "server-stack/server",
+    "server-stack/control-api",
+    "server-stack/deploy-control",
+    "server-stack/deploy-db",
+    "server-stack/deploy-core",
+    "local-stack/client",
+    "local-stack/local-agent",
+    "local-stack/desktop-client",
+]

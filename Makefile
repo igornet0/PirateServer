@@ -1,0 +1,193 @@
+# PireteDocker / deploy workspace — build, install artifacts, test.
+# Usage: `make` or `make help`
+
+.PHONY: help all build build-release check test test-unit test-e2e clippy fmt clean \
+	client client-release server server-release control-api control-api-release \
+	local-agent local-agent-release \
+	rust rust-release frontend frontend-install ui \
+	desktop-ui pirate-desktop pirate-desktop-release \
+	build-local build-stack-release dist dist-linux install install-release \
+	bootstrap bootstrap-phase6 e2e local-e2e
+
+CARGO       ?= cargo
+NPM         ?= npm
+# Optional cross-compile: `make client-release TARGET=x86_64-unknown-linux-gnu`
+TARGET      ?=
+CARGO_TARGET = $(if $(strip $(TARGET)),--target $(TARGET),)
+
+PREFIX      ?= $(CURDIR)/dist
+INSTALL_BIN ?= $(PREFIX)/bin
+
+.DEFAULT_GOAL := help
+
+help:
+	@echo "PireteDocker — Makefile targets"
+	@echo ""
+	@echo "Rust workspace (debug):"
+	@echo "  make build          - cargo build --workspace (dev, local PC)"
+	@echo "  make check          - cargo check --workspace"
+	@echo "  make rust           - same as build"
+	@echo ""
+	@echo "Rust release (server / production binaries):"
+	@echo "  make build-release  - release all crates"
+	@echo "  make rust-release   - same"
+	@echo "  make server-release - deploy-server only (release)"
+	@echo "  make client-release - CLI 'client' only (release)"
+	@echo "  make control-api-release - control-api only (release)"
+	@echo "  make build-stack-release - server + client + control-api (release, no npm)"
+	@echo "  make dist            - full release workspace + server-stack/frontend/dist"
+	@echo "  make dist-linux      - Linux x86_64 bundle + tar.gz (scripts/build-linux-bundle.sh)"
+	@echo "  Cross-compile:  TARGET=x86_64-unknown-linux-gnu make client-release"
+	@echo ""
+	@echo "Single crates (debug):"
+	@echo "  make server | client | control-api | local-agent"
+	@echo "  make pirate-desktop - pirate-client binary (build desktop-ui first if UI missing)"
+	@echo ""
+	@echo "Frontend (dashboard):"
+	@echo "  make frontend       - npm install + vite build → server-stack/frontend/dist"
+	@echo "  make ui             - alias"
+	@echo "  make desktop-ui     - local Pirate Client SPA → local-stack/desktop-ui/dist"
+	@echo ""
+	@echo "Full local dev build:"
+	@echo "  make build-local    - Rust debug workspace + frontend"
+	@echo ""
+	@echo "Install release binaries to PREFIX/bin (default: ./dist/bin):"
+	@echo "  make install-release"
+	@echo "  PREFIX=/opt/deploy make install-release"
+	@echo ""
+	@echo "Test:"
+	@echo "  make test           - unit tests (cargo) + E2E script"
+	@echo "  make test-unit      - cargo test --workspace"
+	@echo "  make test-e2e | e2e | local-e2e - scripts/local-e2e.sh"
+	@echo ""
+	@echo "Other:"
+	@echo "  make clippy | fmt | clean"
+	@echo "  make bootstrap-phase6 - scripts/bootstrap-phase6.sh (hints + build)"
+	@echo ""
+
+# --- Full workspace ---
+
+all: build
+
+build: rust
+rust:
+	$(CARGO) build --workspace $(CARGO_TARGET)
+
+build-release: rust-release
+rust-release:
+	$(CARGO) build --workspace --release $(CARGO_TARGET)
+
+check:
+	$(CARGO) check --workspace $(CARGO_TARGET)
+
+# --- Per-crate (debug) ---
+
+server:
+	$(CARGO) build -p deploy-server $(CARGO_TARGET)
+
+client:
+	$(CARGO) build -p deploy-client --bin client $(CARGO_TARGET)
+
+control-api:
+	$(CARGO) build -p control-api $(CARGO_TARGET)
+
+local-agent:
+	$(CARGO) build -p local-agent --bin local-agent $(CARGO_TARGET)
+
+# --- Per-crate (release) ---
+
+server-release:
+	$(CARGO) build -p deploy-server --release $(CARGO_TARGET)
+
+client-release:
+	$(CARGO) build -p deploy-client --bin client --release $(CARGO_TARGET)
+
+control-api-release:
+	$(CARGO) build -p control-api --release $(CARGO_TARGET)
+
+local-agent-release:
+	$(CARGO) build -p local-agent --bin local-agent --release $(CARGO_TARGET)
+
+build-stack-release: server-release client-release control-api-release
+	@echo "Release binaries under target/$(if $(TARGET),$(TARGET)/,)release/: deploy-server, client, control-api"
+
+# --- Frontend ---
+
+frontend: ui
+ui:
+	cd server-stack/frontend && $(NPM) install && $(NPM) run build
+
+frontend-install:
+	cd server-stack/frontend && $(NPM) ci 2>/dev/null || $(NPM) install
+
+# --- Pirate Client desktop (local UI, 127.0.0.1) ---
+
+desktop-ui:
+	cd local-stack/desktop-ui && $(NPM) install && $(NPM) run build
+
+pirate-desktop:
+	$(CARGO) build -p pirate-desktop --bin pirate-client $(CARGO_TARGET)
+
+pirate-desktop-release:
+	$(CARGO) build -p pirate-desktop --bin pirate-client --release $(CARGO_TARGET)
+
+# Build static UI then debug binary (for first run).
+pirate-desktop-all: desktop-ui pirate-desktop
+
+# --- Combined ---
+
+build-local: build frontend
+
+# Release Rust workspace + dashboard static files (for nginx root).
+dist: rust-release frontend
+	@echo "Artifacts: target/.../release/* and server-stack/frontend/dist/"
+
+dist-linux:
+	@chmod +x scripts/build-linux-bundle.sh
+	./scripts/build-linux-bundle.sh
+
+# --- Install artifacts ---
+
+install-release: server-release client-release control-api-release
+	@mkdir -p $(INSTALL_BIN)
+	@cp target/$(if $(TARGET),$(TARGET)/,)release/deploy-server $(INSTALL_BIN)/
+	@cp target/$(if $(TARGET),$(TARGET)/,)release/client $(INSTALL_BIN)/
+	@cp target/$(if $(TARGET),$(TARGET)/,)release/control-api $(INSTALL_BIN)/
+	@echo "Installed to $(INSTALL_BIN)/ (deploy-server, client, control-api)"
+
+install: install-release
+
+# --- Test ---
+
+test-unit:
+	$(CARGO) test --workspace $(CARGO_TARGET) -- --nocapture
+
+test-e2e: e2e
+e2e: local-e2e
+local-e2e:
+	@chmod +x scripts/local-e2e.sh examples/test-app/build/run.sh 2>/dev/null || true
+	./scripts/local-e2e.sh
+
+test: test-unit test-e2e
+
+# --- Quality ---
+
+clippy:
+	$(CARGO) clippy --workspace --all-targets $(CARGO_TARGET)
+
+fmt:
+	$(CARGO) fmt --all
+
+# --- Bootstrap scripts ---
+
+bootstrap: bootstrap-phase6
+bootstrap-phase6:
+	@chmod +x scripts/bootstrap-phase6.sh 2>/dev/null || true
+	./scripts/bootstrap-phase6.sh
+
+# --- Clean ---
+
+clean:
+	$(CARGO) clean
+	@rm -rf server-stack/frontend/dist
+	@rm -rf local-stack/desktop-ui/dist

@@ -1,0 +1,20 @@
+[package]
+name = "deploy-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+deploy-core = { path = "../deploy-core" }
+deploy-db = { path = "../deploy-db" }
+deploy-proto = { path = "../../proto" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "process", "sync"] }
+tonic = { version = "0.12", features = ["transport"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+hex = "0.4"
+futures-util = "0.3"
+libc = "0.2"

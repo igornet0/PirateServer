@@ -1,0 +1,14 @@
+[Unit]
+Description=Deploy gRPC server (artifact deployment)
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+Environment=RUST_LOG=info
+Environment=DATABASE_URL=postgresql://deploy:deploy@[::1]:5432/deploy
+ExecStart=/usr/local/bin/deploy-server --root /deploy --port 50051
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

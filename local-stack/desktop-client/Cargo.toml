@@ -1,0 +1,22 @@
+[package]
+name = "pirate-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Local desktop HTTP server + static UI for Pirate Client (127.0.0.1 only)"
+autobins = false
+
+[[bin]]
+name = "pirate-client"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower-http = { version = "0.5", features = ["fs", "trace"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-appender = "0.2"
+dirs = "5"
+open = "5"

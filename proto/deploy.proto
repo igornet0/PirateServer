@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package deploy;
+
+// Artifact-based deployment service (gRPC only).
+service DeployService {
+  // Client streams tarball chunks; server assembles, verifies, deploys.
+  rpc Upload(stream DeployChunk) returns (DeployResponse);
+
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+}
+
+message DeployChunk {
+  bytes data = 1;
+  string version = 2;
+  bool is_last = 3;
+  // SHA-256 of the full artifact (hex, lowercase). Required when is_last = true.
+  string sha256_hex = 4;
+}
+
+message DeployResponse {
+  string status = 1;
+  string deployed_version = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string current_version = 1;
+  // running | stopped | error
+  string state = 2;
+}
+
+message RollbackRequest {
+  string version = 1;
+}
+
+message RollbackResponse {
+  string status = 1;
+  string active_version = 2;
+}

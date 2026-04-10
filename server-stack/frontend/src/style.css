@@ -1,0 +1,119 @@
+:root {
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+  color: #e8e8ec;
+  background: #12141a;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+}
+
+header {
+  margin-bottom: 1.5rem;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: #a8b0c0;
+}
+
+.muted {
+  margin: 0;
+  color: #7a8494;
+  font-size: 0.9rem;
+}
+
+section {
+  margin-bottom: 1.5rem;
+}
+
+pre {
+  margin: 0;
+  padding: 1rem;
+  background: #1a1d26;
+  border: 1px solid #2a3040;
+  border-radius: 8px;
+  overflow: auto;
+  font-size: 0.85rem;
+}
+
+.row {
+  margin-bottom: 0.75rem;
+}
+
+.row label {
+  display: block;
+  font-size: 0.8rem;
+  color: #a8b0c0;
+  margin-bottom: 0.25rem;
+}
+
+.row input[type="password"] {
+  width: 100%;
+  max-width: 32rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid #2a3040;
+  background: #1a1d26;
+  color: #e8e8ec;
+  font-family: inherit;
+  font-size: 0.9rem;
+}
+
+textarea#nginx-editor {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid #2a3040;
+  background: #1a1d26;
+  color: #e8e8ec;
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  resize: vertical;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+button {
+  padding: 0.45rem 0.9rem;
+  border-radius: 6px;
+  border: 1px solid #3a4558;
+  background: #252a36;
+  color: #e8e8ec;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+button:hover {
+  background: #2d3444;
+}
+
+button.primary {
+  background: #2a4a6a;
+  border-color: #3a6a9a;
+}
+
+button.primary:hover {
+  background: #325a82;
+}
+
+code {
+  font-size: 0.85em;
+  color: #8ab4d8;
+}

@@ -1,0 +1,13 @@
+[package]
+name = "local-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Placeholder for workstation gateway (see docs/LOCAL_STACK_DESIGN.md)"
+autobins = false
+
+[[bin]]
+name = "local-agent"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }

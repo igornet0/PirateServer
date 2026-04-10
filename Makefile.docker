@@ -1,0 +1,54 @@
+# Docker Compose helpers for docker-compose.test.yml
+# Usage from repo root: make -f Makefile.docker <target>
+#
+# Примеры:
+#   make -f Makefile.docker up
+#   make -f Makefile.docker status
+#   make -f Makefile.docker logs
+#   make -f Makefile.docker logs TAIL=50 SERVICE=control-api
+
+COMPOSE := docker compose -f docker-compose.test.yml
+TAIL ?= 100
+
+.PHONY: help up down build restart stop ps status logs logs-follow e2e
+
+help:
+	@echo "Docker (docker-compose.test.yml):"
+	@echo "  up            — поднять стек в фоне (build + up -d)"
+	@echo "  down          — остановить и убрать контейнеры"
+	@echo "  build         — только собрать образы"
+	@echo "  restart       — перезапуск всех сервисов стека"
+	@echo "  stop          — остановить без удаления контейнеров"
+	@echo "  ps / status   — состояние контейнеров"
+	@echo "  logs          — последние логи (TAIL=$(TAIL) строк, все сервисы)"
+	@echo "  logs-follow   — поток логов (как docker compose logs -f)"
+	@echo "  e2e           — прогнать e2e (профиль e2e)"
+	@echo ""
+	@echo "Переменные: TAIL=число  SERVICE=имя_сервиса  (для logs / logs-follow)"
+
+up:
+	$(COMPOSE) up -d --build
+
+down:
+	$(COMPOSE) down
+
+build:
+	$(COMPOSE) build
+
+restart:
+	$(COMPOSE) restart
+
+stop:
+	$(COMPOSE) stop
+
+ps status:
+	$(COMPOSE) ps -a
+
+logs:
+	$(COMPOSE) logs --tail=$(TAIL) $(SERVICE)
+
+logs-follow:
+	$(COMPOSE) logs -f --tail=$(TAIL) $(SERVICE)
+
+e2e:
+	$(COMPOSE) --profile e2e run --rm e2e

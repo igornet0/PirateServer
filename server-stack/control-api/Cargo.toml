@@ -1,0 +1,19 @@
+[package]
+name = "control-api"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP API for deploy dashboard (REST + optional PostgreSQL)"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+deploy-db = { path = "../deploy-db" }
+deploy-core = { path = "../deploy-core" }
+deploy-control = { path = "../deploy-control" }
+deploy-proto = { path = "../../proto" }
+tonic = { version = "0.12", features = ["transport"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

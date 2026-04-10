@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Deploy dashboard</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>Deploy dashboard</h1>
+        <p class="muted">Status, releases, and history from control-api</p>
+        <div class="row">
+          <label for="api-token">API Bearer token (optional, if <code>CONTROL_API_BEARER_TOKEN</code>)</label>
+          <input
+            id="api-token"
+            type="password"
+            autocomplete="off"
+            placeholder="Global API token"
+          />
+        </div>
+      </header>
+      <section id="status-section">
+        <h2>Current status</h2>
+        <pre id="status">Loading…</pre>
+      </section>
+      <section id="releases-section">
+        <h2>Releases on disk</h2>
+        <pre id="releases">Loading…</pre>
+      </section>
+      <section id="history-section">
+        <h2>Deploy history</h2>
+        <pre id="history">Loading…</pre>
+      </section>
+      <section id="nginx-section">
+        <h2>Nginx configuration</h2>
+        <p class="muted">
+          Requires control-api with <code>NGINX_CONFIG_PATH</code>.           Optional
+          <code>NGINX_ADMIN_TOKEN</code> — paste below for Save (or use
+          <code>X-Nginx-Admin-Token</code> when API token is set).
+        </p>
+        <div class="row">
+          <label for="nginx-token">Admin Bearer token (optional)</label>
+          <input
+            id="nginx-token"
+            type="password"
+            autocomplete="off"
+            placeholder="Bearer token if NGINX_ADMIN_TOKEN is set"
+          />
+        </div>
+        <textarea id="nginx-editor" rows="18" spellcheck="false" placeholder="Load to fetch current config…"></textarea>
+        <div class="row actions">
+          <button type="button" id="nginx-load">Load</button>
+          <button type="button" id="nginx-save" class="primary">Save &amp; reload nginx</button>
+        </div>
+        <pre id="nginx-result"></pre>
+      </section>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

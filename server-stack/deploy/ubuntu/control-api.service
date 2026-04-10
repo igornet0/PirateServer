@@ -1,0 +1,17 @@
+[Unit]
+Description=Deploy control HTTP API (dashboard backend)
+After=network-online.target postgresql.service deploy-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+EnvironmentFile=-/etc/pirete-deploy.env
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/control-api --deploy-root /var/lib/pirete/deploy --listen-port 8080
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

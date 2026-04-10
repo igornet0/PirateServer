@@ -1,0 +1,36 @@
+# Example nginx for phase 6+ (IPv6 listener, static UI, API proxy).
+# Copy and adjust paths. Test: nginx -c /path/to/this/file -t
+
+worker_processes 1;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    default_type application/octet-stream;
+    sendfile on;
+
+    server {
+        listen [::]:80;
+
+        # `npm run build` output
+        root /opt/deploy-ui/dist;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        location /api/ {
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_pass http://[::1]:8080;
+        }
+
+        location /health {
+            proxy_pass http://[::1]:8080/health;
+        }
+    }
+}

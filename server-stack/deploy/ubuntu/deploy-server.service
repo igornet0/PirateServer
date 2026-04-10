@@ -1,0 +1,17 @@
+[Unit]
+Description=Deploy gRPC server (artifact deployment)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+EnvironmentFile=-/etc/pirete-deploy.env
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/deploy-server --root /var/lib/pirete/deploy -p 50051
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

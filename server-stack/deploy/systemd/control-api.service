@@ -1,0 +1,17 @@
+[Unit]
+Description=Deploy control HTTP API
+After=network.target postgresql.service deploy-server.service
+
+[Service]
+Type=simple
+User=deploy
+Environment=RUST_LOG=info
+Environment=DEPLOY_ROOT=/deploy
+Environment=GRPC_ENDPOINT=http://[::1]:50051
+Environment=DATABASE_URL=postgresql://deploy:deploy@[::1]:5432/deploy
+Environment=CONTROL_API_PORT=8080
+ExecStart=/usr/local/bin/control-api
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

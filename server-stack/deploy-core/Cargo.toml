@@ -1,0 +1,8 @@
+[package]
+name = "deploy-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared paths and filesystem helpers for deploy-server and control-api"
+
+[dependencies]
+tokio = { version = "1", features = ["process", "sync"] }
