@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Bootstrap phase 6 stack: PostgreSQL (optional), deploy-server, control-api, build UI.
-# Requires: Rust, Node/npm for frontend, PostgreSQL client tools optional.
+# Bootstrap phase 6 stack: metadata DB (SQLite or PostgreSQL), deploy-server, control-api, build UI.
+# Requires: Rust, Node/npm for frontend, PostgreSQL client tools optional (for Postgres URL).
 #
-# Usage:
+# Usage (PostgreSQL metadata, e.g. local Postgres):
 #   export DATABASE_URL='postgresql://user:pass@[::1]:5432/deploy'
+#   ./scripts/bootstrap-phase6.sh
+#
+# Or SQLite metadata (no local Postgres):
+#   export DEPLOY_SQLITE_URL="sqlite://${TMPDIR:-/tmp}/deploy-phase6-meta.db"
 #   ./scripts/bootstrap-phase6.sh
 #
 # Or without DB (API history empty; status still works via gRPC):
@@ -39,14 +43,24 @@ echo "==> control-api: http://[::1]:${API_PORT}"
 echo ""
 echo "Run in separate terminals (or use systemd units under server-stack/deploy/systemd/):"
 echo ""
-echo "  # 1) PostgreSQL must be running if DATABASE_URL is set; create DB and user first."
+echo "  # 1) Choose metadata: PostgreSQL (DATABASE_URL) or SQLite (DEPLOY_SQLITE_URL)."
+echo "  #    For Postgres, the server must be running; create DB and user first."
 echo "  export DATABASE_URL='${DATABASE_URL:-postgresql://deploy:deploy@[::1]:5432/deploy}'"
+echo "  # or: export DEPLOY_SQLITE_URL='sqlite:///tmp/deploy-phase6-meta.db'"
 echo ""
 echo "  # For local dev without pairing, set DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1"
-echo "  RUST_LOG=info DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1 cargo run -p deploy-server -- --root \"$DEPLOY_ROOT\" -p $PORT --database-url \"\$DATABASE_URL\""
-echo ""
-echo "  RUST_LOG=info DEPLOY_ROOT=\"$DEPLOY_ROOT\" GRPC_ENDPOINT=\"$GRPC_ENDPOINT\" \\"
-echo "    cargo run -p control-api -- --deploy-root \"$DEPLOY_ROOT\" --listen-port $API_PORT --database-url \"\$DATABASE_URL\""
+META="${DEPLOY_SQLITE_URL:-}"
+if [[ -n "$META" ]]; then
+  echo "  RUST_LOG=info DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1 cargo run -p deploy-server -- --root \"$DEPLOY_ROOT\" -p $PORT --deploy-sqlite-url \"\$DEPLOY_SQLITE_URL\""
+  echo ""
+  echo "  RUST_LOG=info DEPLOY_ROOT=\"$DEPLOY_ROOT\" GRPC_ENDPOINT=\"$GRPC_ENDPOINT\" \\"
+  echo "    cargo run -p control-api -- --deploy-root \"$DEPLOY_ROOT\" --listen-port $API_PORT --deploy-sqlite-url \"\$DEPLOY_SQLITE_URL\""
+else
+  echo "  RUST_LOG=info DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1 cargo run -p deploy-server -- --root \"$DEPLOY_ROOT\" -p $PORT --database-url \"\$DATABASE_URL\""
+  echo ""
+  echo "  RUST_LOG=info DEPLOY_ROOT=\"$DEPLOY_ROOT\" GRPC_ENDPOINT=\"$GRPC_ENDPOINT\" \\"
+  echo "    cargo run -p control-api -- --deploy-root \"$DEPLOY_ROOT\" --listen-port $API_PORT --database-url \"\$DATABASE_URL\""
+fi
 echo ""
 echo "  # 3) Optional: point control-api at an nginx config file for UI edit + reload:"
 echo "  export NGINX_CONFIG_PATH=/etc/nginx/nginx.conf"

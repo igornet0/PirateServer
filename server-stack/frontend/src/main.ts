@@ -1,3 +1,4 @@
+import "uplot/dist/uPlot.min.css";
 import { activeProject } from "./api/client.js";
 import { initI18n, onLocaleChange, t } from "./i18n/index.js";
 import { initDashboardTabs } from "./tabs.js";
@@ -8,13 +9,20 @@ import {
   assertDashboardAccess,
   clearSessionAndReload,
 } from "./views/login.js";
+import { bindHostServerDialog } from "./views/host-server-dialog.js";
 import { bindNginxWizard } from "./views/nginx-wizard.js";
+import {
+  bindDatabaseTab,
+  loadDatabaseInfo,
+  refreshDatabaseFromLocale,
+} from "./views/database.js";
 import { loadNginx, saveNginx } from "./views/nginx.js";
 
 initI18n();
 onLocaleChange(() => {
   void refreshDashboard();
   void loadNginx();
+  refreshDatabaseFromLocale();
 });
 
 function bootstrapDashboard(): void {
@@ -31,6 +39,9 @@ function bootstrapDashboard(): void {
   applyPendingApiTokenFromLogin();
 
   initDashboardTabs();
+  if (document.getElementById("tab-database")?.getAttribute("aria-selected") === "true") {
+    void loadDatabaseInfo();
+  }
   const ap = document.getElementById("active-project") as HTMLInputElement | null;
   if (ap) {
     try {
@@ -49,6 +60,21 @@ function bootstrapDashboard(): void {
 
   bindLifecycle();
   bindNginxWizard();
+  bindHostServerDialog();
+  bindDatabaseTab();
+
+  document.getElementById("btn-copy-local-client")?.addEventListener("click", async () => {
+    const text = document.getElementById("local-client-json")?.textContent?.trim();
+    if (!text) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      /* ignore — clipboard may be denied */
+    }
+  });
+
   void refreshDashboard();
   setInterval(() => {
     void refreshDashboard();

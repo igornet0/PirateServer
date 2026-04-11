@@ -5,12 +5,15 @@ edition = "2021"
 description = "HTTP API for deploy dashboard (REST + optional PostgreSQL)"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+async-stream = "0.3"
+futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tower-http = { version = "0.5", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 deploy-db = { path = "../deploy-db" }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 deploy-core = { path = "../deploy-core" }
 deploy-auth = { path = "../deploy-auth" }
 deploy-control = { path = "../deploy-control" }
@@ -23,3 +26,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 argon2 = "0.5"
 jsonwebtoken = "9"
 chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }

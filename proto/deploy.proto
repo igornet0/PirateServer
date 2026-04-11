@@ -19,6 +19,21 @@ service DeployService {
 
   // Kill and respawn the process for the current `current` release (same version).
   rpc RestartProcess(RestartProcessRequest) returns (StatusResponse);
+
+  // Host resource snapshot (same machine as deploy root); signed like GetStatus.
+  rpc GetHostStats(HostStatsRequest) returns (HostStatsResponse);
+
+  // On-demand detail (cpu/memory/disk/network/processes); signed like GetStatus.
+  rpc GetHostStatsDetail(HostStatsDetailRequest) returns (HostStatsDetailResponse);
+
+  // OTA: stream a server-stack bundle tarball (e.g. pirate-linux-amd64 from build-linux-bundle.sh).
+  rpc UploadServerStack(stream ServerStackChunk) returns (ServerStackResponse);
+
+  // Report installed server-stack version on this host (read from disk; signed like GetStatus).
+  rpc GetServerStackInfo(ServerStackInfoRequest) returns (ServerStackInfo);
+
+  // Bidirectional TCP tunnel for outbound HTTP CONNECT / HTTPS (signed like GetStatus; default project).
+  rpc ProxyTunnel(stream ProxyClientMsg) returns (stream ProxyServerMsg);
 }
 
 message PairRequest {
@@ -63,6 +78,10 @@ message StatusResponse {
   string current_version = 1;
   // running | stopped | error
   string state = 2;
+  // Install bundle for authenticated gRPC (empty when deploy-server runs with auth disabled).
+  string client_connect_token = 3;
+  string client_connect_url = 4;
+  string client_connect_pairing = 5;
 }
 
 message RollbackRequest {
@@ -81,4 +100,226 @@ message StopProcessRequest {
 
 message RestartProcessRequest {
   string project_id = 1;
+}
+
+message ServerStackChunk {
+  bytes data = 1;
+  string version = 2;
+  bool is_last = 3;
+  // SHA-256 of the full artifact (hex, lowercase). Required when is_last = true.
+  string sha256_hex = 4;
+}
+
+message ServerStackResponse {
+  string status = 1;
+  string applied_version = 2;
+  optional string deploy_server_pkg_version = 3;
+  optional string control_api_pkg_version = 4;
+}
+
+message ServerStackInfoRequest {
+}
+
+// --- Outbound proxy tunnel (paired clients only) ---
+
+message ProxyOpen {
+  string host = 1;
+  uint32 port = 2;
+}
+
+message ProxyClientMsg {
+  oneof body {
+    ProxyOpen open = 1;
+    bytes data = 2;
+    // Client finished sending (shutdown write); server still may send data.
+    bool fin = 3;
+  }
+}
+
+message ProxyOpenResult {
+  bool ok = 1;
+  string error = 2;
+}
+
+message ProxyServerMsg {
+  oneof body {
+    ProxyOpenResult open_result = 1;
+    bytes data = 2;
+    // Upstream closed or error reading socket.
+    bool eof = 3;
+    string error = 4;
+  }
+}
+
+message ServerStackInfo {
+  // Version label from last successful stack apply (same as upload version string).
+  string bundle_version = 1;
+  // Optional JSON manifest from bundle (build-linux-bundle.sh); empty if missing.
+  optional string manifest_json = 2;
+  // deploy-server binary Cargo version (always available); useful when manifest files are absent.
+  optional string deploy_server_binary_version = 3;
+}
+
+// --- Host stats (control-plane parity with GET /api/v1/host-stats) ---
+
+message HostStatsRequest {
+  // Empty means `default`.
+  string project_id = 1;
+}
+
+message HostMountStatsProto {
+  string path = 1;
+  uint64 total_bytes = 2;
+  uint64 free_bytes = 3;
+}
+
+message HostNetInterfaceProto {
+  string name = 1;
+  double rx_bytes_per_s = 2;
+  double tx_bytes_per_s = 3;
+  uint64 rx_errors = 4;
+  uint64 tx_errors = 5;
+}
+
+message HostLogLineProto {
+  int64 ts_ms = 1;
+  string level = 2;
+  string message = 3;
+}
+
+message HostStatsResponse {
+  uint64 disk_free_bytes = 1;
+  uint64 disk_total_bytes = 2;
+  string disk_mount_path = 3;
+  uint64 memory_used_bytes = 4;
+  uint64 memory_total_bytes = 5;
+  float cpu_usage_percent = 6;
+  double load_average_1m = 7;
+  double load_average_5m = 8;
+  double load_average_15m = 9;
+  optional float temperature_current_celsius = 10;
+  optional float temperature_avg_celsius = 11;
+  uint64 process_count = 12;
+  repeated HostMountStatsProto disk_mounts = 13;
+  repeated HostNetInterfaceProto network_interfaces = 14;
+  repeated HostLogLineProto log_tail = 15;
+}
+
+message HostStatsDetailRequest {
+  string project_id = 1;
+  HostStatsDetailKind kind = 2;
+  // For cpu, memory, disk (clamped 5–100 server-side).
+  uint32 top = 3;
+  // For processes search.
+  string q = 4;
+  // For processes list (clamped 10–2000 server-side).
+  uint32 limit = 5;
+}
+
+enum HostStatsDetailKind {
+  HOST_STATS_DETAIL_KIND_UNSPECIFIED = 0;
+  HOST_STATS_DETAIL_CPU = 1;
+  HOST_STATS_DETAIL_MEMORY = 2;
+  HOST_STATS_DETAIL_DISK = 3;
+  HOST_STATS_DETAIL_NETWORK = 4;
+  HOST_STATS_DETAIL_PROCESSES = 5;
+}
+
+message LoadAvgProto {
+  double m1 = 1;
+  double m5 = 2;
+  double m15 = 3;
+}
+
+message CpuTimesProto {
+  uint64 user_ms = 1;
+  uint64 system_ms = 2;
+  uint64 idle_ms = 3;
+}
+
+message ProcessCpuProto {
+  uint32 pid = 1;
+  string name = 2;
+  float cpu_percent = 3;
+}
+
+message SeriesHintProto {
+  repeated string available_ranges = 1;
+}
+
+message CpuDetailProto {
+  int64 ts_ms = 1;
+  LoadAvgProto loadavg = 2;
+  CpuTimesProto times = 3;
+  repeated ProcessCpuProto top_processes = 4;
+  SeriesHintProto series_hint = 5;
+}
+
+message MemoryOverviewProto {
+  uint64 total_bytes = 1;
+  uint64 used_bytes = 2;
+  uint64 available_bytes = 3;
+  optional uint64 cached_bytes = 4;
+  optional uint64 buffers_bytes = 5;
+  uint64 swap_total_bytes = 6;
+  uint64 swap_used_bytes = 7;
+}
+
+message ProcessMemProto {
+  uint32 pid = 1;
+  string name = 2;
+  uint64 memory_bytes = 3;
+}
+
+message MemoryDetailProto {
+  int64 ts_ms = 1;
+  MemoryOverviewProto memory = 2;
+  repeated ProcessMemProto top_processes = 3;
+}
+
+message DiskIoSummaryProto {
+  string note = 1;
+}
+
+message ProcessDiskProto {
+  uint32 pid = 1;
+  string name = 2;
+  uint64 read_bytes = 3;
+  uint64 write_bytes = 4;
+}
+
+message DiskDetailProto {
+  int64 ts_ms = 1;
+  repeated HostMountStatsProto mounts = 2;
+  DiskIoSummaryProto io = 3;
+  repeated ProcessDiskProto top_processes = 4;
+}
+
+message NetworkDetailProto {
+  int64 ts_ms = 1;
+  repeated HostNetInterfaceProto interfaces = 2;
+  string connections_note = 3;
+}
+
+message ProcessRowProto {
+  uint32 pid = 1;
+  string name = 2;
+  float cpu_percent = 3;
+  uint64 memory_bytes = 4;
+}
+
+message ProcessesDetailProto {
+  int64 ts_ms = 1;
+  repeated ProcessRowProto processes = 2;
+  uint64 total = 3;
+}
+
+message HostStatsDetailResponse {
+  oneof detail {
+    CpuDetailProto cpu = 1;
+    MemoryDetailProto memory = 2;
+    DiskDetailProto disk = 3;
+    NetworkDetailProto network = 4;
+    ProcessesDetailProto processes = 5;
+  }
 }

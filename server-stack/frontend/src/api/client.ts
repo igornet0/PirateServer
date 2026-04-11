@@ -1,12 +1,29 @@
 import type {
   ApiErrorBody,
+  CpuDetail,
+  DataSourceItemView,
+  DataSourcesListView,
+  DatabaseColumnsView,
+  DatabaseInfoView,
+  DatabaseRelationshipsView,
+  DatabaseSchemasView,
+  DatabaseTablePreviewView,
+  DatabaseTablesView,
+  DiskDetail,
   HistoryView,
+  HostStatsDetailKind,
+  HostStatsView,
+  MemoryDetail,
+  NetworkDetail,
   NginxConfigView,
   NginxPutResponseView,
   ProcessControlView,
+  ProcessesDetail,
   ProjectsView,
   ReleasesView,
   RollbackView,
+  SeriesResponse,
+  SmbBrowseView,
   StatusView,
 } from "./types.js";
 import { ApiRequestError } from "./types.js";
@@ -16,7 +33,7 @@ const ACCESS_TOKEN_KEY = "deploy.accessToken";
 /**
  * Manual `#api-token` overrides session JWT; else JWT from login session.
  */
-function apiToken(): string {
+export function apiToken(): string {
   const dash = document.getElementById("api-token") as HTMLInputElement | null;
   const manual = dash?.value?.trim() ?? "";
   if (manual) {
@@ -109,8 +126,100 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+async function deleteJson(path: string): Promise<void> {
+  const r = await fetch(path, {
+    method: "DELETE",
+    headers: baseHeaders(),
+  });
+  if (!r.ok) {
+    await parseError(r);
+  }
+}
+
 export async function fetchStatus(): Promise<StatusView> {
   return getJson<StatusView>(`/api/v1/status${projectQuery()}`);
+}
+
+export async function fetchHostStats(): Promise<HostStatsView> {
+  return getJson<HostStatsView>("/api/v1/host-stats");
+}
+
+function hostStatsDetailPath(
+  kind: HostStatsDetailKind,
+  params?: Record<string, string | number | undefined>,
+): string {
+  let path = `/api/v1/host-stats/detail/${kind}`;
+  const q = new URLSearchParams();
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== "") {
+        q.set(k, String(v));
+      }
+    }
+  }
+  const qs = q.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
+export async function fetchHostStatsDetail(
+  kind: "cpu",
+  params?: { top?: number },
+): Promise<CpuDetail>;
+export async function fetchHostStatsDetail(
+  kind: "memory",
+  params?: { top?: number },
+): Promise<MemoryDetail>;
+export async function fetchHostStatsDetail(
+  kind: "disk",
+  params?: { top?: number },
+): Promise<DiskDetail>;
+export async function fetchHostStatsDetail(
+  kind: "network",
+  params?: Record<string, never>,
+): Promise<NetworkDetail>;
+export async function fetchHostStatsDetail(
+  kind: "processes",
+  params?: { q?: string; limit?: number },
+): Promise<ProcessesDetail>;
+export async function fetchHostStatsDetail(
+  kind: HostStatsDetailKind,
+  params?: Record<string, string | number | undefined>,
+): Promise<
+  CpuDetail | MemoryDetail | DiskDetail | NetworkDetail | ProcessesDetail
+> {
+  return getJson(hostStatsDetailPath(kind, params));
+}
+
+/** Must match `parse_range_ms` in deploy-control `host_stats_history.rs`. */
+export function normalizeSeriesRange(range: string): "15m" | "1h" | "24h" | "7d" {
+  const r = range
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "");
+  if (r === "15m" || r === "15min") {
+    return "15m";
+  }
+  if (r === "1h" || r === "60m" || r === "60min") {
+    return "1h";
+  }
+  if (r === "24h" || r === "24hr" || r === "1d" || r === "1440m") {
+    return "24h";
+  }
+  if (r === "7d" || r === "1w" || r === "week" || r === "168h" || r === "168hr") {
+    return "7d";
+  }
+  return "1h";
+}
+
+export async function fetchHostStatsSeries(
+  metric: string,
+  range: string = "1h",
+): Promise<SeriesResponse> {
+  const q = new URLSearchParams({
+    metric,
+    range: normalizeSeriesRange(range),
+  });
+  return getJson<SeriesResponse>(`/api/v1/host-stats/series?${q}`);
 }
 
 export async function fetchReleases(): Promise<ReleasesView> {
@@ -123,6 +232,95 @@ export async function fetchProjects(): Promise<ProjectsView> {
 
 export async function fetchHistory(): Promise<HistoryView> {
   return getJson<HistoryView>(`/api/v1/history${projectQuery()}`);
+}
+
+export async function fetchDatabaseInfo(): Promise<DatabaseInfoView> {
+  return getJson<DatabaseInfoView>("/api/v1/database-info");
+}
+
+export async function fetchDatabaseSchemas(): Promise<DatabaseSchemasView> {
+  return getJson<DatabaseSchemasView>("/api/v1/database/schemas");
+}
+
+export async function fetchDatabaseTables(schema: string): Promise<DatabaseTablesView> {
+  const q = new URLSearchParams({ schema });
+  return getJson<DatabaseTablesView>(`/api/v1/database/tables?${q}`);
+}
+
+export async function fetchDatabaseColumns(
+  schema: string,
+  table: string,
+): Promise<DatabaseColumnsView> {
+  const path = `/api/v1/database/tables/${encodeURIComponent(schema)}/${encodeURIComponent(table)}/columns`;
+  return getJson<DatabaseColumnsView>(path);
+}
+
+export async function fetchDatabaseTableRows(
+  schema: string,
+  table: string,
+  opts?: { limit?: number; offset?: number },
+): Promise<DatabaseTablePreviewView> {
+  const q = new URLSearchParams();
+  if (opts?.limit != null) {
+    q.set("limit", String(opts.limit));
+  }
+  if (opts?.offset != null) {
+    q.set("offset", String(opts.offset));
+  }
+  const qs = q.toString();
+  const path = `/api/v1/database/tables/${encodeURIComponent(schema)}/${encodeURIComponent(table)}/rows${qs ? `?${qs}` : ""}`;
+  return getJson<DatabaseTablePreviewView>(path);
+}
+
+export async function fetchDatabaseRelationships(): Promise<DatabaseRelationshipsView> {
+  return getJson<DatabaseRelationshipsView>("/api/v1/database/relationships");
+}
+
+export async function fetchDataSources(): Promise<DataSourcesListView> {
+  return getJson<DataSourcesListView>("/api/v1/data-sources");
+}
+
+export async function postDataSourceSmb(body: {
+  label: string;
+  host: string;
+  share: string;
+  folder: string;
+  username: string;
+  password: string;
+}): Promise<DataSourceItemView> {
+  return postJson<DataSourceItemView>("/api/v1/data-sources/smb", body);
+}
+
+export async function postDataSourceConnection(body: {
+  kind: string;
+  label: string;
+  host: string;
+  port: number;
+  database?: string;
+  username?: string;
+  password?: string;
+  ssl: boolean;
+}): Promise<DataSourceItemView> {
+  return postJson<DataSourceItemView>("/api/v1/data-sources/connection", body);
+}
+
+export async function deleteDataSource(id: string): Promise<void> {
+  const path = `/api/v1/data-sources/${encodeURIComponent(id)}`;
+  return deleteJson(path);
+}
+
+export async function fetchSmbBrowse(
+  sourceId: string,
+  path: string = "",
+): Promise<SmbBrowseView> {
+  const q = new URLSearchParams();
+  if (path) {
+    q.set("path", path);
+  }
+  const qs = q.toString();
+  return getJson<SmbBrowseView>(
+    `/api/v1/data-sources/${encodeURIComponent(sourceId)}/browse${qs ? `?${qs}` : ""}`,
+  );
 }
 
 export async function postRollback(version: string): Promise<RollbackView> {

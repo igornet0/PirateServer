@@ -49,11 +49,18 @@ npm run tauri:dev
 
 Откроется окно с dev-сервером Vite (`http://localhost:5174`); `invoke` ходит в тот же Rust-процесс.
 
+## Версия релиза
+
+- Репозиторий: файл [`VERSION`](../VERSION) в корне — единый SemVer для `make dist`, Linux-бандлов и поля `release` в `server-stack-manifest.json`.
+- Vite подставляет `import.meta.env.VITE_APP_RELEASE` из `VERSION` (или переопределите `VITE_APP_RELEASE` при сборке).
+- **Stack info** в UI: `bundleVersion` / `manifestJson` заполняются после установки бандла с манифестом или OTA; поле `deployServerBinaryVersion` всегда отражает версию бинаря `deploy-server` на хосте.
+
 ## Переменные окружения
 
 | Переменная | Назначение |
 |------------|------------|
 | `RUST_LOG` | Уровень логов (`info`, `debug`, …). |
+| `VITE_APP_RELEASE` | Опционально: переопределить строку релиза в UI (иначе читается из `VERSION`). |
 
 ## Команда `get_status`
 
@@ -66,10 +73,22 @@ npm run tauri:dev
 Rust:
 
 - `parse_grpc_bundle` — извлекает URL из JSON-бандла (`token`, `url`, `pairing`) или legacy `export GRPC_ENDPOINT=…` / одна строка URL;
-- `connect_grpc_bundle` — для JSON вызывает `Pair`, проверяет подпись сервера, сохраняет `grpc_connection.json` и при необходимости создаёт `identity.json`; для legacy — только `GetStatus`;
+- `connect_grpc_bundle` — для JSON вызывает `Pair`, проверяет подпись сервера, сохраняет подключение в SQLite (`pirate_desktop.db`) и при необходимости создаёт `identity.json`; для legacy — только `GetStatus`;
 - `refresh_grpc_status` / `clear_grpc_connection` — обновить статус по сохранённому endpoint или забыть его.
 
 Аутентификация на gRPC в протоколе не задаётся — защищайте сеть или добавьте mTLS (см. [`GRPC_AUTH_FUTURE.md`](GRPC_AUTH_FUTURE.md)).
+
+## OTA обновления server-stack (хост)
+
+В дашборде есть блок **Server stack update**: выбор готового архива `pirate-linux-amd64*.tar.gz` или распакованной папки (как после [`scripts/build-linux-bundle.sh`](../scripts/build-linux-bundle.sh)), метка версии и загрузка по gRPC (`UploadServerStack`). Прогресс бара отражает **реальную** долю отправленных байт.
+
+На стороне **deploy-server** нужно:
+
+- `DEPLOY_ALLOW_SERVER_STACK_UPDATE=1` (или флаг `--allow-server-stack-update`);
+- установка с [`server-stack/deploy/ubuntu/install.sh`](../server-stack/deploy/ubuntu/install.sh), чтобы существовали `/usr/local/lib/pirate/pirate-apply-stack-bundle.sh` и правило `sudoers` для пользователя `pirate`;
+- при необходимости увеличить `DEPLOY_MAX_SERVER_STACK_BYTES` для больших бандлов с UI.
+
+После применения `deploy-server` и `control-api` перезапускаются с задержкой; кратковременный обрыв gRPC ожидаем — обновите статус подключения через несколько секунд.
 
 ## Упаковка
 

@@ -6,6 +6,7 @@ mod deploy_service;
 
 use clap::{Parser, Subcommand};
 use deploy_auth::format_install_bundle;
+use deploy_control::NetCounters;
 use deploy_db::DbStore;
 use deploy_proto::deploy::deploy_service_server::DeployServiceServer;
 use deploy_service::DeployServiceImpl;
@@ -33,7 +34,7 @@ enum Commands {
     /// Print one line of JSON for `client pair`: {"token","url","pairing"} (stdout; does not start the server).
     #[command(name = "print-install-bundle")]
     PrintInstallBundle,
-    /// Create or update a dashboard user (Argon2 hash in `dashboard_users`). Requires DATABASE_URL.
+    /// Create or update a dashboard user (Argon2 hash in `dashboard_users`). Requires metadata DB URL.
     #[command(name = "dashboard-add-user")]
     DashboardAddUser(DashboardUserArgs),
 }
@@ -66,11 +67,23 @@ struct Args {
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     max_upload_bytes: u64,
 
+    /// Maximum size (bytes) for server-stack OTA tarball (`UploadServerStack`).
+    #[arg(long, env = "DEPLOY_MAX_SERVER_STACK_BYTES", default_value_t = 512 * 1024 * 1024)]
+    max_server_stack_bytes: u64,
+
+    /// Allow `UploadServerStack` (requires `/usr/local/lib/pirate/pirate-apply-stack-bundle.sh` + sudoers).
+    #[arg(long, env = "DEPLOY_ALLOW_SERVER_STACK_UPDATE", default_value_t = false)]
+    allow_server_stack_update: bool,
+
     /// Fallback executable name inside a release if `run.sh` is missing.
     #[arg(long, default_value = "app")]
     binary_name: String,
 
-    /// Optional PostgreSQL URL for audit/UI (IPv6 host: `postgresql://user:pass@[::1]:5432/db`).
+    /// Metadata SQLite file URL (native install), e.g. `sqlite:///var/lib/pirate/deploy/deploy.db`.
+    #[arg(long, env = "DEPLOY_SQLITE_URL")]
+    deploy_sqlite_url: Option<String>,
+
+    /// Metadata PostgreSQL URL for audit/UI (Docker / optional; IPv6: `postgresql://user:pass@[::1]:5432/db`).
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
 
@@ -148,13 +161,22 @@ fn validate_dashboard_username(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn metadata_database_url(args: &Args) -> Option<String> {
+    args.deploy_sqlite_url
+        .clone()
+        .or_else(|| args.database_url.clone())
+        .filter(|s| !s.trim().is_empty())
+}
+
 async fn dashboard_add_user_cmd(
     args: &Args,
     uargs: &DashboardUserArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_not_root()?;
-    let Some(ref url) = args.database_url else {
-        return Err("deploy-server dashboard-add-user: DATABASE_URL is required".into());
+    let Some(ref url) = metadata_database_url(args) else {
+        return Err(
+            "deploy-server dashboard-add-user: set DEPLOY_SQLITE_URL or DATABASE_URL".into(),
+        );
     };
     let username = uargs.username.trim();
     validate_dashboard_username(username)?;
@@ -194,19 +216,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     ensure_not_root()?;
+    let allow_server_stack_update = args.allow_server_stack_update
+        || std::env::var("DEPLOY_ALLOW_SERVER_STACK_UPDATE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
     info!(
         root = %args.root.display(),
         port = args.port,
         max_upload_bytes = args.max_upload_bytes,
+        max_server_stack_bytes = args.max_server_stack_bytes,
+        allow_server_stack_update = allow_server_stack_update,
         binary = %args.binary_name,
-        database = %if args.database_url.is_some() { "configured" } else { "disabled" },
+        database = %if metadata_database_url(&args).is_some() { "configured" } else { "disabled" },
         "starting deploy-server"
     );
 
-    let db = if let Some(ref url) = args.database_url {
+    let db = if let Some(ref url) = metadata_database_url(&args) {
         let store = DbStore::connect(url).await?;
         store.migrate().await?;
-        info!("PostgreSQL migrations applied");
+        if store.is_postgres() {
+            info!("PostgreSQL metadata migrations applied");
+        } else {
+            info!("SQLite metadata migrations applied");
+        }
         if let Err(e) = admin_seed::seed_dashboard_admin(&store).await {
             return Err(format!("dashboard admin seed: {e}").into());
         }
@@ -247,13 +280,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let states = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let host_net = Arc::new(std::sync::Mutex::new(None::<NetCounters>));
+    let log_tail_path = std::env::var("DEPLOY_HOST_STATS_LOG_TAIL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
     let svc = DeployServiceServer::new(DeployServiceImpl::new(
         args.root,
         args.max_upload_bytes,
+        args.max_server_stack_bytes,
+        allow_server_stack_update,
         args.binary_name,
+        public_url,
         states,
         db,
         server_auth,
+        host_net,
+        log_tail_path,
     ));
 
     tonic::transport::Server::builder()

@@ -1,5 +1,6 @@
-# syntax=docker/dockerfile:1
 # Multi-target: Rust binaries + static UI + nginx (for docker-compose.test.yml).
+# (No `# syntax=docker/dockerfile:1` here — avoids an extra pull from registry-1.docker.io
+# before build; use it only if you need a specific Dockerfile frontend version.)
 
 FROM rust:bookworm AS rust-builder
 WORKDIR /app

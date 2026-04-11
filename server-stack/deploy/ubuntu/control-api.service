@@ -1,12 +1,12 @@
 [Unit]
 Description=Deploy control HTTP API (dashboard backend)
-After=network-online.target postgresql.service deploy-server.service
+After=network-online.target deploy-server.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=deploy
-Group=deploy
+User=pirate
+Group=pirate
 EnvironmentFile=-/etc/pirate-deploy.env
 Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/control-api --deploy-root /var/lib/pirate/deploy --listen-port 8080

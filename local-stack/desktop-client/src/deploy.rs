@@ -25,7 +25,7 @@ pub struct RollbackOutcome {
     pub active_version: String,
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime, String> {
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

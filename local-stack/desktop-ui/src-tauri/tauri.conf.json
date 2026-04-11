@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "PirateServer",
+  "productName": "PirateClient",
   "version": "0.1.0",
   "identifier": "com.pirate.client",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "PirateServer",
+        "title": "PirateClient",
         "width": 800,
         "height": 600,
         "resizable": true

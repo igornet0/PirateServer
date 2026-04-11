@@ -20,7 +20,6 @@
                   aria-label="PirateServer"
                 ></span>
                 <div class="brand-titles">
-                  <span class="brand-product">PirateServer</span>
                   <h1 data-i18n="dash.title">Deploy dashboard</h1>
                 </div>
               </div>
@@ -51,31 +50,6 @@
               </button>
             </div>
           </div>
-          <div class="settings-strip">
-            <div class="row">
-              <label for="api-token" data-i18n="apiToken.label"
-                >API Bearer token (optional override)</label
-              >
-              <input
-                id="api-token"
-                type="password"
-                autocomplete="off"
-                data-i18n-placeholder="apiToken.placeholder"
-                placeholder="Session JWT if signed in; paste static token to override"
-              />
-            </div>
-            <div class="row">
-              <label for="active-project" data-i18n="activeProject.label">Active project</label>
-              <input
-                id="active-project"
-                type="text"
-                autocomplete="off"
-                data-i18n-placeholder="activeProject.placeholder"
-                placeholder="default"
-                value="default"
-              />
-            </div>
-          </div>
         </div>
       </header>
 
@@ -102,13 +76,13 @@
             type="button"
             class="tab"
             role="tab"
-            id="tab-process"
+            id="tab-projects"
             aria-selected="false"
             tabindex="-1"
-            aria-controls="panel-process"
-            data-i18n="tab.process"
+            aria-controls="panel-projects"
+            data-i18n="tab.projects"
           >
-            Process
+            Projects
           </button>
           <button
             type="button"
@@ -121,6 +95,18 @@
             data-i18n="tab.inventory"
           >
             Inventory
+          </button>
+          <button
+            type="button"
+            class="tab"
+            role="tab"
+            id="tab-database"
+            aria-selected="false"
+            tabindex="-1"
+            aria-controls="panel-database"
+            data-i18n="tab.databases"
+          >
+            Databases
           </button>
           <button
             type="button"
@@ -146,19 +132,41 @@
             <section id="status-section" class="panel-block">
               <h2 data-i18n="status.heading">Current status</h2>
               <pre id="status">Loading…</pre>
+              <div class="row actions status-actions">
+                <button
+                  type="button"
+                  id="btn-host-server-info"
+                  class="ghost"
+                  data-i18n="status.hostServer.open"
+                >
+                  Server information
+                </button>
+              </div>
+              <div id="local-client-bundle" class="local-client-bundle" hidden>
+                <h3 class="subheading" data-i18n="status.localClient.heading">
+                  Local client connection
+                </h3>
+                <p class="muted" data-i18n="status.localClient.hint">
+                  JSON for pairing the desktop client with this deploy-server (gRPC).
+                </p>
+                <pre id="local-client-json" class="mono-block"></pre>
+                <button type="button" id="btn-copy-local-client">
+                  <span data-i18n="status.localClient.copy">Copy JSON</span>
+                </button>
+              </div>
             </section>
           </div>
 
           <div
             class="tab-panel"
-            id="panel-process"
+            id="panel-projects"
             role="tabpanel"
-            aria-labelledby="tab-process"
+            aria-labelledby="tab-projects"
             hidden
           >
             <section id="lifecycle-section" class="panel-block">
-              <h2 data-i18n="process.heading">Process control</h2>
-              <p class="muted" data-i18n="process.hint">
+              <h2 data-i18n="projects.heading"> Projects control</h2>
+              <p class="muted" data-i18n="projects.hint">
                 Rollback, stop, or restart the managed app via control-api (gRPC to deploy-server).
                 Same bearer token as above.
               </p>
@@ -176,9 +184,9 @@
                 <button type="button" id="btn-rollback" class="primary" data-i18n="btn.rollback">
                   Rollback
                 </button>
-                <button type="button" id="btn-restart" data-i18n="btn.restart">Restart process</button>
+                <button type="button" id="btn-restart" data-i18n="btn.restart">Restart project</button>
                 <button type="button" id="btn-stop" class="danger" data-i18n="btn.stop">
-                  Stop process
+                  Stop project
                 </button>
               </div>
               <pre id="lifecycle-result"></pre>
@@ -203,6 +211,53 @@
             <section id="history-section" class="panel-block">
               <h2 data-i18n="inv.history">Deploy history</h2>
               <pre id="history">Loading…</pre>
+            </section>
+          </div>
+
+          <div
+            class="tab-panel"
+            id="panel-database"
+            role="tabpanel"
+            aria-labelledby="tab-database"
+            hidden
+          >
+            <section id="database-section" class="panel-block db-explorer-section">
+              <header class="db-explorer-toolbar">
+                <div class="db-explorer-toolbar-text">
+                  <h2 class="db-explorer-product-title" data-i18n="database.heading">Data sources</h2>
+                </div>
+                <div class="db-explorer-toolbar-actions">
+                  <div id="db-source-toolbar" class="db-source-toolbar" hidden>
+                    <label
+                      for="db-source-select"
+                      class="db-source-label"
+                      data-i18n="database.sourceLabel"
+                      >Data source</label
+                    >
+                    <span class="db-source-icon-wrap" id="db-source-icon" aria-hidden="true"></span>
+                    <select id="db-source-select" class="db-source-select"></select>
+                  </div>
+                  <button
+                    type="button"
+                    id="btn-database-add"
+                    class="ghost db-add-source"
+                    data-i18n="database.addSource"
+                    data-i18n-aria="database.addSourceAria"
+                    aria-label="Add data source"
+                  >
+                    +
+                  </button>
+                  <button
+                    type="button"
+                    id="btn-database-refresh"
+                    class="primary db-explorer-refresh"
+                    data-i18n="database.refresh"
+                  >
+                    Refresh
+                  </button>
+                </div>
+              </header>
+              <div id="database-content" class="database-content" aria-live="polite"></div>
             </section>
           </div>
 
@@ -299,6 +354,327 @@
         </div>
       </div>
     </div>
+
+    <dialog id="dialog-host-server" class="server-info-dialog" aria-labelledby="dialog-host-server-title">
+      <div class="server-info-dialog-inner">
+        <header class="host-server-header">
+          <div class="host-server-header-text">
+            <h2 id="dialog-host-server-title" data-i18n="status.hostServer.title">Server information</h2>
+            <p class="muted host-server-hint" data-i18n="status.hostServer.loadHint">
+              Load averages are 1 / 5 / 15 minute (not CPU percent).
+            </p>
+          </div>
+          <div class="host-server-header-actions">
+            <span
+              id="host-server-live-badge"
+              class="host-server-live-badge"
+              data-i18n="status.hostServer.liveBadge"
+              hidden
+              >Live</span
+            >
+            <button type="button" id="btn-host-server-refresh" data-i18n="status.hostServer.refresh">
+              Refresh
+            </button>
+          </div>
+        </header>
+        <div id="host-server-stats-root" class="host-stats-root">
+          <section class="host-stats-overview-section" aria-labelledby="host-server-overview-heading">
+            <h3 id="host-server-overview-heading" class="host-stats-section-title" data-i18n="status.hostServer.overview">
+              Overview
+            </h3>
+            <div id="host-server-stats-cards" class="host-stats-card-grid" aria-live="polite"></div>
+          </section>
+
+          <div class="host-server-secondary">
+            <div
+              class="host-stats-tablist"
+              role="tablist"
+              aria-label=""
+              data-i18n-aria="status.hostServer.secondaryTabsAria"
+            >
+              <button
+                type="button"
+                class="host-stats-tab"
+                role="tab"
+                id="tab-host-storage"
+                aria-selected="true"
+                aria-controls="panel-host-storage"
+                data-tab="storage"
+                data-i18n="status.hostServer.tabStorage"
+              >
+                Storage
+              </button>
+              <button
+                type="button"
+                class="host-stats-tab"
+                role="tab"
+                id="tab-host-network"
+                aria-selected="false"
+                aria-controls="panel-host-network"
+                data-tab="network"
+                data-i18n="status.hostServer.tabNetwork"
+              >
+                Network
+              </button>
+              <button
+                type="button"
+                class="host-stats-tab"
+                role="tab"
+                id="tab-host-logs"
+                aria-selected="false"
+                aria-controls="panel-host-logs"
+                data-tab="logs"
+                data-i18n="status.hostServer.tabLogs"
+              >
+                Logs
+              </button>
+              <button
+                type="button"
+                class="host-stats-tab"
+                role="tab"
+                id="tab-host-charts"
+                aria-selected="false"
+                aria-controls="panel-host-charts"
+                data-tab="charts"
+                data-i18n="status.hostServer.tabCharts"
+              >
+                Charts
+              </button>
+            </div>
+            <div
+              id="panel-host-storage"
+              class="host-stats-tabpanel"
+              role="tabpanel"
+              aria-labelledby="tab-host-storage"
+            >
+              <div id="host-server-tab-storage" class="host-stats-tabpanel-inner"></div>
+            </div>
+            <div
+              id="panel-host-network"
+              class="host-stats-tabpanel"
+              role="tabpanel"
+              aria-labelledby="tab-host-network"
+              hidden
+            >
+              <div id="host-server-tab-network" class="host-stats-tabpanel-inner"></div>
+            </div>
+            <div
+              id="panel-host-logs"
+              class="host-stats-tabpanel"
+              role="tabpanel"
+              aria-labelledby="tab-host-logs"
+              hidden
+            >
+              <div id="host-server-tab-logs" class="host-stats-tabpanel-inner"></div>
+            </div>
+            <div
+              id="panel-host-charts"
+              class="host-stats-tabpanel"
+              role="tabpanel"
+              aria-labelledby="tab-host-charts"
+              hidden
+            >
+              <div id="host-server-stats-charts" class="host-stats-charts" hidden>
+                <div class="host-stats-chart-toolbar">
+                  <label>
+                    <span data-i18n="status.hostServer.chartMetric">Metric</span>
+                    <select id="host-server-chart-metric"></select>
+                  </label>
+                  <label>
+                    <span data-i18n="status.hostServer.chartRange">Range</span>
+                    <select id="host-server-chart-range">
+                      <option value="15m">15m</option>
+                      <option value="1h" selected>1h</option>
+                      <option value="24h">24h</option>
+                    </select>
+                  </label>
+                </div>
+                <div id="host-server-uplot" class="host-stats-uplot"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="row host-server-options">
+          <label class="host-server-checkbox">
+            <input type="checkbox" id="host-server-live-sse" />
+            <span data-i18n="status.hostServer.liveSse">Live updates (SSE)</span>
+          </label>
+          <span class="muted host-server-sse-hint" data-i18n="status.hostServer.liveSseHint"
+            >Requires CONTROL_API_HOST_STATS_STREAM on the server.</span
+          >
+          <span id="host-server-sse-status" class="host-server-sse-status" aria-live="polite"></span>
+        </div>
+        <p id="host-server-fetch-status" class="host-server-fetch-status" aria-live="polite"></p>
+        <div class="row actions dialog-host-actions">
+          <button type="button" id="btn-host-server-close" class="primary" data-i18n="status.hostServer.close">
+            Close
+          </button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog
+      id="dialog-host-server-drill"
+      class="server-info-dialog host-server-drill-dialog"
+      aria-labelledby="host-server-drill-title"
+    >
+      <div class="server-info-dialog-inner host-server-drill-inner">
+        <header class="host-server-drill-toolbar">
+          <h2 id="host-server-drill-title" class="host-server-drill-title">—</h2>
+          <button
+            type="button"
+            id="btn-host-server-drill-close"
+            class="ghost"
+            data-i18n="status.hostServer.drillClose"
+          >
+            Back
+          </button>
+        </header>
+        <div id="host-server-drill-body" class="host-server-drill-body"></div>
+      </div>
+    </dialog>
+
+    <dialog
+      id="dialog-datasource-wizard"
+      class="server-info-dialog smb-datasource-dialog"
+      aria-labelledby="dialog-datasource-wizard-title"
+    >
+      <div class="server-info-dialog-inner smb-datasource-inner">
+        <div id="wizard-step-pick">
+          <h2 id="dialog-datasource-wizard-title" data-i18n="database.wizardPickTitle">
+            Add data source
+          </h2>
+          <p class="muted smb-datasource-hint" data-i18n="database.wizardPickHint">
+            Choose a type. SMB mounts on the server use restricted sudo.
+          </p>
+          <div class="db-kind-grid" role="list">
+            <button type="button" class="db-kind-card" data-db-kind="smb" data-i18n="database.kindCard.smb">
+              SMB
+            </button>
+            <button type="button" class="db-kind-card" data-db-kind="clickhouse" data-i18n="database.kindCard.clickhouse">
+              ClickHouse
+            </button>
+            <button type="button" class="db-kind-card" data-db-kind="oracle" data-i18n="database.kindCard.oracle">
+              Oracle
+            </button>
+            <button type="button" class="db-kind-card" data-db-kind="mysql" data-i18n="database.kindCard.mysql">
+              MySQL
+            </button>
+            <button type="button" class="db-kind-card" data-db-kind="postgresql" data-i18n="database.kindCard.postgresql">
+              PostgreSQL
+            </button>
+            <button type="button" class="db-kind-card" data-db-kind="mssql" data-i18n="database.kindCard.mssql">
+              MS SQL Server
+            </button>
+            <button type="button" class="db-kind-card" data-db-kind="mongodb" data-i18n="database.kindCard.mongodb">
+              MongoDB
+            </button>
+            <button type="button" class="db-kind-card" data-db-kind="redis" data-i18n="database.kindCard.redis">
+              Redis
+            </button>
+          </div>
+          <details class="db-install-details">
+            <summary data-i18n="database.installSummary">Server installation (Ubuntu)</summary>
+            <p class="muted db-install-hint" data-i18n-html="database.installHintHtml"></p>
+          </details>
+          <div class="row actions smb-datasource-actions">
+            <button type="button" id="btn-wizard-close-pick" class="ghost" data-i18n="database.smbCancel">
+              Cancel
+            </button>
+          </div>
+        </div>
+
+        <div id="wizard-step-form" hidden>
+          <button type="button" id="btn-wizard-back" class="ghost db-wizard-back" data-i18n="database.wizardBack">
+            Back
+          </button>
+          <h2 id="wizard-form-title" class="db-wizard-form-title">—</h2>
+
+          <form id="form-smb-datasource" class="smb-datasource-form" hidden>
+            <p class="muted smb-datasource-hint" data-i18n="database.smbDialogHint">
+              Mount is performed on the server with restricted sudo. Password is not stored in the database.
+            </p>
+            <div class="row">
+              <label for="smb-label" data-i18n="database.smbFieldLabel">Display name</label>
+              <input id="smb-label" name="label" type="text" autocomplete="off" required />
+            </div>
+            <div class="row">
+              <label for="smb-host" data-i18n="database.smbFieldHost">Server</label>
+              <input id="smb-host" name="host" type="text" autocomplete="off" required placeholder="fileserver" />
+            </div>
+            <div class="row">
+              <label for="smb-share" data-i18n="database.smbFieldShare">Share</label>
+              <input id="smb-share" name="share" type="text" autocomplete="off" required placeholder="backups" />
+            </div>
+            <div class="row">
+              <label for="smb-folder" data-i18n="database.smbFieldFolder">Folder</label>
+              <input id="smb-folder" name="folder" type="text" autocomplete="off" placeholder="optional/subfolder" />
+            </div>
+            <div class="row">
+              <label for="smb-username" data-i18n="database.smbFieldUsername">Username</label>
+              <input id="smb-username" name="username" type="text" autocomplete="username" required />
+            </div>
+            <div class="row">
+              <label for="smb-password" data-i18n="database.smbFieldPassword">Password</label>
+              <input id="smb-password" name="password" type="password" autocomplete="current-password" required />
+            </div>
+            <p id="smb-form-error" class="smb-form-error" hidden></p>
+            <div class="row actions smb-datasource-actions">
+              <button type="button" id="btn-smb-cancel" class="ghost" data-i18n="database.smbCancel">Cancel</button>
+              <button type="submit" id="btn-smb-submit" class="primary" data-i18n="database.smbSubmit">
+                Mount and save
+              </button>
+            </div>
+          </form>
+
+          <form id="form-conn-datasource" class="smb-datasource-form" hidden>
+            <p class="muted smb-datasource-hint" data-i18n="database.connDialogHint">
+              Connection details are stored without returning passwords from the API.
+            </p>
+            <p id="conn-pg-install-hint" class="muted smb-datasource-hint" hidden></p>
+            <input type="hidden" id="conn-kind" name="kind" value="" />
+            <div class="row">
+              <label for="conn-label" data-i18n="database.connFieldLabel">Display name</label>
+              <input id="conn-label" name="label" type="text" autocomplete="off" required />
+            </div>
+            <div class="row">
+              <label for="conn-host" data-i18n="database.connFieldHost">Host</label>
+              <input id="conn-host" name="host" type="text" autocomplete="off" required />
+            </div>
+            <div class="row">
+              <label for="conn-port" data-i18n="database.connFieldPort">Port</label>
+              <input id="conn-port" name="port" type="number" min="1" max="65535" required />
+            </div>
+            <div class="row">
+              <label for="conn-database" data-i18n="database.connFieldDatabase">Database / DB</label>
+              <input id="conn-database" name="database" type="text" autocomplete="off" />
+            </div>
+            <div class="row">
+              <label for="conn-username" data-i18n="database.connFieldUsername">Username</label>
+              <input id="conn-username" name="username" type="text" autocomplete="username" />
+            </div>
+            <div class="row">
+              <label for="conn-password" data-i18n="database.connFieldPassword">Password</label>
+              <input id="conn-password" name="password" type="password" autocomplete="current-password" />
+            </div>
+            <div class="row">
+              <label>
+                <input id="conn-ssl" name="ssl" type="checkbox" value="1" />
+                <span data-i18n="database.connFieldSsl">TLS / SSL</span>
+              </label>
+            </div>
+            <p id="conn-form-error" class="smb-form-error" hidden></p>
+            <div class="row actions smb-datasource-actions">
+              <button type="button" id="btn-conn-cancel" class="ghost" data-i18n="database.smbCancel">Cancel</button>
+              <button type="submit" id="btn-conn-submit" class="primary" data-i18n="database.connSubmit">
+                Save connection
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </dialog>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

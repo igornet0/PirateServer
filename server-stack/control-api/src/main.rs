@@ -2,26 +2,36 @@
 
 mod auth;
 mod cors;
+mod data_sources_api;
 mod error;
 
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::HeaderMap;
-use axum::routing::{get, post, put};
+use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use futures::Stream;
+use std::convert::Infallible;
 use clap::{Parser, Subcommand};
 use deploy_auth::{
     load_authorized_peers, load_identity, save_authorized_peers, IdentityFile,
 };
 use deploy_control::{
-    apply_nginx_put, read_nginx_config, ControlPlane, NginxConfigPut, NginxConfigView,
-    NginxPutResponseView, ProcessControlView, ProjectsView, RollbackBody, RollbackView,
+    apply_nginx_put, read_nginx_config, ControlPlane, CpuDetail, DatabaseColumnsView,
+    DatabaseInfoView, DatabaseRelationshipsView, DatabaseSchemasView, DatabaseTablePreviewView,
+    DatabaseTablesView, DiskDetail, HostStatsHistory, MemoryDetail, NginxConfigPut, NginxConfigView,
+    NginxPutResponseView, NetworkDetail, ProcessControlView, ProcessesDetail, ProjectsView,
+    RollbackBody, RollbackView, SeriesResponse,
 };
-use deploy_db::DbStore;
+use deploy_db::{DbStore, PgPool};
+use sqlx::postgres::PgPoolOptions;
 use ed25519_dalek::SigningKey;
 use error::ApiError;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -36,6 +46,32 @@ struct ApiState {
     /// When set, `Authorization: Bearer` may be a valid HS256 JWT issued by `/api/v1/auth/login`.
     jwt_secret: Option<String>,
     jwt_ttl_secs: u64,
+    /// Previous network counters for throughput (overview + detail).
+    host_net: Arc<Mutex<Option<deploy_control::NetCounters>>>,
+    /// Optional path to tail in `HostStatsView.log_tail` (application log only).
+    log_tail_path: Option<PathBuf>,
+    /// When true, record samples for `GET /api/v1/host-stats/series`.
+    host_stats_series_enabled: bool,
+    host_history: Option<Arc<Mutex<HostStatsHistory>>>,
+    /// When true, expose SSE and WebSocket host-stats streams (use with care on public networks).
+    host_stats_stream_enabled: bool,
+    /// Explorer PostgreSQL URL with password removed (for `GET /api/v1/database-info`).
+    explorer_connection_display: Option<String>,
+    /// Root for DB credential files and optional server-side SMB dirs (`install.sh` creates the tree).
+    data_mounts_root: PathBuf,
+    smb_mount_script: PathBuf,
+    smb_umount_script: PathBuf,
+}
+
+/// Parse database URL and strip password for safe display (PostgreSQL; SQLite returned as-is).
+fn redact_database_url(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.starts_with("sqlite:") {
+        return Some(t.to_string());
+    }
+    let mut u = url::Url::parse(t).ok()?;
+    let _ = u.set_password(None);
+    Some(u.to_string())
 }
 
 fn bearer_raw(headers: &HeaderMap) -> Option<&str> {
@@ -45,7 +81,21 @@ fn bearer_raw(headers: &HeaderMap) -> Option<&str> {
         .and_then(|a| a.strip_prefix("Bearer "))
 }
 
-fn check_api_bearer(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
+fn token_matches(state: &ApiState, token: &str) -> bool {
+    if let Some(ref static_tok) = state.api_bearer_token {
+        if token == static_tok.as_str() {
+            return true;
+        }
+    }
+    if let Some(ref secret) = state.jwt_secret {
+        if auth::decode_access_token(token, secret).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn check_api_bearer(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
     let require_auth = state.api_bearer_token.is_some() || state.jwt_secret.is_some();
     if !require_auth {
         return Ok(());
@@ -55,18 +105,41 @@ fn check_api_bearer(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiErro
             "missing or invalid Authorization Bearer token",
         ));
     };
-    if let Some(ref static_tok) = state.api_bearer_token {
-        if token == static_tok.as_str() {
-            return Ok(());
-        }
+    if token_matches(state, token) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized(
+            "missing or invalid Authorization Bearer token",
+        ))
     }
-    if let Some(ref secret) = state.jwt_secret {
-        if auth::decode_access_token(token, secret).is_ok() {
+}
+
+/// Same as [`check_api_bearer`], but also accepts `access_token` query (for EventSource / WebSocket).
+fn check_api_bearer_with_query(
+    state: &ApiState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<(), ApiError> {
+    let require_auth = state.api_bearer_token.is_some() || state.jwt_secret.is_some();
+    if !require_auth {
+        return Ok(());
+    }
+    if let Some(t) = bearer_raw(headers) {
+        return if token_matches(state, t) {
+            Ok(())
+        } else {
+            Err(ApiError::unauthorized(
+                "invalid Authorization Bearer token",
+            ))
+        };
+    }
+    if let Some(t) = query_token {
+        if token_matches(state, t) {
             return Ok(());
         }
     }
     Err(ApiError::unauthorized(
-        "missing or invalid Authorization Bearer token",
+        "missing or invalid token (Authorization Bearer or access_token query for streams)",
     ))
 }
 
@@ -121,7 +194,7 @@ async fn api_login(
     };
     let Some(ref db) = s.plane.db else {
         return Err(ApiError::service_unavailable(
-            "DATABASE_URL is not configured",
+            "metadata database is not configured (set DEPLOY_SQLITE_URL or DATABASE_URL)",
         ));
     };
     let u = body.username.trim();
@@ -180,6 +253,360 @@ async fn api_status(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn api_database_info(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<DatabaseInfoView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .database_info(s.explorer_connection_display.clone())
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn api_database_schemas(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<DatabaseSchemasView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane.database_schemas().await.map(Json).map_err(Into::into)
+}
+
+#[derive(serde::Deserialize)]
+struct DatabaseTablesQuery {
+    schema: String,
+}
+
+async fn api_database_tables(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<DatabaseTablesQuery>,
+) -> Result<Json<DatabaseTablesView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    if q.schema.trim().is_empty() {
+        return Err(ApiError::bad_request("query parameter `schema` is required"));
+    }
+    s.plane
+        .database_tables(q.schema.trim())
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn api_database_columns(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path((schema, table)): Path<(String, String)>,
+) -> Result<Json<DatabaseColumnsView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .database_columns(&schema, &table)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[derive(serde::Deserialize)]
+struct TablePreviewQuery {
+    #[serde(default = "default_preview_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+fn default_preview_limit() -> i64 {
+    100
+}
+
+async fn api_database_table_rows(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path((schema, table)): Path<(String, String)>,
+    Query(q): Query<TablePreviewQuery>,
+) -> Result<Json<DatabaseTablePreviewView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .database_table_preview(&schema, &table, q.limit, q.offset)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn api_database_relationships(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<DatabaseRelationshipsView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .database_relationships()
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+fn host_stats_snapshot_blocking(state: &ApiState) -> deploy_control::HostStatsView {
+    let root = state.plane.deploy_root().to_path_buf();
+    let log_path = state.log_tail_path.clone();
+    let prev = state.host_net.lock().unwrap().clone();
+    let (stats, net) =
+        deploy_control::collect_host_stats(&root, prev.as_ref(), log_path.as_deref());
+    {
+        let mut g = state.host_net.lock().unwrap();
+        *g = Some(net);
+    }
+    if state.host_stats_series_enabled {
+        if let Some(h) = &state.host_history {
+            let ts_ms = chrono::Utc::now().timestamp_millis();
+            let net_rx: f64 = stats
+                .network_interfaces
+                .iter()
+                .map(|i| i.rx_bytes_per_s)
+                .sum();
+            let net_tx: f64 = stats
+                .network_interfaces
+                .iter()
+                .map(|i| i.tx_bytes_per_s)
+                .sum();
+            let mut hist = h.lock().unwrap();
+            hist.record(
+                ts_ms,
+                stats.cpu_usage_percent,
+                stats.memory_used_bytes,
+                stats.load_average_1m,
+                net_rx,
+                net_tx,
+            );
+        }
+    }
+    stats
+}
+
+async fn api_host_stats(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<deploy_control::HostStatsView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let state = s.clone();
+    let stats = tokio::task::spawn_blocking(move || host_stats_snapshot_blocking(&state))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(stats))
+}
+
+#[derive(serde::Deserialize)]
+struct HostStatsDetailQuery {
+    #[serde(default = "default_top_n")]
+    top: usize,
+}
+
+fn default_top_n() -> usize {
+    20
+}
+
+#[derive(serde::Deserialize)]
+struct ProcessesDetailQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default = "default_proc_limit")]
+    limit: usize,
+}
+
+fn default_proc_limit() -> usize {
+    200
+}
+
+#[derive(serde::Deserialize)]
+struct SeriesQuery {
+    metric: String,
+    #[serde(default = "default_series_range")]
+    range: String,
+}
+
+fn default_series_range() -> String {
+    "1h".to_string()
+}
+
+async fn api_host_stats_detail_cpu(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<HostStatsDetailQuery>,
+) -> Result<Json<CpuDetail>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let top = q.top.clamp(5, 100);
+    let detail = tokio::task::spawn_blocking(move || deploy_control::collect_cpu_detail(top))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(detail))
+}
+
+async fn api_host_stats_detail_memory(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<HostStatsDetailQuery>,
+) -> Result<Json<MemoryDetail>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let top = q.top.clamp(5, 100);
+    let detail = tokio::task::spawn_blocking(move || deploy_control::collect_memory_detail(top))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(detail))
+}
+
+async fn api_host_stats_detail_disk(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<HostStatsDetailQuery>,
+) -> Result<Json<DiskDetail>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let top = q.top.clamp(5, 100);
+    let detail = tokio::task::spawn_blocking(move || deploy_control::collect_disk_detail(top))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(detail))
+}
+
+async fn api_host_stats_detail_network(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<NetworkDetail>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let prev = s.host_net.lock().unwrap().clone();
+    let (detail, net) = tokio::task::spawn_blocking(move || {
+        deploy_control::collect_network_detail(prev.as_ref())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    {
+        let mut g = s.host_net.lock().unwrap();
+        *g = Some(net);
+    }
+    Ok(Json(detail))
+}
+
+async fn api_host_stats_detail_processes(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<ProcessesDetailQuery>,
+) -> Result<Json<ProcessesDetail>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let limit = q.limit.clamp(10, 2000);
+    let qstr = q.q.clone();
+    let detail = tokio::task::spawn_blocking(move || {
+        deploy_control::collect_processes_list(&qstr, limit)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(detail))
+}
+
+async fn api_host_stats_series(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<SeriesQuery>,
+) -> Result<Json<SeriesResponse>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    if !s.host_stats_series_enabled {
+        return Err(ApiError::service_unavailable(
+            "CONTROL_API_HOST_STATS_SERIES is not enabled",
+        ));
+    }
+    let Some(h) = &s.host_history else {
+        return Err(ApiError::service_unavailable("series buffer not configured"));
+    };
+    let hist = h.lock().unwrap();
+    let res = hist.series(&q.metric, &q.range);
+    Ok(Json(res))
+}
+
+#[derive(serde::Deserialize)]
+struct StreamAuthQuery {
+    access_token: Option<String>,
+}
+
+async fn api_host_stats_sse(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<StreamAuthQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    check_api_bearer_with_query(&s, &headers, q.access_token.as_deref())?;
+    if !s.host_stats_stream_enabled {
+        return Err(ApiError::service_unavailable(
+            "CONTROL_API_HOST_STATS_STREAM is not enabled",
+        ));
+    }
+    let state = s.clone();
+    let stream = async_stream::stream! {
+        // First snapshot immediately (EventSource / fetch clients see data without a 5s wait).
+        let st0 = state.clone();
+        let json0 = tokio::task::spawn_blocking(move || {
+            let h = host_stats_snapshot_blocking(&st0);
+            serde_json::to_string(&h).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(payload) = json0 {
+            yield Ok(Event::default().data(payload));
+        }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let st = state.clone();
+            let json = tokio::task::spawn_blocking(move || {
+                let h = host_stats_snapshot_blocking(&st);
+                serde_json::to_string(&h).ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(payload) = json {
+                yield Ok(Event::default().data(payload));
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15)),
+    ))
+}
+
+async fn api_host_stats_ws(
+    ws: WebSocketUpgrade,
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<StreamAuthQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_api_bearer_with_query(&s, &headers, q.access_token.as_deref())?;
+    if !s.host_stats_stream_enabled {
+        return Err(ApiError::service_unavailable(
+            "CONTROL_API_HOST_STATS_STREAM is not enabled",
+        ));
+    }
+    let state = s.clone();
+    Ok(ws.on_upgrade(move |socket| host_stats_ws_task(socket, state)))
+}
+
+async fn host_stats_ws_task(mut socket: WebSocket, state: ApiState) {
+    use axum::extract::ws::Message;
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        let st = state.clone();
+        let payload = tokio::task::spawn_blocking(move || {
+            serde_json::to_string(&host_stats_snapshot_blocking(&st)).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(text) = payload else {
+            continue;
+        };
+        if socket.send(Message::Text(text)).await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn api_releases(
@@ -342,17 +769,25 @@ struct Args {
     #[arg(long, default_value = "http://[::1]:50051", env = "GRPC_ENDPOINT")]
     grpc_endpoint: String,
 
-    /// Bind address (`::` or `0.0.0.0` for Docker / all interfaces).
-    #[arg(long, default_value = "::")]
+    /// Bind address (`127.0.0.1` / `::1` for localhost-only; `::` for all interfaces).
+    #[arg(long, env = "CONTROL_API_BIND", default_value = "::")]
     bind: IpAddr,
 
     /// HTTP listen port.
     #[arg(short, long, default_value_t = 8080, env = "CONTROL_API_PORT")]
     listen_port: u16,
 
-    /// Optional; enables `/api/v1/history` and DB fallback for status.
+    /// Metadata SQLite URL (native install). Takes precedence over `DATABASE_URL` when both are set.
+    #[arg(long, env = "DEPLOY_SQLITE_URL")]
+    deploy_sqlite_url: Option<String>,
+
+    /// Metadata database URL: PostgreSQL in Docker, or omit when using `DEPLOY_SQLITE_URL` only.
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
+
+    /// Optional PostgreSQL for dashboard explorer + database-info when metadata is SQLite-only.
+    #[arg(long, env = "POSTGRES_EXPLORER_URL")]
+    postgres_explorer_url: Option<String>,
 
     /// Path to nginx config file for GET/PUT `/api/v1/nginx/config` (optional).
     #[arg(long, env = "NGINX_CONFIG_PATH")]
@@ -370,7 +805,7 @@ struct Args {
     #[arg(long, env = "CONTROL_API_BEARER_TOKEN")]
     api_bearer_token: Option<String>,
 
-    /// HS256 secret for JWTs from `/api/v1/auth/login`. When set with `DATABASE_URL`, dashboard login is enabled.
+    /// HS256 secret for JWTs from `/api/v1/auth/login`. When set with a metadata DB URL, dashboard login is enabled.
     #[arg(long, env = "CONTROL_API_JWT_SECRET")]
     jwt_secret: Option<String>,
 
@@ -381,6 +816,38 @@ struct Args {
     /// Ed25519 identity JSON for signed gRPC `GetStatus` to deploy-server (when server enforces auth).
     #[arg(long, env = "GRPC_SIGNING_KEY_PATH")]
     grpc_signing_key_path: Option<PathBuf>,
+
+    /// If set, last lines of this file are included in `GET /api/v1/host-stats` as `log_tail`.
+    #[arg(long, env = "CONTROL_API_LOG_TAIL_PATH")]
+    log_tail_path: Option<PathBuf>,
+
+    /// Set to `1` to maintain in-memory series for `GET /api/v1/host-stats/series`.
+    #[arg(long, env = "CONTROL_API_HOST_STATS_SERIES", default_value = "0")]
+    host_stats_series: u8,
+
+    /// Set to `1` to enable `GET /api/v1/host-stats/stream` (SSE) and WebSocket `/api/v1/host-stats/ws`.
+    #[arg(long, env = "CONTROL_API_HOST_STATS_STREAM", default_value = "0")]
+    host_stats_stream: u8,
+
+    /// Root for credential files (PostgreSQL, etc.) and per-id dirs if server-side SMB is configured.
+    /// `install.sh` creates `/var/lib/pirate/db-mounts` (SMB mounts themselves use Pirate Client, not the server).
+    #[arg(long, env = "PIRATE_DATA_MOUNTS_ROOT", default_value = "/var/lib/pirate/db-mounts")]
+    data_mounts_root: PathBuf,
+
+    /// Optional: only if you add mount helpers on the host; not installed by `install.sh`.
+    #[arg(
+        long,
+        env = "PIRATE_SMB_MOUNT_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-smb-mount.sh"
+    )]
+    smb_mount_script: PathBuf,
+
+    #[arg(
+        long,
+        env = "PIRATE_SMB_UMOUNT_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-smb-umount.sh"
+    )]
+    smb_umount_script: PathBuf,
 }
 
 fn spawn_reconcile(plane: Arc<ControlPlane>) {
@@ -493,13 +960,37 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "starting control-api"
     );
 
-    let db = if let Some(ref url) = args.database_url {
+    let metadata_url = args
+        .deploy_sqlite_url
+        .clone()
+        .or_else(|| args.database_url.clone())
+        .filter(|s| !s.trim().is_empty());
+
+    let db = if let Some(ref url) = metadata_url {
         let store = DbStore::connect(url).await?;
-        info!("PostgreSQL connected (control-api); schema migrations are applied by deploy-server only");
+        info!("metadata database connected (control-api); migrations are applied by deploy-server only");
         Some(Arc::new(store))
     } else {
         None
     };
+
+    let pg_explorer: Option<Arc<PgPool>> =
+        if let Some(ref u) = args.postgres_explorer_url {
+            if !u.trim().is_empty() {
+                let pool = PgPoolOptions::new()
+                    .max_connections(3)
+                    .connect(u)
+                    .await?;
+                info!("PostgreSQL explorer pool connected");
+                Some(Arc::new(pool))
+            } else {
+                None
+            }
+        } else if let Some(ref d) = db {
+            d.pg_pool().map(|p| Arc::new(p.clone()))
+        } else {
+            None
+        };
 
     let grpc_signing_key: Option<Arc<SigningKey>> = match &args.grpc_signing_key_path {
         Some(p) => Some(Arc::new(load_identity(p)?)),
@@ -510,12 +1001,37 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.deploy_root.clone(),
         args.grpc_endpoint.clone(),
         db.clone(),
+        pg_explorer,
         grpc_signing_key,
     ));
 
     if db.is_some() {
         spawn_reconcile(plane.clone());
     }
+
+    let host_stats_series_enabled = args.host_stats_series != 0;
+    let host_stats_stream_enabled = args.host_stats_stream != 0;
+    let host_history = if host_stats_series_enabled {
+        Some(Arc::new(Mutex::new(HostStatsHistory::default_new())))
+    } else {
+        None
+    };
+
+    let explorer_connection_display = args
+        .postgres_explorer_url
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|u| redact_database_url(u))
+        .or_else(|| {
+            if db.as_ref().map(|d| d.is_postgres()).unwrap_or(false) {
+                args.database_url
+                    .as_ref()
+                    .filter(|s| !s.trim().is_empty())
+                    .and_then(|u| redact_database_url(u))
+            } else {
+                None
+            }
+        });
 
     let state = ApiState {
         plane,
@@ -525,15 +1041,83 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         api_bearer_token: args.api_bearer_token.clone(),
         jwt_secret: args.jwt_secret.clone(),
         jwt_ttl_secs: args.jwt_ttl_secs,
+        host_net: Arc::new(Mutex::new(None)),
+        log_tail_path: args.log_tail_path.clone(),
+        host_stats_series_enabled,
+        host_history,
+        host_stats_stream_enabled,
+        explorer_connection_display,
+        data_mounts_root: args.data_mounts_root.clone(),
+        smb_mount_script: args.smb_mount_script.clone(),
+        smb_umount_script: args.smb_umount_script.clone(),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/auth/login", post(api_login))
         .route("/api/v1/status", get(api_status))
+        .route("/api/v1/host-stats", get(api_host_stats))
+        .route(
+            "/api/v1/host-stats/detail/cpu",
+            get(api_host_stats_detail_cpu),
+        )
+        .route(
+            "/api/v1/host-stats/detail/memory",
+            get(api_host_stats_detail_memory),
+        )
+        .route(
+            "/api/v1/host-stats/detail/disk",
+            get(api_host_stats_detail_disk),
+        )
+        .route(
+            "/api/v1/host-stats/detail/network",
+            get(api_host_stats_detail_network),
+        )
+        .route(
+            "/api/v1/host-stats/detail/processes",
+            get(api_host_stats_detail_processes),
+        )
+        .route("/api/v1/host-stats/series", get(api_host_stats_series))
+        .route("/api/v1/host-stats/stream", get(api_host_stats_sse))
+        .route("/api/v1/host-stats/ws", get(api_host_stats_ws))
         .route("/api/v1/releases", get(api_releases))
         .route("/api/v1/projects", get(api_projects))
         .route("/api/v1/history", get(api_history))
+        .route("/api/v1/database-info", get(api_database_info))
+        .route("/api/v1/database/schemas", get(api_database_schemas))
+        .route("/api/v1/database/tables", get(api_database_tables))
+        .route(
+            "/api/v1/database/tables/:schema/:table/columns",
+            get(api_database_columns),
+        )
+        .route(
+            "/api/v1/database/tables/:schema/:table/rows",
+            get(api_database_table_rows),
+        )
+        .route(
+            "/api/v1/database/relationships",
+            get(api_database_relationships),
+        )
+        .route(
+            "/api/v1/data-sources",
+            get(data_sources_api::api_data_sources_list),
+        )
+        .route(
+            "/api/v1/data-sources/smb",
+            post(data_sources_api::api_post_smb),
+        )
+        .route(
+            "/api/v1/data-sources/connection",
+            post(data_sources_api::api_post_connection),
+        )
+        .route(
+            "/api/v1/data-sources/:id",
+            delete(data_sources_api::api_data_sources_delete),
+        )
+        .route(
+            "/api/v1/data-sources/:id/browse",
+            get(data_sources_api::api_smb_browse),
+        )
         .route("/api/v1/rollback", post(api_rollback))
         .route("/api/v1/process/stop", post(api_process_stop))
         .route("/api/v1/process/restart", post(api_process_restart))

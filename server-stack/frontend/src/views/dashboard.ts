@@ -28,11 +28,38 @@ export async function refreshDashboard(): Promise<void> {
   const releasesEl = document.getElementById("releases")!;
   const historyEl = document.getElementById("history")!;
 
+  const bundleWrap = document.getElementById("local-client-bundle") as HTMLElement | null;
+  const bundleJson = document.getElementById("local-client-json") as HTMLElement | null;
+
   try {
     const data = await fetchStatus();
-    statusEl.textContent = JSON.stringify(data, null, 2);
+    const { local_client: lc, ...core } = data;
+    statusEl.textContent = JSON.stringify(core, null, 2);
+    if (bundleWrap && bundleJson) {
+      const bundle: Record<string, string> = {};
+      if (lc?.token) {
+        bundle.token = lc.token;
+      }
+      if (lc?.url) {
+        bundle.url = lc.url;
+      }
+      if (lc?.pairing) {
+        bundle.pairing = lc.pairing;
+      }
+      if (Object.keys(bundle).length > 0) {
+        bundleWrap.hidden = false;
+        bundleJson.textContent = JSON.stringify(bundle, null, 2);
+      } else {
+        bundleWrap.hidden = true;
+        bundleJson.textContent = "";
+      }
+    }
   } catch (e) {
     statusEl.textContent = formatErr(e);
+    if (bundleWrap && bundleJson) {
+      bundleWrap.hidden = true;
+      bundleJson.textContent = "";
+    }
   }
 
   try {

@@ -206,11 +206,20 @@ pub fn signing_payload(method: &str, project_id: &str, secondary: &str) -> Strin
     let p = normalize_project_for_signing(project_id);
     let is_default = p == "default";
     match method {
-        "Upload" | "Rollback" => {
+        "Upload" | "UploadServerStack" | "Rollback" => {
             if is_default {
                 secondary.to_string()
             } else {
                 format!("{p}|{secondary}")
+            }
+        }
+        // Same signing payload shape as GetStatus / StopProcess (project only when not default).
+        "ProxyTunnel" | "GetStatus" | "StopProcess" | "RestartProcess" | "GetHostStats"
+        | "GetHostStatsDetail" | "GetServerStackInfo" => {
+            if is_default {
+                String::new()
+            } else {
+                p
             }
         }
         _ => {
@@ -246,10 +255,10 @@ pub fn attach_auth_metadata<T>(
     insert_ascii(m, META_TS, &ts_ms.to_string())?;
     insert_ascii(m, META_NONCE, &nonce)?;
     insert_ascii(m, META_SIG, &sig_b64)?;
-    if method == "Upload" && !secondary.is_empty() {
+    if (method == "Upload" || method == "UploadServerStack") && !secondary.is_empty() {
         insert_ascii(m, META_VERSION, secondary)?;
         let p = normalize_project_for_signing(project_id);
-        if p != "default" {
+        if p != "default" && method == "Upload" {
             insert_ascii(m, META_PROJECT, &p)?;
         }
     }
@@ -363,6 +372,28 @@ pub fn verify_upload_metadata(
     verify_rpc_metadata(meta, peers, "Upload", &payload, config, nonce_tracker)
 }
 
+/// Same as [`verify_upload_metadata`] but for `UploadServerStack` (no project metadata).
+pub fn verify_upload_server_stack_metadata(
+    meta: &MetadataMap,
+    peers: &HashSet<[u8; 32]>,
+    config: &AuthConfig,
+    nonce_tracker: &NonceTracker,
+) -> Result<(), AuthError> {
+    let ver = meta
+        .get(META_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AuthError::MissingMetadata(META_VERSION))?;
+    let payload = signing_payload("UploadServerStack", "default", ver);
+    verify_rpc_metadata(
+        meta,
+        peers,
+        "UploadServerStack",
+        &payload,
+        config,
+        nonce_tracker,
+    )
+}
+
 /// Parse connection bundle JSON: `{"token":"...","url":"http://..."}` optional `pairing`.
 #[derive(Debug, Clone)]
 pub struct ConnectionBundle {
@@ -448,5 +479,13 @@ mod tests {
         let tracker = NonceTracker::default();
         let cfg = AuthConfig::default();
         verify_rpc_metadata(meta, &peers, "GetStatus", "", &cfg, &tracker).unwrap();
+    }
+
+    #[test]
+    fn signing_payload_upload_server_stack_uses_version_only_for_default_project() {
+        assert_eq!(
+            signing_payload("UploadServerStack", "default", "v2026-1"),
+            "v2026-1"
+        );
     }
 }

@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use deploy_control::ControlError;
+use deploy_db::DbError;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -70,7 +71,10 @@ impl From<ControlError> for ApiError {
         match e {
             ControlError::Grpc(msg) => ApiError::bad_gateway(msg),
             ControlError::Io(err) => ApiError::internal(err.to_string()),
-            ControlError::Db(err) => ApiError::internal(err.to_string()),
+            ControlError::Db(err) => match err {
+                DbError::InvalidIdentifier(msg) => ApiError::bad_request(msg),
+                other => ApiError::internal(other.to_string()),
+            },
         }
     }
 }

@@ -1,4 +1,4 @@
-use deploy_proto::deploy::DeployChunk;
+use deploy_proto::deploy::{DeployChunk, ServerStackChunk};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::path::Path;
@@ -107,4 +107,68 @@ pub fn build_chunks(
         offset = end;
     }
     out
+}
+
+/// Chunks for `UploadServerStack` (no `project_id`).
+pub fn build_server_stack_chunks(
+    bytes: &[u8],
+    version: &str,
+    sha256_hex: &str,
+    chunk_size: usize,
+) -> Vec<ServerStackChunk> {
+    assert!(chunk_size > 0, "chunk_size must be > 0");
+    if bytes.is_empty() {
+        return vec![ServerStackChunk {
+            data: vec![],
+            version: version.to_string(),
+            is_last: true,
+            sha256_hex: sha256_hex.to_string(),
+        }];
+    }
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    let mut first = true;
+    while offset < bytes.len() {
+        let end = (offset + chunk_size).min(bytes.len());
+        let data = bytes[offset..end].to_vec();
+        let is_last = end >= bytes.len();
+        out.push(ServerStackChunk {
+            data,
+            version: if first {
+                version.to_string()
+            } else {
+                String::new()
+            },
+            is_last,
+            sha256_hex: if is_last {
+                sha256_hex.to_string()
+            } else {
+                String::new()
+            },
+        });
+        first = false;
+        offset = end;
+    }
+    out
+}
+
+/// Pre-built `.tar.gz` / `.tgz` or a directory to pack (same layout as `build-linux-bundle.sh`).
+pub fn read_or_pack_bundle(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    if path.is_file() {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+            return std::fs::read(path);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bundle file must be .tar.gz or .tgz",
+        ));
+    }
+    if path.is_dir() {
+        return pack_directory(path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "bundle path not found",
+    ))
 }

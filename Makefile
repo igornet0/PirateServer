@@ -2,12 +2,12 @@
 # Usage: `make` or `make help`
 
 .PHONY: help all build build-release check test test-unit test-e2e clippy fmt clean \
-	client client-release server server-release control-api control-api-release \
+	client client-release pirate pirate-release server server-release control-api control-api-release \
 	local-agent local-agent-release \
 	rust rust-release frontend frontend-install ui \
 	desktop-ui pirate-desktop pirate-desktop-release pirate-desktop-bundle \
-	build-local build-stack-release dist dist-linux install install-release \
-	bootstrap bootstrap-phase6 e2e local-e2e docker-client-help
+	build-local build-stack-release dist dist-manifest dist-linux dist-arm64-linux install install-release \
+	bootstrap bootstrap-phase6 e2e local-e2e docker-client-help build-desktop-ui
 
 CARGO       ?= cargo
 NPM         ?= npm
@@ -17,6 +17,8 @@ CARGO_TARGET = $(if $(strip $(TARGET)),--target $(TARGET),)
 
 PREFIX      ?= $(CURDIR)/dist
 INSTALL_BIN ?= $(PREFIX)/bin
+# Linux tar.gz bundle: 1 = include server-stack/frontend static UI; 0 = binaries only + .bundle-no-ui (install.sh forbids --ui)
+UI_BUILD    ?= 1
 
 .DEFAULT_GOAL := help
 
@@ -33,21 +35,25 @@ help:
 	@echo "  make rust-release   - same"
 	@echo "  make server-release - deploy-server only (release)"
 	@echo "  make client-release - CLI 'client' only (release)"
+	@echo "  make pirate-release - CLI 'pirate' only (release; auth/board)"
 	@echo "  make control-api-release - control-api only (release)"
 	@echo "  make build-stack-release - server + client + control-api (release, no npm)"
-	@echo "  make dist            - full release workspace + server-stack/frontend/dist"
-	@echo "  make dist-linux      - Linux x86_64 bundle + tar.gz (scripts/build-linux-bundle.sh)"
+	@echo "  make dist                           - rust-release + frontend + dist/release-manifest.json (see VERSION)"
+	@echo "  make dist-linux [UI_BUILD=1]        - Linux x86_64 tar.gz (pirate-linux-amd64-<VERSION>-<date>.tar.gz)"
+	@echo "  make dist-arm64-linux [UI_BUILD=1]  - Linux aarch64 tar.gz (pirate-linux-aarch64-<VERSION>-<date>.tar.gz)"
+	@echo "    UI_BUILD=0 — без статики дашборда, архив с .bundle-no-ui (установка UI недоступна)"
 	@echo "  Cross-compile:  TARGET=x86_64-unknown-linux-gnu make client-release"
 	@echo ""
 	@echo "Single crates (debug):"
-	@echo "  make server | client | control-api | local-agent"
+	@echo "  make server | client | pirate | control-api | local-agent"
 	@echo "  make pirate-desktop - Tauri binary pirate-client (Vite build + cargo debug)"
 	@echo "  make pirate-desktop-bundle - Tauri bundle/installer (npm run tauri:build)"
 	@echo ""
 	@echo "Frontend (dashboard):"
-	@echo "  make frontend       - npm install + vite build → server-stack/frontend/dist"
-	@echo "  make ui             - alias"
-	@echo "  make desktop-ui     - Pirate Client web assets only → local-stack/desktop-ui/dist"
+	@echo "  make frontend          - npm install + vite build → server-stack/frontend/dist"
+	@echo "  make ui                - alias"
+	@echo "  make build-desktop-ui  - build Pirate Client web assets only → local-stack/desktop-ui/dist"
+	@echo "  make desktop-ui        - Pirate Client bundle running Tauri (npm run tauri:build)"
 	@echo ""
 	@echo "Full local dev build:"
 	@echo "  make build-local    - Rust debug workspace + frontend"
@@ -92,6 +98,9 @@ server:
 client:
 	$(CARGO) build -p deploy-client --bin client $(CARGO_TARGET)
 
+pirate:
+	$(CARGO) build -p deploy-client --bin pirate $(CARGO_TARGET)
+
 control-api:
 	$(CARGO) build -p control-api $(CARGO_TARGET)
 
@@ -105,6 +114,9 @@ server-release:
 
 client-release:
 	$(CARGO) build -p deploy-client --bin client --release $(CARGO_TARGET)
+
+pirate-release:
+	$(CARGO) build -p deploy-client --bin pirate --release $(CARGO_TARGET)
 
 control-api-release:
 	$(CARGO) build -p control-api --release $(CARGO_TARGET)
@@ -124,9 +136,13 @@ ui:
 frontend-install:
 	cd server-stack/frontend && $(NPM) ci 2>/dev/null || $(NPM) install
 
-# --- Pirate Client desktop (local UI, 127.0.0.1) ---
 
 desktop-ui:
+	make build-desktop-ui && cd local-stack/desktop-ui && $(NPM) install && $(NPM) run tauri:build
+
+# --- Pirate Client build bundle (desktop UI, 127.0.0.1) ---
+
+build-desktop-ui:
 	cd local-stack/desktop-ui && $(NPM) install && $(NPM) run build
 
 pirate-desktop:
@@ -145,13 +161,21 @@ pirate-desktop-bundle:
 
 build-local: build frontend
 
-# Release Rust workspace + dashboard static files (for nginx root).
-dist: rust-release frontend
-	@echo "Artifacts: target/.../release/* and server-stack/frontend/dist/"
+# Release Rust workspace + dashboard static files (for nginx root) + dist/release-manifest.json.
+dist: rust-release frontend dist-manifest
+	@echo "Artifacts: target/.../release/*, server-stack/frontend/dist/, dist/release-manifest.json"
+
+dist-manifest:
+	@chmod +x scripts/write-release-manifest.sh scripts/read-version.sh
+	./scripts/write-release-manifest.sh
 
 dist-linux:
-	@chmod +x scripts/build-linux-bundle.sh
-	./scripts/build-linux-bundle.sh
+	@chmod +x scripts/build-linux-bundle.sh scripts/linux-bundle-build.sh scripts/read-version.sh scripts/write-server-stack-manifest.sh
+	UI_BUILD=$(UI_BUILD) ./scripts/build-linux-bundle.sh
+
+dist-arm64-linux:
+	@chmod +x scripts/build-arm64-linux-bundle.sh scripts/linux-bundle-build.sh scripts/read-version.sh scripts/write-server-stack-manifest.sh
+	UI_BUILD=$(UI_BUILD) ./scripts/build-arm64-linux-bundle.sh
 
 # --- Install artifacts ---
 

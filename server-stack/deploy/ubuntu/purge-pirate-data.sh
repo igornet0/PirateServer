@@ -7,8 +7,8 @@
 #   sudo ./purge-pirate-data.sh --remove-postgres
 #   sudo ./purge-pirate-data.sh --remove-postgres --remove-linux-user
 #
-# --remove-postgres  — DROP DATABASE deploy и DROP USER deploy (PostgreSQL)
-# --remove-linux-user  — удалить системного пользователя deploy (после удаления каталога)
+# --remove-postgres  — DROP DATABASE/ROLE для legacy «deploy» и опционально explorer (pirate_explorer)
+# --remove-linux-user  — удалить системного пользователя pirate (после удаления каталога)
 
 set -euo pipefail
 
@@ -62,7 +62,7 @@ if [[ "$REMOVE_PG" -eq 1 ]]; then
 fi
 
 if [[ "$REMOVE_PG" -eq 1 ]]; then
-  echo "==> PostgreSQL: база и роль deploy"
+  echo "==> PostgreSQL: legacy deploy / explorer pirate_explorer"
   if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='deploy'" 2>/dev/null | grep -q 1; then
     sudo -u postgres psql -c "DROP DATABASE IF EXISTS deploy;" >/dev/null
     echo "    База deploy удалена."
@@ -75,6 +75,18 @@ if [[ "$REMOVE_PG" -eq 1 ]]; then
   else
     echo "    Роль deploy не найдена."
   fi
+  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='pirate_explorer'" 2>/dev/null | grep -q 1; then
+    sudo -u postgres psql -c "DROP DATABASE IF EXISTS pirate_explorer;" >/dev/null
+    echo "    База pirate_explorer удалена."
+  else
+    echo "    База pirate_explorer не найдена."
+  fi
+  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='pirate_explorer'" 2>/dev/null | grep -q 1; then
+    sudo -u postgres psql -c "DROP USER IF EXISTS pirate_explorer;" >/dev/null
+    echo "    Роль pirate_explorer удалена."
+  else
+    echo "    Роль pirate_explorer не найдена."
+  fi
 fi
 
 echo "==> каталог данных: $DATA_ROOT"
@@ -86,15 +98,18 @@ else
 fi
 
 if [[ "$REMOVE_USER" -eq 1 ]]; then
-  echo "==> системный пользователь deploy"
-  if id deploy &>/dev/null; then
-    userdel deploy 2>/dev/null || userdel -f deploy 2>/dev/null || {
-      echo "Не удалось удалить пользователя deploy (возможно, заняты процессы)." >&2
+  echo "==> системный пользователь pirate"
+  if id pirate &>/dev/null; then
+    userdel pirate 2>/dev/null || userdel -f pirate 2>/dev/null || {
+      echo "Не удалось удалить пользователя pirate (возможно, заняты процессы)." >&2
       exit 1
     }
-    echo "    Пользователь deploy удалён."
+    echo "    Пользователь pirate удалён."
   else
-    echo "    Пользователь deploy отсутствует."
+    echo "    Пользователь pirate отсутствует."
+  fi
+  if id deploy &>/dev/null; then
+    echo "    Предупреждение: остался legacy-пользователь deploy — удалите вручную при необходимости." >&2
   fi
 fi
 

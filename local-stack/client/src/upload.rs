@@ -1,5 +1,5 @@
 use deploy_auth::attach_auth_metadata;
-use deploy_proto::deploy::DeployResponse;
+use deploy_proto::deploy::{DeployResponse, ServerStackInfo, ServerStackResponse};
 
 /// Result of packing + upload (for CLI / desktop metrics).
 pub struct DeploySummary {
@@ -9,12 +9,14 @@ pub struct DeploySummary {
 }
 use deploy_proto::DeployServiceClient;
 use ed25519_dalek::SigningKey;
-use futures_util::stream;
+use futures_util::stream::{self, poll_fn};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Mutex;
+use std::task::Poll;
 use tonic::Request;
 
-use crate::ops::build_chunks;
+use crate::ops::{build_chunks, build_server_stack_chunks};
 
 /// Stream a packed artifact to deploy-server. When `signing_key` is set, request is authenticated.
 pub async fn upload_artifact(
@@ -79,4 +81,84 @@ pub async fn deploy_directory(
         artifact_bytes,
         chunk_count,
     })
+}
+
+/// Stream server-stack tarball to deploy-server (`UploadServerStack`).
+pub async fn upload_server_stack_artifact(
+    endpoint: &str,
+    artifact: &[u8],
+    version: &str,
+    chunk_size: usize,
+    signing_key: Option<&SigningKey>,
+) -> Result<ServerStackResponse, tonic::Status> {
+    upload_server_stack_artifact_with_progress(
+        endpoint,
+        artifact,
+        version,
+        chunk_size,
+        signing_key,
+        |_, _| {},
+    )
+    .await
+}
+
+/// Same as [`upload_server_stack_artifact`] but reports upload progress as bytes sent / total.
+pub async fn upload_server_stack_artifact_with_progress<F>(
+    endpoint: &str,
+    artifact: &[u8],
+    version: &str,
+    chunk_size: usize,
+    signing_key: Option<&SigningKey>,
+    on_progress: F,
+) -> Result<ServerStackResponse, tonic::Status>
+where
+    F: FnMut(u64, u64) + Send + 'static,
+{
+    let digest = Sha256::digest(artifact);
+    let sha256_hex = hex::encode(digest);
+    let chunks = build_server_stack_chunks(artifact, version, &sha256_hex, chunk_size);
+    let total = artifact.len() as u64;
+    let mut chunk_iter = chunks.into_iter();
+    let mut sent = 0u64;
+    let on_progress = Mutex::new(on_progress);
+
+    let st = poll_fn(move |_cx| {
+        let ch = match chunk_iter.next() {
+            Some(c) => c,
+            None => return Poll::Ready(None),
+        };
+        sent += ch.data.len() as u64;
+        if let Ok(mut cb) = on_progress.lock() {
+            (cb)(sent, total);
+        }
+        Poll::Ready(Some(ch))
+    });
+
+    let mut client = DeployServiceClient::connect(endpoint.to_string())
+        .await
+        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let mut req = Request::new(Box::pin(st));
+    if let Some(sk) = signing_key {
+        attach_auth_metadata(&mut req, sk, "UploadServerStack", "", version)
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+    }
+
+    let resp = client.upload_server_stack(req).await?.into_inner();
+    Ok(resp)
+}
+
+pub async fn fetch_server_stack_info(
+    endpoint: &str,
+    signing_key: Option<&SigningKey>,
+) -> Result<ServerStackInfo, tonic::Status> {
+    use deploy_proto::deploy::ServerStackInfoRequest;
+    let mut client = DeployServiceClient::connect(endpoint.to_string())
+        .await
+        .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let mut req = Request::new(ServerStackInfoRequest {});
+    if let Some(sk) = signing_key {
+        attach_auth_metadata(&mut req, sk, "GetServerStackInfo", "", "")
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+    }
+    Ok(client.get_server_stack_info(req).await?.into_inner())
 }

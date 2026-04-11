@@ -1,12 +1,12 @@
 [Unit]
 Description=Deploy gRPC server (artifact deployment)
-After=network-online.target postgresql.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=deploy
-Group=deploy
+User=pirate
+Group=pirate
 EnvironmentFile=-/etc/pirate-deploy.env
 Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/deploy-server --root /var/lib/pirate/deploy -p 50051

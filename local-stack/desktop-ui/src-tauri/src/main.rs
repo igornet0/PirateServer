@@ -3,6 +3,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::time::Duration;
+use tauri::Emitter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -74,6 +76,87 @@ fn refresh_grpc_status() -> Result<pirate_desktop::GrpcConnectResult, String> {
 }
 
 #[tauri::command]
+fn get_control_api_base() -> Option<String> {
+    pirate_desktop::load_control_api_base()
+}
+
+#[tauri::command]
+fn set_control_api_base(url: String) -> Result<(), String> {
+    pirate_desktop::set_control_api_base(&url)
+}
+
+#[tauri::command]
+fn fetch_remote_host_stats() -> Result<String, String> {
+    pirate_desktop::fetch_host_stats_json()
+}
+
+#[tauri::command]
+fn fetch_remote_host_stats_detail(
+    kind: i32,
+    top: u32,
+    q: String,
+    limit: u32,
+) -> Result<String, String> {
+    pirate_desktop::fetch_host_stats_detail_json(kind, top, q, limit)
+}
+
+/// `GET {base}/api/v1/host-stats/series` for `net_rx` and `net_tx` (control-api; requires
+/// `CONTROL_API_HOST_STATS_SERIES=1` on the server). Same base URL as gRPC endpoint (HTTPS).
+#[tauri::command]
+async fn fetch_remote_host_stats_series(base_url: String, range: String) -> Result<String, String> {
+    fn norm_range(s: &str) -> &'static str {
+        let r = s.trim().to_lowercase().replace(' ', "");
+        match r.as_str() {
+            "15m" | "15min" => "15m",
+            "1h" | "60m" | "60min" => "1h",
+            "24h" | "24hr" | "1d" | "1440m" => "24h",
+            "7d" | "1w" | "week" | "168h" | "168hr" => "7d",
+            _ => "1h",
+        }
+    }
+
+    let base = base_url.trim().trim_end_matches('/');
+    let enc = norm_range(&range);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let rx_url = format!("{base}/api/v1/host-stats/series?metric=net_rx&range={enc}");
+    let tx_url = format!("{base}/api/v1/host-stats/series?metric=net_tx&range={enc}");
+
+    let (rx_res, tx_res) = tokio::join!(client.get(&rx_url).send(), client.get(&tx_url).send(),);
+
+    let rx_res = rx_res.map_err(|e| e.to_string())?;
+    let tx_res = tx_res.map_err(|e| e.to_string())?;
+
+    let rx_status = rx_res.status();
+    let tx_status = tx_res.status();
+    let rx_body = rx_res.text().await.map_err(|e| e.to_string())?;
+    let tx_body = tx_res.text().await.map_err(|e| e.to_string())?;
+
+    if !rx_status.is_success() {
+        return Err(format!(
+            "net_rx HTTP {}: {}",
+            rx_status,
+            rx_body.chars().take(200).collect::<String>()
+        ));
+    }
+    if !tx_status.is_success() {
+        return Err(format!(
+            "net_tx HTTP {}: {}",
+            tx_status,
+            tx_body.chars().take(200).collect::<String>()
+        ));
+    }
+
+    let net_rx: serde_json::Value = serde_json::from_str(&rx_body).map_err(|e| e.to_string())?;
+    let net_tx: serde_json::Value = serde_json::from_str(&tx_body).map_err(|e| e.to_string())?;
+    let out = serde_json::json!({ "net_rx": net_rx, "net_tx": net_tx });
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_active_project() -> String {
     pirate_desktop::load_project_id()
 }
@@ -118,12 +201,83 @@ fn delete_server_bookmark(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn add_server_bookmark(url: String) -> Result<pirate_desktop::ServerBookmark, String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Err("URL is empty".into());
+    }
+    let id = pirate_desktop::upsert_bookmark(u, u)?;
+    pirate_desktop::load_bookmarks()
+        .into_iter()
+        .find(|b| b.id == id)
+        .ok_or_else(|| "bookmark not found after insert".to_string())
+}
+
+#[tauri::command]
 fn activate_server_bookmark(url: String) -> Result<pirate_desktop::GrpcConnectResult, String> {
     pirate_desktop::connection::activate_bookmark_url(&url)
 }
 
+#[tauri::command]
+fn rename_server_bookmark(id: String, label: String) -> Result<(), String> {
+    pirate_desktop::set_bookmark_label(&id, label)
+}
+
+#[tauri::command]
+fn monitoring_api_base() -> Option<String> {
+    pirate_desktop::monitoring_api_base()
+}
+
+#[tauri::command]
+fn monitoring_set_economy(enabled: bool) -> bool {
+    pirate_desktop::monitoring_set_economy_mode(enabled)
+}
+
+#[tauri::command]
+fn pick_server_stack_tar_gz() -> Result<Option<String>, String> {
+    Ok(rfd::FileDialog::new()
+        .add_filter("Tarball", &["tar.gz", "tgz"])
+        .pick_file()
+        .map(|p| p.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn fetch_server_stack_info_cmd() -> Result<String, String> {
+    pirate_desktop::fetch_server_stack_info_json()
+}
+
+#[tauri::command]
+async fn apply_server_stack_update(
+    app: tauri::AppHandle,
+    path: String,
+    version: String,
+    chunk_size: Option<u32>,
+) -> Result<pirate_desktop::ServerStackOutcome, String> {
+    let chunk = chunk_size.unwrap_or(64 * 1024) as usize;
+    let path = PathBuf::from(path);
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        pirate_desktop::run_server_stack_update_with_progress(path, version, chunk, move |sent, total| {
+            let _ = app.emit(
+                "server_stack_upload_progress",
+                serde_json::json!({ "sent": sent, "total": total }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn main() {
     let _guard = init_tracing();
+    if let Err(e) = pirate_desktop::spawn_monitoring_server() {
+        tracing::warn!(%e, "monitoring HTTP server not started");
+    } else {
+        tracing::info!(
+            base = ?pirate_desktop::monitoring_api_base(),
+            "monitoring API"
+        );
+    }
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -133,6 +287,8 @@ fn main() {
             clear_grpc_connection,
             test_grpc_endpoint,
             refresh_grpc_status,
+            get_control_api_base,
+            set_control_api_base,
             get_active_project,
             set_active_project,
             pick_deploy_directory,
@@ -140,7 +296,17 @@ fn main() {
             rollback_deploy,
             list_server_bookmarks,
             delete_server_bookmark,
+            add_server_bookmark,
             activate_server_bookmark,
+            rename_server_bookmark,
+            monitoring_api_base,
+            monitoring_set_economy,
+            fetch_remote_host_stats,
+            fetch_remote_host_stats_detail,
+            fetch_remote_host_stats_series,
+            pick_server_stack_tar_gz,
+            fetch_server_stack_info_cmd,
+            apply_server_stack_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,0 +1,43 @@
+# Генерируется install.sh: __pirate_SERVER_NAMES__ — server_name; без статики UI (--nginx без --ui).
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __pirate_SERVER_NAMES__;
+
+    location /api/ {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    location /health {
+        proxy_pass http://127.0.0.1:8080/health;
+    }
+
+    location / {
+        return 404;
+    }
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location /api/ {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    location /health {
+        proxy_pass http://127.0.0.1:8080/health;
+    }
+
+    location / {
+        return 404;
+    }
+}

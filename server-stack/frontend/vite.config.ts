@@ -8,7 +8,19 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://[::1]:8080",
+      "/api": {
+        target: "http://[::1]:8080",
+        changeOrigin: true,
+        ws: true,
+        configure(proxy) {
+          proxy.on("proxyReq", (proxyReq, req) => {
+            if (req.url?.includes("/stream")) {
+              proxyReq.setHeader("Accept", "text/event-stream");
+              proxyReq.setHeader("X-Accel-Buffering", "no");
+            }
+          });
+        },
+      },
       "/health": "http://[::1]:8080",
     },
   },

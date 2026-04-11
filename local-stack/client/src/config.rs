@@ -16,6 +16,11 @@ pub fn connection_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("connection.json"))
 }
 
+/// Normalize gRPC URL for comparison and storage (trim, strip trailing `/`).
+pub fn normalize_endpoint(s: &str) -> String {
+    s.trim().trim_end_matches('/').to_string()
+}
+
 pub fn load_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error>> {
     let path = identity_path().ok_or("no config directory")?;
     deploy_auth::load_or_create_identity(&path).map_err(|e| e.into())
@@ -33,6 +38,14 @@ pub fn load_connection() -> Option<StoredConnection> {
     let path = connection_path()?;
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
+}
+
+/// True when `connection.json` matches this endpoint and is paired (signed gRPC).
+pub fn use_signed_requests(endpoint: &str) -> bool {
+    let ep = normalize_endpoint(endpoint);
+    load_connection()
+        .map(|c| c.paired && normalize_endpoint(&c.url) == ep)
+        .unwrap_or(false)
 }
 
 pub fn save_connection(c: &StoredConnection) -> Result<(), Box<dyn std::error::Error>> {

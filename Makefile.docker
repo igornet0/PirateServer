@@ -1,4 +1,4 @@
-# Docker Compose helpers for docker-compose.test.yml
+# Docker Compose helpers (test stack + dev-frontend: UI из server-stack/frontend/dist)
 # Usage from repo root: make -f Makefile.docker <target>
 #
 # Примеры:
@@ -11,21 +11,23 @@
 #   make -f Makefile.docker e2e-nginx
 
 CARGO ?= cargo
-COMPOSE := docker compose -f docker-compose.test.yml
-COMPOSE_NGINX := docker compose -f docker-compose.test.yml -f docker-compose.nginx-e2e.yml
-COMPOSE_BEARER := docker compose -f docker-compose.test.yml -f docker-compose.bearer-override.yml
+# Дашборд из server-stack/frontend/dist на хосте (без пересборки образа nginx при правках UI).
+COMPOSE := docker compose -f docker-compose.test.yml -f docker-compose.dev-frontend.yml
+COMPOSE_NGINX := $(COMPOSE) -f docker-compose.nginx-e2e.yml
+COMPOSE_BEARER := docker compose -f docker-compose.test.yml -f docker-compose.bearer-override.yml -f docker-compose.dev-frontend.yml
 TAIL ?= 100
 
 .PHONY: help up down down-v build restart stop ps status logs logs-follow e2e e2e-bearer e2e-nginx connection \
 	client-status client-deploy doctor
 
 help:
-	@echo "Docker (docker-compose.test.yml):"
-	@echo "  up            — поднять стек в фоне (build + up -d)"
+	@echo "Docker (docker-compose.test.yml + docker-compose.dev-frontend.yml):"
+	@echo "  up            — поднять стек в фоне (build + up -d); UI из server-stack/frontend/dist"
+	@echo "                  (один раз: cd server-stack/frontend && npm ci && npm run build; при разработке: npm run build:watch)"
 	@echo "  down          — остановить и убрать контейнеры"
 	@echo "  down-v        — down и удалить тома (postgres/deploy-data); если postgres падает с \"No space\""
 	@echo "  build         — только собрать образы"
-	@echo "  restart       — пересборка образов (в т.ч. server-stack/frontend → nginx) и up -d"
+	@echo "  restart       — пересборка образов и up -d (дашборд по-прежнему с хостового dist)"
 	@echo "  stop          — остановить без удаления контейнеров"
 	@echo "  ps / status   — состояние контейнеров"
 	@echo "  logs          — последние логи (TAIL=$(TAIL) строк, все сервисы)"

@@ -1,8 +1,20 @@
-//! PostgreSQL pool, migrations, and helpers for deploy events + snapshot.
+//! Metadata store (PostgreSQL or SQLite) and PostgreSQL-only explorer helpers.
+
+mod data_sources;
+mod explorer;
+
+pub use data_sources::DataSourceRow;
+pub use explorer::{
+    explorer_columns, explorer_foreign_keys, explorer_schemas, explorer_table_preview,
+    explorer_tables, fetch_postgres_server_info, validate_pg_ident, ForeignKeyRow, PostgresServerInfoRow,
+    SchemaRow, TableColumnRow, TablePreview, TableSummaryRow,
+};
+pub use sqlx::postgres::PgPool;
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::SqlitePoolOptions;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,29 +23,59 @@ pub enum DbError {
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("invalid identifier: {0}")]
+    InvalidIdentifier(String),
 }
 
-pub struct DbStore {
-    pool: PgPool,
+/// Deploy metadata: events, snapshots, dashboard users, data sources.
+pub enum DbStore {
+    Postgres(PgPool),
+    Sqlite(SqlitePool),
 }
 
 impl DbStore {
+    /// Connect using `postgresql://…` or `sqlite:…` (including `sqlite::memory:`).
     pub async fn connect(database_url: &str) -> Result<Self, DbError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(database_url)
-            .await?;
-        Ok(Self { pool })
+        let u = database_url.trim();
+        if u.starts_with("sqlite:") {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect(u)
+                .await?;
+            Ok(Self::Sqlite(pool))
+        } else {
+            let pool = PgPoolOptions::new()
+                .max_connections(5)
+                .connect(u)
+                .await?;
+            Ok(Self::Postgres(pool))
+        }
     }
 
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    #[must_use]
+    pub fn is_postgres(&self) -> bool {
+        matches!(self, Self::Postgres(_))
     }
 
-    /// Apply schema migrations. Call this from **one** process only (typically `deploy-server`);
-    /// other binaries should use [`Self::connect`] against an already-migrated database.
+    /// When metadata is stored in PostgreSQL, the same pool may be used for the schema explorer.
+    #[must_use]
+    pub fn pg_pool(&self) -> Option<&PgPool> {
+        match self {
+            Self::Postgres(p) => Some(p),
+            Self::Sqlite(_) => None,
+        }
+    }
+
+    /// Apply schema migrations. Call from **one** process only (typically `deploy-server`).
     pub async fn migrate(&self) -> Result<(), DbError> {
-        sqlx::migrate!("./migrations").run(&self.pool).await?;
+        match self {
+            Self::Postgres(p) => {
+                sqlx::migrate!("./migrations").run(p).await?;
+            }
+            Self::Sqlite(p) => {
+                sqlx::migrate!("./migrations_sqlite").run(p).await?;
+            }
+        }
         Ok(())
     }
 
@@ -44,18 +86,36 @@ impl DbStore {
         version: &str,
         state_snapshot: Option<&str>,
     ) -> Result<(), DbError> {
-        sqlx::query(
-            r#"
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query(
+                    r#"
             INSERT INTO deploy_events (project_id, kind, version, state_snapshot)
             VALUES ($1, $2, $3, $4)
             "#,
-        )
-        .bind(project_id)
-        .bind(kind)
-        .bind(version)
-        .bind(state_snapshot)
-        .execute(&self.pool)
-        .await?;
+                )
+                .bind(project_id)
+                .bind(kind)
+                .bind(version)
+                .bind(state_snapshot)
+                .execute(pool)
+                .await?;
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query(
+                    r#"
+            INSERT INTO deploy_events (project_id, kind, version, state_snapshot)
+            VALUES ($1, $2, $3, $4)
+            "#,
+                )
+                .bind(project_id)
+                .bind(kind)
+                .bind(version)
+                .bind(state_snapshot)
+                .execute(pool)
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -66,36 +126,77 @@ impl DbStore {
         state: &str,
         last_error: Option<&str>,
     ) -> Result<(), DbError> {
-        sqlx::query(
-            r#"
+        let now = Utc::now();
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query(
+                    r#"
             INSERT INTO project_snapshots (project_id, current_version, state, last_error, updated_at)
-            VALUES ($1, $2, $3, $4, NOW())
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (project_id) DO UPDATE SET
               current_version = EXCLUDED.current_version,
               state = EXCLUDED.state,
               last_error = EXCLUDED.last_error,
-              updated_at = NOW()
+              updated_at = EXCLUDED.updated_at
             "#,
-        )
-        .bind(project_id)
-        .bind(current_version)
-        .bind(state)
-        .bind(last_error)
-        .execute(&self.pool)
-        .await?;
+                )
+                .bind(project_id)
+                .bind(current_version)
+                .bind(state)
+                .bind(last_error)
+                .bind(now)
+                .execute(pool)
+                .await?;
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query(
+                    r#"
+            INSERT INTO project_snapshots (project_id, current_version, state, last_error, updated_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (project_id) DO UPDATE SET
+              current_version = excluded.current_version,
+              state = excluded.state,
+              last_error = excluded.last_error,
+              updated_at = excluded.updated_at
+            "#,
+                )
+                .bind(project_id)
+                .bind(current_version)
+                .bind(state)
+                .bind(last_error)
+                .bind(now)
+                .execute(pool)
+                .await?;
+            }
+        }
         Ok(())
     }
 
     pub async fn get_snapshot(&self, project_id: &str) -> Result<Option<SnapshotRow>, DbError> {
-        let row = sqlx::query_as::<_, SnapshotRow>(
-            r#"
+        let row = match self {
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, SnapshotRow>(
+                    r#"
             SELECT current_version, state, last_error, updated_at
             FROM project_snapshots WHERE project_id = $1
             "#,
-        )
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await?;
+                )
+                .bind(project_id)
+                .fetch_optional(pool)
+                .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, SnapshotRow>(
+                    r#"
+            SELECT current_version, state, last_error, updated_at
+            FROM project_snapshots WHERE project_id = $1
+            "#,
+                )
+                .bind(project_id)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
         Ok(row)
     }
 
@@ -105,32 +206,65 @@ impl DbStore {
         limit: i64,
         project_id: Option<&str>,
     ) -> Result<Vec<DeployEventRow>, DbError> {
-        let rows = if let Some(pid) = project_id {
-            sqlx::query_as::<_, DeployEventRow>(
-                r#"
+        let rows = match self {
+            Self::Postgres(pool) => {
+                if let Some(pid) = project_id {
+                    sqlx::query_as::<_, DeployEventRow>(
+                        r#"
                 SELECT id, kind, version, created_at, state_snapshot, project_id
                 FROM deploy_events
                 WHERE project_id = $1
                 ORDER BY id DESC
                 LIMIT $2
                 "#,
-            )
-            .bind(pid)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, DeployEventRow>(
-                r#"
+                    )
+                    .bind(pid)
+                    .bind(limit)
+                    .fetch_all(pool)
+                    .await?
+                } else {
+                    sqlx::query_as::<_, DeployEventRow>(
+                        r#"
                 SELECT id, kind, version, created_at, state_snapshot, project_id
                 FROM deploy_events
                 ORDER BY id DESC
                 LIMIT $1
                 "#,
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+                    )
+                    .bind(limit)
+                    .fetch_all(pool)
+                    .await?
+                }
+            }
+            Self::Sqlite(pool) => {
+                if let Some(pid) = project_id {
+                    sqlx::query_as::<_, DeployEventRow>(
+                        r#"
+                SELECT id, kind, version, created_at, state_snapshot, project_id
+                FROM deploy_events
+                WHERE project_id = $1
+                ORDER BY id DESC
+                LIMIT $2
+                "#,
+                    )
+                    .bind(pid)
+                    .bind(limit)
+                    .fetch_all(pool)
+                    .await?
+                } else {
+                    sqlx::query_as::<_, DeployEventRow>(
+                        r#"
+                SELECT id, kind, version, created_at, state_snapshot, project_id
+                FROM deploy_events
+                ORDER BY id DESC
+                LIMIT $1
+                "#,
+                    )
+                    .bind(limit)
+                    .fetch_all(pool)
+                    .await?
+                }
+            }
         };
         Ok(rows)
     }
@@ -139,35 +273,66 @@ impl DbStore {
         &self,
         username: &str,
     ) -> Result<Option<DashboardUserRow>, DbError> {
-        let row = sqlx::query_as::<_, DashboardUserRow>(
-            r#"
+        let row = match self {
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, DashboardUserRow>(
+                    r#"
             SELECT id, username, password_hash, created_at
             FROM dashboard_users WHERE username = $1
             "#,
-        )
-        .bind(username)
-        .fetch_optional(&self.pool)
-        .await?;
+                )
+                .bind(username)
+                .fetch_optional(pool)
+                .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, DashboardUserRow>(
+                    r#"
+            SELECT id, username, password_hash, created_at
+            FROM dashboard_users WHERE username = $1
+            "#,
+                )
+                .bind(username)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
         Ok(row)
     }
 
-    /// Insert new user or update password hash when `username` already exists.
     pub async fn upsert_dashboard_user(
         &self,
         username: &str,
         password_hash: &str,
     ) -> Result<(), DbError> {
-        sqlx::query(
-            r#"
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query(
+                    r#"
             INSERT INTO dashboard_users (username, password_hash)
             VALUES ($1, $2)
             ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash
             "#,
-        )
-        .bind(username)
-        .bind(password_hash)
-        .execute(&self.pool)
-        .await?;
+                )
+                .bind(username)
+                .bind(password_hash)
+                .execute(pool)
+                .await?;
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query(
+                    r#"
+            INSERT INTO dashboard_users (username, password_hash)
+            VALUES ($1, $2)
+            ON CONFLICT (username) DO UPDATE SET password_hash = excluded.password_hash
+            "#,
+                )
+                .bind(username)
+                .bind(password_hash)
+                .execute(pool)
+                .await?;
+            }
+        }
         Ok(())
     }
 }

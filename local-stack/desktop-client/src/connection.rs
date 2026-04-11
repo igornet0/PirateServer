@@ -8,9 +8,14 @@ use deploy_proto::deploy::{PairRequest, StatusRequest, StatusResponse};
 use ed25519_dalek::SigningKey;
 use deploy_proto::DeployServiceClient;
 use rand_core::{OsRng, RngCore};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 use tonic::Request;
+
+use crate::bookmarks::bookmark_pairing_pubkey_for_url;
+use crate::desktop_store;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,13 +23,6 @@ pub struct GrpcConnectResult {
     pub endpoint: String,
     pub current_version: String,
     pub state: String,
-}
-
-fn config_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("PirateClient")
-        .join("grpc_connection.json")
 }
 
 fn identity_path() -> PathBuf {
@@ -66,6 +64,19 @@ fn validate_endpoint(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `true` when JSON is an object that includes `token` (full install bundle → Pair flow).
+fn install_json_has_token(text: &str) -> Result<bool, String> {
+    let t = text.trim();
+    if !t.starts_with('{') {
+        return Ok(false);
+    }
+    let v: Value = serde_json::from_str(t).map_err(|e| format!("invalid json: {e}"))?;
+    let Some(obj) = v.as_object() else {
+        return Err("expected a JSON object".into());
+    };
+    Ok(obj.contains_key("token"))
+}
+
 /// Extract URL from install JSON or legacy `export GRPC_ENDPOINT=…` / single URL line.
 pub fn parse_grpc_endpoint_from_bundle(text: &str) -> Result<String, String> {
     let t = text.trim();
@@ -74,8 +85,24 @@ pub fn parse_grpc_endpoint_from_bundle(text: &str) -> Result<String, String> {
     }
 
     if t.starts_with('{') {
-        let b = ConnectionBundle::parse(t).map_err(|e| e.to_string())?;
-        return Ok(normalize_endpoint(&b.url));
+        if install_json_has_token(t)? {
+            let b = ConnectionBundle::parse(t).map_err(|e| e.to_string())?;
+            return Ok(normalize_endpoint(&b.url));
+        }
+        let v: Value = serde_json::from_str(t).map_err(|e| format!("invalid json: {e}"))?;
+        let Some(obj) = v.as_object() else {
+            return Err("expected a JSON object".into());
+        };
+        let url = obj
+            .get("url")
+            .or_else(|| obj.get("endpoint"))
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| {
+                r#"expected "url" or "endpoint", or install JSON with "token" for pairing"#
+                    .to_string()
+            })?;
+        validate_endpoint(url)?;
+        return Ok(normalize_endpoint(url));
     }
 
     let lines: Vec<&str> = t.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
@@ -108,15 +135,25 @@ pub fn parse_grpc_endpoint_from_bundle(text: &str) -> Result<String, String> {
     }
 
     Err(
-        "expected JSON bundle with token/url/pairing, or export GRPC_ENDPOINT=…, or a single http(s) URL"
+        "expected {\"url\":\"http://…\"} or install JSON with token/url/pairing, or export GRPC_ENDPOINT=…, or a single http(s) URL"
             .into(),
     )
 }
 
 fn load_stored() -> Option<StoredConnection> {
-    let path = config_path();
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    let c = desktop_store::open().ok()?;
+    let mut stmt = c
+        .prepare("SELECT url, server_pubkey_b64, paired, project_id FROM connection WHERE id = 1")
+        .ok()?;
+    stmt.query_row([], |row| {
+        Ok(StoredConnection {
+            url: row.get(0)?,
+            server_pubkey_b64: row.get(1)?,
+            paired: row.get::<_, i64>(2)? != 0,
+            project_id: row.get(3)?,
+        })
+    })
+    .ok()
 }
 
 fn use_signed_for_endpoint(endpoint: &str) -> bool {
@@ -173,28 +210,71 @@ pub fn verify_grpc_endpoint(endpoint: &str) -> Result<GrpcConnectResult, String>
 pub fn save_endpoint(endpoint: &str) -> Result<(), String> {
     validate_endpoint(endpoint)?;
     let endpoint = normalize_endpoint(endpoint);
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+    let c = desktop_store::open().map_err(|e| e.to_string())?;
     let project_id = load_stored()
         .map(|s| s.project_id)
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(default_project_id);
-    let body = StoredConnection {
-        url: endpoint.clone(),
-        server_pubkey_b64: None,
-        paired: false,
-        project_id,
-    };
-    let json = serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    if let Some(pk) = bookmark_pairing_pubkey_for_url(&endpoint) {
+        c.execute(
+            "UPDATE connection SET url = ?1, server_pubkey_b64 = ?2, paired = 1, project_id = ?3 WHERE id = 1",
+            params![endpoint, pk, project_id],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        c.execute(
+            "UPDATE connection SET url = ?1, server_pubkey_b64 = NULL, paired = 0, project_id = ?2 WHERE id = 1",
+            params![endpoint, project_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let _ = crate::bookmarks::upsert_bookmark(&endpoint, &endpoint);
     Ok(())
 }
 
 pub fn load_endpoint() -> Option<String> {
-    load_stored().map(|s| s.url)
+    load_stored().and_then(|s| {
+        let u = s.url.trim();
+        if u.is_empty() {
+            None
+        } else {
+            Some(u.to_string())
+        }
+    })
+}
+
+/// HTTP base for control-api (`/api/v1/...`), **not** the gRPC deploy-server URL.
+/// Charts and REST host-stats series use this; gRPC stays on [`load_endpoint`].
+pub fn load_control_api_base() -> Option<String> {
+    let c = desktop_store::open().ok()?;
+    let s: String = c
+        .query_row(
+            "SELECT control_api_base_url FROM connection WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(normalize_endpoint(t))
+    }
+}
+
+/// Persist control-api HTTP base (e.g. `http://192.168.0.30:8080`). Empty string clears.
+pub fn set_control_api_base(url: &str) -> Result<(), String> {
+    let t = url.trim();
+    if !t.is_empty() {
+        validate_endpoint(t)?;
+    }
+    let c = desktop_store::open().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE connection SET control_api_base_url = ?1 WHERE id = 1",
+        params![normalize_endpoint(t)],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Active deploy project id (persisted with the gRPC connection).
@@ -214,17 +294,15 @@ pub fn load_project_id() -> String {
 /// Set active project id (requires an existing saved connection file).
 pub fn set_active_project(project_id: String) -> Result<(), String> {
     deploy_core::validate_project_id(&project_id).map_err(|e| e.to_string())?;
-    let path = config_path();
-    let mut s = load_stored().ok_or_else(|| "save a gRPC connection first".to_string())?;
-    s.project_id = deploy_core::normalize_project_id(&project_id);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?,
+    let _ = load_stored().ok_or_else(|| "save a gRPC connection first".to_string())?;
+    let pid = deploy_core::normalize_project_id(&project_id);
+    let c = desktop_store::open().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE connection SET project_id = ?1 WHERE id = 1",
+        params![pid],
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Switch active connection to saved URL and verify gRPC (GetStatus).
@@ -235,18 +313,19 @@ pub fn activate_bookmark_url(url: &str) -> Result<GrpcConnectResult, String> {
 }
 
 pub fn clear_endpoint() -> Result<(), String> {
-    let path = config_path();
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+    let c = desktop_store::open().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE connection SET url = '', server_pubkey_b64 = NULL, paired = 0, control_api_base_url = '' WHERE id = 1",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Parse install JSON, run `Pair`, verify server, save connection + identity.
 pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
     let t = bundle.trim();
-    if !t.starts_with('{') {
+    if !install_json_has_token(t)? {
         let ep = parse_grpc_endpoint_from_bundle(bundle)?;
         let res = verify_grpc_endpoint(&ep)?;
         save_endpoint(&res.endpoint)?;
@@ -297,10 +376,6 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
         )
         .map_err(|e| format!("server identity check failed: {e}"))?;
 
-        let path = config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
         let body = StoredConnection {
             url: normalize_endpoint(&b.url),
             server_pubkey_b64: Some(b.server_pubkey_b64.clone()),
@@ -310,9 +385,14 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
                 .filter(|p| !p.trim().is_empty())
                 .unwrap_or_else(default_project_id),
         };
-        std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?,
+        let c = desktop_store::open().map_err(|e| e.to_string())?;
+        c.execute(
+            "UPDATE connection SET url = ?1, server_pubkey_b64 = ?2, paired = 1, project_id = ?3 WHERE id = 1",
+            params![
+                body.url.clone(),
+                body.server_pubkey_b64.clone(),
+                body.project_id.clone(),
+            ],
         )
         .map_err(|e| e.to_string())?;
 
@@ -332,6 +412,7 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
 
         let endpoint = normalize_endpoint(&b.url);
         let _ = crate::bookmarks::upsert_bookmark(&endpoint, &endpoint);
+        let _ = crate::bookmarks::set_bookmark_pairing(&endpoint, b.server_pubkey_b64.clone());
 
         Ok(GrpcConnectResult {
             endpoint,
@@ -339,4 +420,39 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
             state: r.state,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_grpc_endpoint_from_bundle;
+
+    #[test]
+    fn parse_minimal_url_json() {
+        assert_eq!(
+            parse_grpc_endpoint_from_bundle(r#"{"url":"http://127.0.0.1:50051"}"#).unwrap(),
+            "http://127.0.0.1:50051"
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_alias_json() {
+        assert_eq!(
+            parse_grpc_endpoint_from_bundle(r#"{"endpoint":"http://[::1]:50051/"}"#).unwrap(),
+            "http://[::1]:50051"
+        );
+    }
+
+    #[test]
+    fn parse_install_bundle_extracts_url() {
+        let u = parse_grpc_endpoint_from_bundle(
+            r#"{"token":"dGVzdA","url":"http://example.test:50051","pairing":"abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(u, "http://example.test:50051");
+    }
+
+    #[test]
+    fn parse_json_object_without_url_errors() {
+        assert!(parse_grpc_endpoint_from_bundle("{}").is_err());
+    }
 }

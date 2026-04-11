@@ -1,9 +1,14 @@
 //! CLI: pack `build/` as tar.gz, stream over gRPC (IPv6 endpoint); optional Ed25519 pairing.
 
+mod board;
 mod config;
+mod version_info;
 
-use clap::{Parser, Subcommand};
-use config::{load_connection, load_or_create_identity, save_connection, StoredConnection};
+use clap::{CommandFactory, Parser, Subcommand};
+use config::{
+    load_connection, load_or_create_identity, normalize_endpoint, save_connection,
+    use_signed_requests, StoredConnection,
+};
 use deploy_auth::{
     attach_auth_metadata, pair_request_canonical, pubkey_b64_url, verify_pair_response,
     ConnectionBundle, now_unix_ms,
@@ -13,6 +18,7 @@ use deploy_proto::deploy::{PairRequest, RollbackRequest};
 use deploy_proto::DeployServiceClient;
 use rand_core::{OsRng, RngCore};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tonic::Code;
 use tonic::Request;
 
@@ -21,12 +27,18 @@ const DEFAULT_ENDPOINT: &str = "http://[::1]:50051";
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "client",
-    about = "Deploy artifact to deploy-server over gRPC (IPv6); use `pair` for key enrollment"
+    name = env!("CARGO_BIN_NAME"),
+    about = "Deploy artifact to deploy-server over gRPC; pair with `auth`, optional HTTP CONNECT proxy with `board`",
+    subcommand_required = false,
+    disable_version_flag = true
 )]
 struct Cli {
+    /// Print client version; with `--endpoint` / `--url`, also query server stack versions (GetServerStackInfo).
+    #[arg(short = 'V', long = "version", global = true)]
+    version: bool,
+
     /// Server endpoint, e.g. http://[::1]:50051 (overrides saved connection).
-    #[arg(long, global = true)]
+    #[arg(long = "endpoint", visible_alias = "url", global = true)]
     endpoint: Option<String>,
 
     /// Deploy target project id (`default` is the legacy single-root layout).
@@ -34,11 +46,25 @@ struct Cli {
     project: String,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Register this machine with the server (install JSON), verify with GetStatus, print RTT.
+    Auth {
+        /// JSON `{"token":"...","url":"...","pairing":"..."}`, path to a file, or omit for stdin.
+        bundle: Option<String>,
+    },
+    /// Local HTTP CONNECT proxy → server outbound TCP (requires prior `auth`).
+    Board {
+        /// gRPC endpoint (must match saved paired connection).
+        #[arg(long)]
+        url: String,
+        /// Listen address for the HTTP proxy (CONNECT).
+        #[arg(long, default_value = "127.0.0.1:3128")]
+        listen: String,
+    },
     /// Register this machine's public key with the server using the install JSON bundle.
     Pair {
         /// JSON from server logs: {"token":"...","url":"...","pairing":"..."} or path to a file containing it.
@@ -72,10 +98,8 @@ fn resolve_endpoint(cli: &Cli) -> String {
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string())
 }
 
-fn use_signed_requests(endpoint: &str) -> bool {
-    load_connection()
-        .map(|c| c.paired && c.url == endpoint)
-        .unwrap_or(false)
+fn resolve_endpoint_normalized(cli: &Cli) -> String {
+    normalize_endpoint(&resolve_endpoint(cli))
 }
 
 fn read_bundle_text(bundle: &Option<String>) -> Result<String, Box<dyn std::error::Error>> {
@@ -94,7 +118,7 @@ fn read_bundle_text(bundle: &Option<String>) -> Result<String, Box<dyn std::erro
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     if buf.trim().is_empty() {
-        return Err("paste the install bundle JSON or pass --bundle".into());
+        return Err("paste the install bundle JSON or pass the JSON as an argument".into());
     }
     Ok(buf)
 }
@@ -118,7 +142,8 @@ async fn run_pair(bundle_arg: Option<String>) -> Result<(), Box<dyn std::error::
     let msg = pair_request_canonical(&client_pub, &b.server_pubkey_b64, ts_ms, &nonce, &pairing);
     let client_sig = deploy_auth::sign_bytes(&sk, &msg);
 
-    let mut client = DeployServiceClient::connect(b.url.clone()).await?;
+    let url = normalize_endpoint(&b.url);
+    let mut client = DeployServiceClient::connect(url.clone()).await?;
     let resp = client
         .pair(Request::new(PairRequest {
             client_public_key_b64: client_pub.clone(),
@@ -140,7 +165,7 @@ async fn run_pair(bundle_arg: Option<String>) -> Result<(), Box<dyn std::error::
     .map_err(|e| format!("server identity check failed: {e}"))?;
 
     save_connection(&StoredConnection {
-        url: b.url.clone(),
+        url: url.clone(),
         server_pubkey_b64: b.server_pubkey_b64,
         paired: true,
     })?;
@@ -149,21 +174,71 @@ async fn run_pair(bundle_arg: Option<String>) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+async fn run_auth(bundle_arg: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    run_pair(bundle_arg).await?;
+    let conn = load_connection().ok_or("internal: missing connection after pair")?;
+    let url = normalize_endpoint(&conn.url);
+    let sk = load_or_create_identity()?;
+    let mut client = DeployServiceClient::connect(url.clone()).await?;
+    let mut req = Request::new(deploy_proto::deploy::StatusRequest {
+        project_id: "default".to_string(),
+    });
+    attach_auth_metadata(&mut req, &sk, "GetStatus", "default", "")?;
+    let t0 = Instant::now();
+    let r = client.get_status(req).await?.into_inner();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "rtt_ms={:.2} current_version={} state={}",
+        ms, r.current_version, r.state
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    match cli.command {
+    if cli.version {
+        version_info::run_version(&cli).await?;
+        return Ok(());
+    }
+
+    let Some(command) = cli.command.as_ref() else {
+        Cli::command().print_help()?;
+        return Ok(());
+    };
+
+    match command {
+        Commands::Auth { bundle } => {
+            run_auth(bundle.clone()).await?;
+            return Ok(());
+        }
+        Commands::Board { url, listen } => {
+            let url = normalize_endpoint(&url);
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                eprintln!("--url must start with http:// or https://");
+                std::process::exit(2);
+            }
+            if !use_signed_requests(&url) {
+                eprintln!(
+                    "no paired connection for this URL. Run: pirate auth '<install-json>' first"
+                );
+                std::process::exit(2);
+            }
+            let sk = load_or_create_identity()?;
+            board::run_board(listen, url.as_str(), &sk).await?;
+            return Ok(());
+        }
         Commands::Pair { bundle } => {
-            run_pair(bundle).await?;
+            run_pair(bundle.clone()).await?;
             return Ok(());
         }
         Commands::Deploy {
-            ref path,
-            ref version,
+            path,
+            version,
             chunk_size,
         } => {
-            let endpoint = resolve_endpoint(&cli);
+            let endpoint = resolve_endpoint_normalized(&cli);
             if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
                 eprintln!("endpoint must start with http:// or https://");
                 std::process::exit(2);
@@ -183,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 path.as_path(),
                 &version,
                 &cli.project,
-                chunk_size,
+                *chunk_size,
                 sk.as_ref(),
             )
             .await?;
@@ -196,7 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Commands::Status => {
-            let endpoint = resolve_endpoint(&cli);
+            let endpoint = resolve_endpoint_normalized(&cli);
             if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
                 eprintln!("endpoint must start with http:// or https://");
                 std::process::exit(2);
@@ -217,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && e.message().contains("missing metadata")
                     {
                         eprintln!(
-                            "hint: run `client pair --bundle '<JSON>'` first (see install output or journalctl -u deploy-server)."
+                            "hint: run `pirate auth '<JSON>'` first (see install output or journalctl -u deploy-server)."
                         );
                         eprintln!("      Without pair, no x-deploy-pubkey is sent; endpoint was: {}", endpoint);
                     }
@@ -228,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Rollback { ref version } => {
             validate_version_label(version)?;
-            let endpoint = resolve_endpoint(&cli);
+            let endpoint = resolve_endpoint_normalized(&cli);
             if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
                 eprintln!("endpoint must start with http:// or https://");
                 std::process::exit(2);
@@ -250,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && e.message().contains("missing metadata")
                     {
                         eprintln!(
-                            "hint: run `client pair --bundle '<JSON>'` first (see install output or journalctl -u deploy-server)."
+                            "hint: run `pirate auth '<JSON>'` first (see install output or journalctl -u deploy-server)."
                         );
                         eprintln!("      Without pair, no x-deploy-pubkey is sent; endpoint was: {}", endpoint);
                     }
