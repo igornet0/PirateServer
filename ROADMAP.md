@@ -4,6 +4,46 @@
 
 ---
 
+## Состояние проекта (оценка готовности, 2026-04)
+
+Ниже — насколько текущий код закрывает описанные направления. Проценты субъективны: **100%** = соответствует заявленному продуктовому контуру и покрыто сценариями/документацией.
+
+| Область | % | Комментарий |
+|--------|---|-------------|
+| **gRPC-контракт и `deploy-server`** | **~97%** | `Pair`, `Upload` (SHA-256 в последнем чанке), `GetStatus`, `Rollback`, `StopProcess`, `RestartProcess`; распаковка в `releases/`, symlink `current`, процесс; опционально PostgreSQL (аудит/снимок). |
+| **CLI `client` (деплой с ПК оператора)** | **~95%** | Подкоманды `pair` / `deploy` / `status` / `rollback`, IPv6, chunked upload; общая логика вынесена в crate `deploy_client` (lib) для переиспользования desktop. |
+| **PostgreSQL и миграции** | **~90%** | Схема в `deploy-db`, миграции при старте `deploy-server` при `DATABASE_URL`; история и снимок для UI. |
+| **`control-api` (HTTP для дашборда)** | **~85%** | HTTP-слой и маршруты готовы; при **включённом** gRPC-auth на `deploy-server` нужен **`GRPC_SIGNING_KEY_PATH`** и публичный ключ в `authorized_peers` — **текущий `install.sh` это не настраивает**, из-за чего фоновый reconcile к БД пишет `Unauthenticated` в журнал. |
+| **Серверный frontend (дашборд за nginx)** | **~78%** | Статус, **проекты** (`/api/v1/projects`), релизы, история (JSON), nginx editor, **управление процессом** (rollback / stop / restart). Отдельного мастера портов/TLS нет — порты в тексте конфига nginx. |
+| **Nginx в стеке** | **~80%** | Примеры конфигов, Docker/e2e, API правки файла и `nginx -t` + reload; нет отдельного мастера портов/TLS в UI. |
+| **Упаковка и установка стека (Docker / скрипты)** | **~72%** | `docker-compose.test.yml`, e2e, `Makefile`, `scripts/build-linux-bundle.sh` → `dist/pirate-linux-amd64-*.tar.gz`; bare-metal `install.sh` ставит стек, но **не сшивает** внутреннюю gRPC-идентичность `control-api` ↔ `deploy-server` и не документирует в `env.example` ключ для подписи. |
+| **Локальный desktop (`pirate-client`, Tauri)** | **~72%** | gRPC: bundle, статус, **деплой каталога** и **rollback** через `deploy_client`; список **сохранённых серверов** (закладки), переключение активного URL. Нет отдельного прогресс-бара по чанкам в UI (есть текстовая обратная связь). |
+| **`local-agent` (долгоживущий агент ПК)** | **~12%** | CLI: `local-agent` / `local-agent info` — краткая дорожная карта туннеля; сетевой туннель/mTLS/прокси — вперёди (`LOCAL_STACK_DESIGN.md`, `LOCAL_GATEWAY.md`). |
+| **Мультипроектность на одном хосте** | **~15%** | Один конвейер релизов на `DEPLOY_ROOT`; HTTP `GET /api/v1/projects` отдаёт один логический проект `default` (точка расширения). Вариант «несколько независимых приложений на одном хосте» (отдельные корни / proto) — не реализован. |
+
+**Итог:** ядро **MVP (этапы 1–5)** в коде **сделано**. **Этап 6+** существенно продвинут: дашборд с жизненным циклом через HTTP, desktop-деплой и закладки серверов, задел под проекты API и bootstrap без Docker. Остаются **продуктовые** пробелы: **мультипроект на одном хосте** (несколько `DEPLOY_ROOT`/имён), **туннель/NAT** для `local-agent`, **нативный установщик ОС** (deb/rpm), **мастер портов/TLS** в UI.
+
+### Разбор логов после установки `pirate-linux-amd64-*.tar.gz` (2026-04)
+
+Типичный сценарий: `tar xzf … && cd pirate-linux-amd64 && sudo ./install.sh`, домен задан, сервисы `active (running)`.
+
+| Наблюдение | Смысл |
+|------------|--------|
+| `tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'` | Архив собран на macOS; GNU tar на Linux игнорирует служебные xattr. **Безопасно**, но шумно. Желательно собирать tarball с отключённым копированием расширенных атрибутов (например `COPYFILE_DISABLE=1` при упаковке на macOS) или без `xattr`. |
+| `could not change directory to "/root/pirate-linux-amd64": Permission denied` (от `postgres`) | `sudo -u postgres psql` наследует cwd root (`/root/...`); пользователь `postgres` не может зайти в `/root`. Запросы к БД при этом обычно выполняются, но в логах — предупреждение. **Исправление:** перед вызовами `sudo -u postgres` делать `cd /` (или `cd /tmp`) в `install.sh`. |
+| `control-api`: `reconcile upsert_snapshot e=grpc: … Unauthenticated, message: "missing metadata: x-deploy-pubkey"` | `deploy-server` с **включённым** Ed25519-auth ожидает подписанные метаданные на каждом gRPC-вызове. **`control-api` запущен без `GRPC_SIGNING_KEY_PATH`**, поэтому фоновый reconcile (раз в ~30 с) не проходит. Дашборд может частично работать из ФС, но согласование снимка с БД — нет. |
+| `client status` → тот же `missing metadata: x-deploy-pubkey` | CLI без завершённого **`client pair`** (и сохранённого ключа оператора) не является авторизованным peer’ом. Это ожидаемо при строгом auth. |
+| `curl http://…:50051` пусто / зависание | Порт gRPC (HTTP/2); обычный HTTP GET не является валидным клиентом. Проверять **`client pair` / `client status`** или gRPC-клиенты. |
+
+**Что нужно сделать по продукту (приоритет):**
+
+1. **Bare-metal install и systemd:** сгенерировать (или скопировать) Ed25519 identity для пользователя `deploy`, добавить публичный ключ в `authorized_peers.json` у `deploy-server`, прописать в `/etc/pirate-deploy.env` и в `ExecStart` **control-api** параметр **`GRPC_SIGNING_KEY_PATH`** (и при необходимости расширить `env.example`). Перезапуск сервисов — без ручного редактирования на сервере.
+2. **Документация / сообщение в конце `install.sh`:** явно указать, что **`client status` с самого сервера** работает только после **`client pair`** с бандлом из лога `deploy-server` (или после появления серверного ключа для служебных вызовов — отдельное решение продуктовое).
+3. **Сборка архива:** убрать предупреждения tar при распаковке на Linux (см. xattr выше).
+4. **Опционально (только dev/лаборатория):** `DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1` в env — снимает требование метаданных; **не рекомендуется для продакшена**.
+
+---
+
 ## Цель и критерий успеха
 
 - `client deploy ./build` → сервер принимает архив, проверяет хеш, распаковывает, переключает `current`, запускает приложение.
@@ -52,20 +92,17 @@
 
 ## gRPC контракт (целевое состояние)
 
-**Сервис `DeployService`:**
+**Сервис `DeployService`** (см. `proto/deploy.proto` → `tonic-build` в `build.rs`):
 
-1. **`Upload(stream DeployChunk) → DeployResponse`**
-   - `DeployChunk`: `bytes data`, `string version`, `bool is_last`
-   - `DeployResponse`: `string status`, `string deployed_version`
-   - (При необходимости расширение proto: поле `sha256` в последнем чанке или отдельное сообщение метаданных — без усложнения схемы.)
+1. **`Pair`**, **`Upload(stream DeployChunk) → DeployResponse`**
+   - `DeployChunk`: данные, `version`, `is_last`, `sha256_hex` (обязателен при `is_last`).
+   - Аутентификация клиента после pairing: подписанные метаданные (`deploy-auth`).
 
-2. **`GetStatus(StatusRequest) → StatusResponse`**
-   - `StatusResponse`: `current_version`, `state` (`running` / `stopped` / `error`)
+2. **`GetStatus` → `StatusResponse`**: `current_version`, `state` (`running` / `stopped` / `error`).
 
-3. **`Rollback(RollbackRequest) → RollbackResponse`**
-   - `RollbackRequest`: `version`
+3. **`Rollback` → `RollbackResponse`**: переключение `current` на существующий релиз и перезапуск процесса.
 
-Файл: `proto/deploy.proto` → генерация через `tonic-build` в `build.rs`.
+4. **`StopProcess` / `RestartProcess` → `StatusResponse`**: остановка управляемого процесса без смены релиза; рестарт текущего `current`.
 
 ---
 
@@ -102,6 +139,7 @@
 /server-stack/server/src/main.rs
 /server-stack/server/src/deploy_service.rs
 /local-stack/client/src/main.rs
+/local-stack/client/src/lib.rs
 Cargo.toml          # workspace: server-stack + local-stack + proto
 ```
 
@@ -113,48 +151,48 @@ Cargo.toml          # workspace: server-stack + local-stack + proto
 
 ### Этап 0 — ROADMAP (текущий документ)
 
-- Зафиксировать требования, порядок работ, критерии успеха.
+- [x] Зафиксировать требования, порядок работ, критерии успеха.
 
 ### Этап 1 — Proto
 
-- [ ] Написать `proto/deploy.proto` (все RPC и сообщения из ТЗ).
-- [ ] Подключить `tonic-build` в `build.rs`, workspace `Cargo.toml`.
-- [ ] Сгенерировать код, убедиться что компилируется пустой `lib` или заглушки.
+- [x] Написать `proto/deploy.proto` (все RPC и сообщения из ТЗ).
+- [x] Подключить `tonic-build` в `build.rs`, workspace `Cargo.toml`.
+- [x] Сгенерировать код, убедиться что компилируется пустой `lib` или заглушки.
 
 **Следующий шаг после этапа 1:** скелет сервера с `tonic::transport::Server` на `[::]:50051` и заглушками сервиса.
 
 ### Этап 2 — Сервер (скелет + сеть)
 
-- [ ] `main.rs`: инициализация `tracing`, парсинг аргументов (порт, корень `/deploy`, лимиты).
-- [ ] Явный bind на IPv6 (`[::]:PORT`).
-- [ ] Реализовать заглушки `Upload`, `GetStatus`, `Rollback` с логированием входа.
+- [x] `main.rs`: инициализация `tracing`, парсинг аргументов (порт, корень `/deploy`, лимиты).
+- [x] Явный bind на IPv6 (`[::]:PORT`).
+- [x] Реализовать заглушки `Upload`, `GetStatus`, `Rollback` с логированием входа.
 
 **Следующий шаг:** полная логика деплоя в `deploy_service.rs`.
 
 ### Этап 3 — Деплой-логика на сервере
 
-- [ ] Приём stream → temp file + лимит размера.
-- [ ] SHA-256 проверка (уточнить поле в proto при реализации: хеш от клиента в последнем чанке или отдельное поле).
-- [ ] Распаковка tar.gz в `releases/<version>/`.
-- [ ] Управление процессом: старт `run.sh` или бинарника, хранение `Child`, kill при новом деплое/rollback.
-- [ ] Symlink `current`, атомарная смена где возможно.
-- [ ] Валидация версии, проверка non-root.
+- [x] Приём stream → temp file + лимит размера.
+- [x] SHA-256 проверка (уточнить поле в proto при реализации: хеш от клиента в последнем чанке или отдельное поле).
+- [x] Распаковка tar.gz в `releases/<version>/`.
+- [x] Управление процессом: старт `run.sh` или бинарника, хранение `Child`, kill при новом деплое/rollback.
+- [x] Symlink `current`, атомарная смена где возможно.
+- [x] Валидация версии, проверка non-root.
 
 **Следующий шаг:** CLI клиент.
 
 ### Этап 4 — CLI клиент
 
-- [ ] `clap`: подкоманды `deploy`, `status`, `rollback`.
-- [ ] `deploy`: tar.gz каталога `build/`, chunked upload, IPv6 endpoint.
-- [ ] `status` / `rollback`: unary вызовы.
+- [x] `clap`: подкоманды `pair`, `deploy`, `status`, `rollback`.
+- [x] `deploy`: tar.gz каталога `build/`, chunked upload, IPv6 endpoint.
+- [x] `status` / `rollback`: unary вызовы.
 
 **Следующий шаг:** интеграционные сценарии и документация запуска.
 
 ### Этап 5 — Тестирование и сценарии
 
-- [ ] Скрипт или инструкция: локальный запуск сервера (не Docker).
-- [ ] Тестовый проект: простой `run.sh` + файлы в `build/`.
-- [ ] Сценарий: deploy → status → rollback → status.
+- [x] Скрипт или инструкция: локальный запуск сервера (не Docker).
+- [x] Тестовый проект: простой `run.sh` + файлы в `build/`.
+- [x] Сценарий: deploy → status → rollback → status.
 
 ---
 
@@ -194,6 +232,8 @@ Cargo.toml          # workspace: server-stack + local-stack + proto
 - После установки открывается веб-интерфейс и видно **активную версию** и **состояние** деплоя (как минимум то же, что `client status`).
 - В списке отображаются **сервисы/релизы** (как минимум один целевой сервис — развёрнутое приложение) и их **версии** согласованно с сервером деплоя.
 
+**Фактическое состояние (2026-04, обновлено):** дашборд и `control-api` закрывают статус, релизы, историю (БД), nginx, **rollback/stop/restart** через HTTP, список **проектов** (`default`). Desktop покрывает **deploy/rollback** и **несколько сохранённых URL**. **Узкое место свежей bare-metal установки:** gRPC-auth включён по умолчанию, а пакетный `install.sh` **не выдаёт** `control-api` ключ подписи → предупреждения reconcile и необходимость **`pair`** для CLI. **По-прежнему вне контура 6+ «готово»:** несколько независимых приложений на одном хосте, мастер портов/TLS в UI, нативный пакет ОС, полноценный сетевой туннель в `local-agent`.
+
 ---
 
 ## Логирование
@@ -229,3 +269,6 @@ Cargo.toml          # workspace: server-stack + local-stack + proto
 
 - **v1** — начальный ROADMAP (только планирование).
 - **v2** — добавлен этап 6+ (nginx, PostgreSQL, frontend, установка «под ключ», UI версий/состояний); уточнены ограничения MVP vs расширение.
+- **v3** — этапы 1–5 отмечены как выполненные в коде; добавлена таблица **«Состояние проекта (оценка готовности)»** по компонентам; уточнён прогресс этапа 6+.
+- **v4** — обновлена таблица готовности и блок «фактическое состояние» этапа 6+: HTTP lifecycle, `StopProcess`/`RestartProcess`, desktop deploy и закладки серверов, `GET /projects`, `local-agent info`, `scripts/os-bootstrap-install.sh`.
+- **v5** — разбор логов установки `pirate-linux-amd64-*.tar.gz`: gRPC `Unauthenticated` / `x-deploy-pubkey` для `control-api` и `client` без pair; предупреждения `tar`/PostgreSQL cwd; скорректированы оценки готовности **control-api** и **упаковки**; список доработок install/env/документации.

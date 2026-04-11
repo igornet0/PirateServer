@@ -1,0 +1,21 @@
+# Smaller build context and less disk use for `docker compose build`.
+.git
+.gitignore
+**/.DS_Store
+**/target
+**/node_modules
+server-stack/frontend/dist
+local-stack/desktop-ui/node_modules
+local-stack/desktop-ui/src-tauri/target
+**/*.rs.bk
+.env
+.env.*
+*.log
+dist
+packaging
+docs
+tests
+.github
+.cursor
+**/.idea
+**/.vscode

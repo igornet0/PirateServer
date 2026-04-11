@@ -43,8 +43,9 @@ chmod +x "$BUILD_DIR/run.sh" 2>/dev/null || true
 echo "==> cargo build (workspace)"
 cargo build -q -p deploy-server -p deploy-client --bin client
 
-echo "==> start deploy-server"
+echo "==> start deploy-server (open gRPC for this script — use pairing in production)"
 RUST_LOG="${RUST_LOG:-info}" \
+  DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1 \
   cargo run -q -p deploy-server -- \
     --root "$DEPLOY_ROOT" \
     -p "$PORT" \

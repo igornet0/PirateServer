@@ -5,7 +5,7 @@ This document describes how a **separate** “local PC ↔ remote server” conn
 ## Why keep it separate
 
 - **`client` (deploy CLI)** is an operator tool for artifact upload and release management. It should stay a thin gRPC client over `DeployService`.
-- A **local gateway** (agent on a workstation, tunnel, or VPN) solves a different problem: reachability, NAT traversal, and trust boundaries between a user machine and a host running Pirete stack. Mixing that into the deploy CLI blurs security and release workflows.
+- A **local gateway** (agent on a workstation, tunnel, or VPN) solves a different problem: reachability, NAT traversal, and trust boundaries between a user machine and a host running pirate stack. Mixing that into the deploy CLI blurs security and release workflows.
 
 ## Threat model (sketch)
 

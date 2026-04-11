@@ -10,7 +10,7 @@
 
 ## Реализовано: `pirate-client` (desktop UI)
 
-Локальный бинарь **`pirate-client`** (crate `pirate-desktop`) поднимает Axum на **`127.0.0.1`**, отдаёт статику из [`local-stack/desktop-ui`](../local-stack/desktop-ui/) и опционально добавляет `pirate-client.internal` в hosts. Подробности: [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md).
+Локальный бинарь **`pirate-client`** (Tauri 2 + crate `pirate-desktop`) встраивает WebView со статикой из [`local-stack/desktop-ui`](../local-stack/desktop-ui/); статус и данные для UI — через `invoke`, без отдельного HTTP-сервера для SPA. Подробности: [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md).
 
 ## Предлагаемые компоненты
 

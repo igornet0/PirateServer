@@ -1,0 +1,18 @@
+[package]
+name = "pirate-client"
+version = "0.1.0"
+edition = "2021"
+description = "Pirate Client — Tauri desktop shell"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+pirate-desktop = { path = "../../desktop-client" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-appender = "0.2"
+dirs = "5"

@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=simple
 User=deploy
 Group=deploy
-EnvironmentFile=-/etc/pirete-deploy.env
+EnvironmentFile=-/etc/pirate-deploy.env
 Environment=RUST_LOG=info
-ExecStart=/usr/local/bin/deploy-server --root /var/lib/pirete/deploy -p 50051
+ExecStart=/usr/local/bin/deploy-server --root /var/lib/pirate/deploy -p 50051
 Restart=on-failure
 RestartSec=3
 

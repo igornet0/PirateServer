@@ -15,6 +15,7 @@
 - `DATABASE_URL` — e.g. `postgresql://user:pass@[::1]:5432/dbname` (IPv6 host must be bracketed).
 - `DEPLOY_ROOT` / `--deploy-root` — same path as deploy-server `--root` (for listing `releases/`).
 - `GRPC_ENDPOINT` — default `http://[::1]:50051` for control-api → deploy-server.
+- `GRPC_SIGNING_KEY_PATH` — optional; path to Ed25519 `identity.json` (same as CLI/desktop after `pair`) so control-api can sign `GetStatus` when deploy-server enforces auth. Omit when using `DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1` on the server.
 - `CONTROL_API_PORT` / `--listen-port` — default `8080` (IPv6 all interfaces).
 
 ### Security and CORS (control-api)

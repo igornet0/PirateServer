@@ -55,6 +55,14 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "bad_request",
+            message: message.into(),
+        }
+    }
 }
 
 impl From<ControlError> for ApiError {

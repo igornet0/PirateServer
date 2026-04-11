@@ -1,5 +1,6 @@
 import { fetchNginxConfig, putNginxConfig } from "../api/client.js";
 import { ApiRequestError } from "../api/types.js";
+import { t } from "../i18n/index.js";
 
 function formatErr(e: unknown): string {
   if (e instanceof ApiRequestError) {
@@ -16,15 +17,13 @@ export async function loadNginx(): Promise<void> {
     const data = await fetchNginxConfig();
     if (!data.enabled) {
       editor.value = "";
-      editor.placeholder =
-        "NGINX_CONFIG_PATH not set on control-api — nginx editor disabled.";
-      result.textContent =
-        "API: nginx config editing disabled (set NGINX_CONFIG_PATH).";
+      editor.placeholder = t("nginx.disabled.placeholder");
+      result.textContent = t("nginx.disabled.apiMsg");
       return;
     }
     editor.value = data.content ?? "";
     editor.placeholder = "";
-    result.textContent = `Loaded: ${data.path}`;
+    result.textContent = t("nginx.loadedPattern", { path: data.path ?? "" });
   } catch (e) {
     result.textContent = formatErr(e);
   }
@@ -33,7 +32,7 @@ export async function loadNginx(): Promise<void> {
 export async function saveNginx(): Promise<void> {
   const editor = document.getElementById("nginx-editor") as HTMLTextAreaElement;
   const result = document.getElementById("nginx-result")!;
-  result.textContent = "Saving…";
+  result.textContent = t("nginx.saving");
   try {
     const raw = await putNginxConfig(editor.value);
     result.textContent = JSON.stringify(raw, null, 2);

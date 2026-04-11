@@ -3,59 +3,301 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Deploy dashboard</title>
+    <title data-i18n="page.dashboardTitle">PirateServer — Deploy dashboard</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
-    <div id="app">
-      <header>
-        <h1>Deploy dashboard</h1>
-        <p class="muted">Status, releases, and history from control-api</p>
-        <div class="row">
-          <label for="api-token">API Bearer token (optional, if <code>CONTROL_API_BEARER_TOKEN</code>)</label>
-          <input
-            id="api-token"
-            type="password"
-            autocomplete="off"
-            placeholder="Global API token"
-          />
+    <div class="app-dashboard">
+      <header class="dash-top">
+        <div class="dash-top-inner">
+          <div class="header-row">
+            <div class="brand-block">
+              <div class="brand-row">
+                <span
+                  class="brand-logo"
+                  role="img"
+                  data-i18n-aria="brand.logoAria"
+                  aria-label="PirateServer"
+                ></span>
+                <div class="brand-titles">
+                  <span class="brand-product">PirateServer</span>
+                  <h1 data-i18n="dash.title">Deploy dashboard</h1>
+                </div>
+              </div>
+              <p class="muted dash-tagline" data-i18n="dash.tagline">
+                Control API: status, releases, and history
+              </p>
+            </div>
+            <div class="header-actions">
+              <div class="lang-block">
+                <label
+                  id="lang-label"
+                  for="lang-switcher"
+                  class="lang-switch-label"
+                  data-i18n="lang.label"
+                  >Language</label
+                >
+                <select
+                  id="lang-switcher"
+                  class="lang-switcher"
+                  aria-labelledby="lang-label"
+                >
+                  <option value="en" data-i18n="lang.en">English</option>
+                  <option value="ru" data-i18n="lang.ru">Русский</option>
+                </select>
+              </div>
+              <button type="button" id="btn-logout" class="ghost" data-i18n="btn.logout">
+                Sign out
+              </button>
+            </div>
+          </div>
+          <div class="settings-strip">
+            <div class="row">
+              <label for="api-token" data-i18n="apiToken.label"
+                >API Bearer token (optional override)</label
+              >
+              <input
+                id="api-token"
+                type="password"
+                autocomplete="off"
+                data-i18n-placeholder="apiToken.placeholder"
+                placeholder="Session JWT if signed in; paste static token to override"
+              />
+            </div>
+            <div class="row">
+              <label for="active-project" data-i18n="activeProject.label">Active project</label>
+              <input
+                id="active-project"
+                type="text"
+                autocomplete="off"
+                data-i18n-placeholder="activeProject.placeholder"
+                placeholder="default"
+                value="default"
+              />
+            </div>
+          </div>
         </div>
       </header>
-      <section id="status-section">
-        <h2>Current status</h2>
-        <pre id="status">Loading…</pre>
-      </section>
-      <section id="releases-section">
-        <h2>Releases on disk</h2>
-        <pre id="releases">Loading…</pre>
-      </section>
-      <section id="history-section">
-        <h2>Deploy history</h2>
-        <pre id="history">Loading…</pre>
-      </section>
-      <section id="nginx-section">
-        <h2>Nginx configuration</h2>
-        <p class="muted">
-          Requires control-api with <code>NGINX_CONFIG_PATH</code>.           Optional
-          <code>NGINX_ADMIN_TOKEN</code> — paste below for Save (or use
-          <code>X-Nginx-Admin-Token</code> when API token is set).
-        </p>
-        <div class="row">
-          <label for="nginx-token">Admin Bearer token (optional)</label>
-          <input
-            id="nginx-token"
-            type="password"
-            autocomplete="off"
-            placeholder="Bearer token if NGINX_ADMIN_TOKEN is set"
-          />
+
+      <div class="dash-body">
+        <nav
+          class="tablist"
+          data-tablist="dashboard"
+          role="tablist"
+          data-i18n-aria="tabs.sectionsAria"
+          aria-label="Dashboard sections"
+        >
+          <button
+            type="button"
+            class="tab"
+            role="tab"
+            id="tab-status"
+            aria-selected="true"
+            aria-controls="panel-status"
+            data-i18n="tab.status"
+          >
+            Status
+          </button>
+          <button
+            type="button"
+            class="tab"
+            role="tab"
+            id="tab-process"
+            aria-selected="false"
+            tabindex="-1"
+            aria-controls="panel-process"
+            data-i18n="tab.process"
+          >
+            Process
+          </button>
+          <button
+            type="button"
+            class="tab"
+            role="tab"
+            id="tab-inventory"
+            aria-selected="false"
+            tabindex="-1"
+            aria-controls="panel-inventory"
+            data-i18n="tab.inventory"
+          >
+            Inventory
+          </button>
+          <button
+            type="button"
+            class="tab"
+            role="tab"
+            id="tab-nginx"
+            aria-selected="false"
+            tabindex="-1"
+            aria-controls="panel-nginx"
+            data-i18n="tab.nginx"
+          >
+            Nginx
+          </button>
+        </nav>
+
+        <div class="tab-panels">
+          <div
+            class="tab-panel"
+            id="panel-status"
+            role="tabpanel"
+            aria-labelledby="tab-status"
+          >
+            <section id="status-section" class="panel-block">
+              <h2 data-i18n="status.heading">Current status</h2>
+              <pre id="status">Loading…</pre>
+            </section>
+          </div>
+
+          <div
+            class="tab-panel"
+            id="panel-process"
+            role="tabpanel"
+            aria-labelledby="tab-process"
+            hidden
+          >
+            <section id="lifecycle-section" class="panel-block">
+              <h2 data-i18n="process.heading">Process control</h2>
+              <p class="muted" data-i18n="process.hint">
+                Rollback, stop, or restart the managed app via control-api (gRPC to deploy-server).
+                Same bearer token as above.
+              </p>
+              <div class="row">
+                <label for="rollback-version" data-i18n="rollback.label">Rollback to version</label>
+                <input
+                  id="rollback-version"
+                  type="text"
+                  autocomplete="off"
+                  data-i18n-placeholder="rollback.placeholder"
+                  placeholder="e.g. v1.0.0"
+                />
+              </div>
+              <div class="row actions">
+                <button type="button" id="btn-rollback" class="primary" data-i18n="btn.rollback">
+                  Rollback
+                </button>
+                <button type="button" id="btn-restart" data-i18n="btn.restart">Restart process</button>
+                <button type="button" id="btn-stop" class="danger" data-i18n="btn.stop">
+                  Stop process
+                </button>
+              </div>
+              <pre id="lifecycle-result"></pre>
+            </section>
+          </div>
+
+          <div
+            class="tab-panel"
+            id="panel-inventory"
+            role="tabpanel"
+            aria-labelledby="tab-inventory"
+            hidden
+          >
+            <section id="projects-section" class="panel-block">
+              <h2 data-i18n="inv.projects">Projects</h2>
+              <div id="projects" class="panel">Loading…</div>
+            </section>
+            <section id="releases-section" class="panel-block">
+              <h2 data-i18n="inv.releases">Releases on disk</h2>
+              <pre id="releases">Loading…</pre>
+            </section>
+            <section id="history-section" class="panel-block">
+              <h2 data-i18n="inv.history">Deploy history</h2>
+              <pre id="history">Loading…</pre>
+            </section>
+          </div>
+
+          <div
+            class="tab-panel"
+            id="panel-nginx"
+            role="tabpanel"
+            aria-labelledby="tab-nginx"
+            hidden
+          >
+            <section id="nginx-section" class="panel-block">
+              <h2 data-i18n="nginx.heading">Nginx configuration</h2>
+              <p class="muted" id="nginx-help" data-i18n-html="nginx.helpHtml">
+                Requires control-api with <code>NGINX_CONFIG_PATH</code>. Optional
+                <code>NGINX_ADMIN_TOKEN</code> — paste below for Save (or use
+                <code>X-Nginx-Admin-Token</code> when API token is set).
+              </p>
+              <div class="row">
+                <label for="nginx-token" data-i18n="nginx.adminToken.label"
+                  >Admin Bearer token (optional)</label
+                >
+                <input
+                  id="nginx-token"
+                  type="password"
+                  autocomplete="off"
+                  data-i18n-placeholder="nginx.adminToken.placeholder"
+                  placeholder="Bearer token if NGINX_ADMIN_TOKEN is set"
+                />
+              </div>
+              <div class="row wiz">
+                <label data-i18n="nginx.listen">Listen</label>
+                <input
+                  id="wiz-listen"
+                  type="text"
+                  value="[::]:80"
+                  data-i18n-placeholder="nginx.placeholderListen"
+                  placeholder="[::]:443"
+                />
+                <label data-i18n="nginx.serverName">server_name</label>
+                <input
+                  id="wiz-server-name"
+                  type="text"
+                  data-i18n-placeholder="nginx.placeholderServerName"
+                  placeholder="example.com"
+                />
+              </div>
+              <div class="row wiz">
+                <label data-i18n="nginx.staticRoot">Static root</label>
+                <input id="wiz-root" type="text" value="/var/www/deploy-dashboard" />
+                <label data-i18n="nginx.apiUpstream">API upstream</label>
+                <input id="wiz-api-upstream" type="text" value="127.0.0.1:8080" />
+              </div>
+              <div class="row wiz">
+                <label
+                  ><input id="wiz-tls" type="checkbox" />
+                  <span data-i18n="nginx.tls">TLS</span></label
+                >
+                <label data-i18n="nginx.sslCert">ssl_certificate</label>
+                <input
+                  id="wiz-cert"
+                  type="text"
+                  data-i18n-placeholder="nginx.placeholderCert"
+                  placeholder="/etc/ssl/certs/fullchain.pem"
+                />
+                <label data-i18n="nginx.sslKey">ssl_certificate_key</label>
+                <input
+                  id="wiz-key"
+                  type="text"
+                  data-i18n-placeholder="nginx.placeholderKey"
+                  placeholder="/etc/ssl/private/privkey.pem"
+                />
+              </div>
+              <div class="row actions">
+                <button type="button" id="nginx-wizard-insert" data-i18n="nginx.appendSnippet">
+                  Append snippet to editor
+                </button>
+              </div>
+              <textarea
+                id="nginx-editor"
+                rows="18"
+                spellcheck="false"
+                data-i18n-placeholder="nginx.editorPlaceholder"
+                placeholder="Load to fetch current config…"
+              ></textarea>
+              <div class="row actions">
+                <button type="button" id="nginx-load" data-i18n="nginx.load">Load</button>
+                <button type="button" id="nginx-save" class="primary" data-i18n="nginx.save">
+                  Save &amp; reload nginx
+                </button>
+              </div>
+              <pre id="nginx-result"></pre>
+            </section>
+          </div>
         </div>
-        <textarea id="nginx-editor" rows="18" spellcheck="false" placeholder="Load to fetch current config…"></textarea>
-        <div class="row actions">
-          <button type="button" id="nginx-load">Load</button>
-          <button type="button" id="nginx-save" class="primary">Save &amp; reload nginx</button>
-        </div>
-        <pre id="nginx-result"></pre>
-      </section>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

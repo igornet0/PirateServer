@@ -3,28 +3,42 @@
 #
 # Примеры:
 #   make -f Makefile.docker up
-#   make -f Makefile.docker status
-#   make -f Makefile.docker logs
-#   make -f Makefile.docker logs TAIL=50 SERVICE=control-api
+#   make -f Makefile.docker connection
+#   make -f Makefile.docker client-status   # хостовый CLI против gRPC в Docker
+#   make -f Makefile.docker client-deploy  # тестовый деплой minimal-app
+#   make -f Makefile.docker e2e
+#   DOCKER_E2E_API_TOKEN=secret make -f Makefile.docker e2e-bearer
+#   make -f Makefile.docker e2e-nginx
 
+CARGO ?= cargo
 COMPOSE := docker compose -f docker-compose.test.yml
+COMPOSE_NGINX := docker compose -f docker-compose.test.yml -f docker-compose.nginx-e2e.yml
+COMPOSE_BEARER := docker compose -f docker-compose.test.yml -f docker-compose.bearer-override.yml
 TAIL ?= 100
 
-.PHONY: help up down build restart stop ps status logs logs-follow e2e
+.PHONY: help up down down-v build restart stop ps status logs logs-follow e2e e2e-bearer e2e-nginx connection \
+	client-status client-deploy doctor
 
 help:
 	@echo "Docker (docker-compose.test.yml):"
 	@echo "  up            — поднять стек в фоне (build + up -d)"
 	@echo "  down          — остановить и убрать контейнеры"
+	@echo "  down-v        — down и удалить тома (postgres/deploy-data); если postgres падает с \"No space\""
 	@echo "  build         — только собрать образы"
-	@echo "  restart       — перезапуск всех сервисов стека"
+	@echo "  restart       — пересборка образов (в т.ч. server-stack/frontend → nginx) и up -d"
 	@echo "  stop          — остановить без удаления контейнеров"
 	@echo "  ps / status   — состояние контейнеров"
 	@echo "  logs          — последние логи (TAIL=$(TAIL) строк, все сервисы)"
 	@echo "  logs-follow   — поток логов (как docker compose logs -f)"
+	@echo "  connection    — вывести GRPC_ENDPOINT / DASHBOARD / CONTROL_API (после up)"
+	@echo "  client-status — с хоста: $(CARGO) run client … status (сначала up; иначе см. preflight)"
+	@echo "  client-deploy — с хоста: deploy tests/fixtures/minimal-app (сначала up)"
 	@echo "  e2e           — прогнать e2e (профиль e2e)"
+	@echo "  e2e-bearer    — стек + bearer (нужен DOCKER_E2E_API_TOKEN в env)"
+	@echo "  e2e-nginx     — merge nginx-e2e + тест PUT /api/v1/nginx/config"
 	@echo ""
 	@echo "Переменные: TAIL=число  SERVICE=имя_сервиса  (для logs / logs-follow)"
+	@echo "  DOCKER_E2E_HOST (default 127.0.0.1)  DOCKER_E2E_GRPC_PORT (default 50051)"
 
 up:
 	$(COMPOSE) up -d --build
@@ -32,11 +46,20 @@ up:
 down:
 	$(COMPOSE) down
 
+down-v:
+	$(COMPOSE) down -v
+
+doctor:
+	@echo "Если postgres сразу Exited (1): смотрите логи — make -f Makefile.docker logs SERVICE=postgres"
+	@echo "  Частая причина: No space left on device → освободите место на диске или в Docker Desktop (Settings → Resources → Disk image size), затем: docker system prune"
+	@echo "  После смены образа PostgreSQL или битого тома: make -f Makefile.docker down-v && make -f Makefile.docker up"
+
 build:
 	$(COMPOSE) build
 
+# up -d --build: иначе `compose restart` не пересобирает UI (dist в образе nginx-with-ui).
 restart:
-	$(COMPOSE) restart
+	$(COMPOSE) up -d --build
 
 stop:
 	$(COMPOSE) stop
@@ -50,5 +73,36 @@ logs:
 logs-follow:
 	$(COMPOSE) logs -f --tail=$(TAIL) $(SERVICE)
 
+connection:
+	bash scripts/print-docker-connection.sh
+
+# Хостовый CLI к deploy-server в контейнере (стек с DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1 — pair не нужен).
+# Сначала: make -f Makefile.docker up  (иначе connection refused на :50051)
+client-status:
+	@chmod +x scripts/docker-grpc-preflight.sh 2>/dev/null || true
+	@HOST="$${DOCKER_E2E_HOST:-127.0.0.1}"; \
+	PORT="$${DOCKER_E2E_GRPC_PORT:-50051}"; \
+	bash scripts/docker-grpc-preflight.sh "$$HOST" "$$PORT"; \
+	EP="http://$$HOST:$$PORT"; \
+	echo "==> client status -> $$EP"; \
+	$(CARGO) run -q -p deploy-client --bin client -- --endpoint "$$EP" status
+
+client-deploy:
+	@chmod +x scripts/docker-grpc-preflight.sh 2>/dev/null || true
+	@HOST="$${DOCKER_E2E_HOST:-127.0.0.1}"; \
+	PORT="$${DOCKER_E2E_GRPC_PORT:-50051}"; \
+	bash scripts/docker-grpc-preflight.sh "$$HOST" "$$PORT"; \
+	EP="http://$$HOST:$$PORT"; \
+	V="$${DOCKER_CLIENT_TEST_VERSION:-v-docker-test}"; \
+	echo "==> client deploy minimal-app -> $$EP version $$V"; \
+	$(CARGO) run -q -p deploy-client --bin client -- --endpoint "$$EP" deploy tests/fixtures/minimal-app --version "$$V"
+
 e2e:
 	$(COMPOSE) --profile e2e run --rm e2e
+
+e2e-bearer:
+	@test -n "$$DOCKER_E2E_API_TOKEN" || (echo "set DOCKER_E2E_API_TOKEN" && exit 1)
+	./scripts/run-docker-e2e-bearer.sh --down
+
+e2e-nginx:
+	./scripts/run-docker-e2e-nginx.sh --down

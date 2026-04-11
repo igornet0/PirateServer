@@ -8,42 +8,77 @@ GRPC="${GRPC_ENDPOINT:-http://deploy-server:50051}"
 
 chmod +x /fixtures/minimal-app/run.sh 2>/dev/null || true
 
+curl_api() {
+  local opts=(-sf)
+  if [[ -n "${DOCKER_E2E_API_TOKEN:-}" ]]; then
+    opts+=(-H "Authorization: Bearer ${DOCKER_E2E_API_TOKEN}")
+  fi
+  curl "${opts[@]}" "$@"
+}
+
+if [[ -n "${DOCKER_E2E_API_TOKEN:-}" ]]; then
+  echo "==> bearer: /api/v1/status without token returns 401"
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" "$API/api/v1/status" || true)
+  if [[ "$CODE" != "401" ]]; then
+    echo "expected 401, got ${CODE}"
+    exit 1
+  fi
+fi
+
 echo "==> health (direct control-api)"
 curl -sf "$API/health" | grep -q ok
 
 echo "==> status (direct)"
-curl -sf "$API/api/v1/status"
+curl_api "$API/api/v1/status"
+echo ""
 
 echo "==> status (via nginx proxy)"
-curl -sf "$NGINX/api/v1/status"
+curl_api "$NGINX/api/v1/status"
+echo ""
 
 echo "==> deploy v-e2e-1"
 client --endpoint "$GRPC" deploy /fixtures/minimal-app --version v-e2e-1
 
 echo "==> status after first deploy"
-curl -sf "$API/api/v1/status" | grep -q '"state":"running"'
+curl_api "$API/api/v1/status" | grep -q '"state":"running"'
 
 echo "==> releases lists v-e2e-1"
-REL=$(curl -sf "$API/api/v1/releases")
+REL=$(curl_api "$API/api/v1/releases")
 echo "$REL" | grep -q v-e2e-1
 
 echo "==> deploy v-e2e-2"
 client --endpoint "$GRPC" deploy /fixtures/minimal-app --version v-e2e-2
 
 echo "==> current version v-e2e-2"
-curl -sf "$API/api/v1/status" | grep -q '"current_version":"v-e2e-2"'
+curl_api "$API/api/v1/status" | grep -q '"current_version":"v-e2e-2"'
 
 echo "==> rollback to v-e2e-1"
 client --endpoint "$GRPC" rollback v-e2e-1
 
 echo "==> current version v-e2e-1 after rollback"
-curl -sf "$API/api/v1/status" | grep -q '"current_version":"v-e2e-1"'
+curl_api "$API/api/v1/status" | grep -q '"current_version":"v-e2e-1"'
 
 echo "==> history has events"
-HIST=$(curl -sf "$API/api/v1/history")
+HIST=$(curl_api "$API/api/v1/history")
 echo "$HIST" | grep -q '"events":\[{' || {
   echo "$HIST"
   exit 1
 }
+
+if [[ "${NGINX_E2E_TESTS:-}" == "1" ]]; then
+  echo "==> nginx config API: GET (enabled)"
+  GET=$(curl_api "$API/api/v1/nginx/config")
+  echo "$GET" | grep -q '"enabled":true' || {
+    echo "$GET"
+    exit 1
+  }
+  echo "==> nginx config API: PUT (reload)"
+  BODY=$(jq -Rs '{content: .}' </fixtures/nginx-e2e-put.conf)
+  RESP=$(curl_api -X PUT "$API/api/v1/nginx/config" -H "Content-Type: application/json" -d "$BODY")
+  echo "$RESP" | grep -q '"ok":true' || {
+    echo "$RESP"
+    exit 1
+  }
+fi
 
 echo "OK: Docker e2e passed"

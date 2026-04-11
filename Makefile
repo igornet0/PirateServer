@@ -1,13 +1,13 @@
-# PireteServer / deploy workspace — build, install artifacts, test.
+# PirateServer / deploy workspace — build, install artifacts, test.
 # Usage: `make` or `make help`
 
 .PHONY: help all build build-release check test test-unit test-e2e clippy fmt clean \
 	client client-release server server-release control-api control-api-release \
 	local-agent local-agent-release \
 	rust rust-release frontend frontend-install ui \
-	desktop-ui pirate-desktop pirate-desktop-release \
+	desktop-ui pirate-desktop pirate-desktop-release pirate-desktop-bundle \
 	build-local build-stack-release dist dist-linux install install-release \
-	bootstrap bootstrap-phase6 e2e local-e2e
+	bootstrap bootstrap-phase6 e2e local-e2e docker-client-help
 
 CARGO       ?= cargo
 NPM         ?= npm
@@ -21,7 +21,7 @@ INSTALL_BIN ?= $(PREFIX)/bin
 .DEFAULT_GOAL := help
 
 help:
-	@echo "PireteServer — Makefile targets"
+	@echo "PirateServer — Makefile targets"
 	@echo ""
 	@echo "Rust workspace (debug):"
 	@echo "  make build          - cargo build --workspace (dev, local PC)"
@@ -41,12 +41,13 @@ help:
 	@echo ""
 	@echo "Single crates (debug):"
 	@echo "  make server | client | control-api | local-agent"
-	@echo "  make pirate-desktop - pirate-client binary (build desktop-ui first if UI missing)"
+	@echo "  make pirate-desktop - Tauri binary pirate-client (Vite build + cargo debug)"
+	@echo "  make pirate-desktop-bundle - Tauri bundle/installer (npm run tauri:build)"
 	@echo ""
 	@echo "Frontend (dashboard):"
 	@echo "  make frontend       - npm install + vite build → server-stack/frontend/dist"
 	@echo "  make ui             - alias"
-	@echo "  make desktop-ui     - local Pirate Client SPA → local-stack/desktop-ui/dist"
+	@echo "  make desktop-ui     - Pirate Client web assets only → local-stack/desktop-ui/dist"
 	@echo ""
 	@echo "Full local dev build:"
 	@echo "  make build-local    - Rust debug workspace + frontend"
@@ -59,6 +60,9 @@ help:
 	@echo "  make test           - unit tests (cargo) + E2E script"
 	@echo "  make test-unit      - cargo test --workspace"
 	@echo "  make test-e2e | e2e | local-e2e - scripts/local-e2e.sh"
+	@echo ""
+	@echo "Docker (тестовый стек, клиент с хоста на gRPC в контейнере):"
+	@echo "  make docker-client-help   — кратко про Makefile.docker"
 	@echo ""
 	@echo "Other:"
 	@echo "  make clippy | fmt | clean"
@@ -126,13 +130,16 @@ desktop-ui:
 	cd local-stack/desktop-ui && $(NPM) install && $(NPM) run build
 
 pirate-desktop:
-	$(CARGO) build -p pirate-desktop --bin pirate-client $(CARGO_TARGET)
+	cd local-stack/desktop-ui && $(NPM) install && $(NPM) run build && cd ../.. && $(CARGO) build -p pirate-client $(CARGO_TARGET)
 
 pirate-desktop-release:
-	$(CARGO) build -p pirate-desktop --bin pirate-client --release $(CARGO_TARGET)
+	cd local-stack/desktop-ui && $(NPM) install && $(NPM) run build && cd ../.. && $(CARGO) build -p pirate-client --release $(CARGO_TARGET)
 
-# Build static UI then debug binary (for first run).
-pirate-desktop-all: desktop-ui pirate-desktop
+# Same as pirate-desktop (Vite dist is required for the Tauri frontend).
+pirate-desktop-all: pirate-desktop
+
+pirate-desktop-bundle:
+	cd local-stack/desktop-ui && $(NPM) install && $(NPM) run tauri:build
 
 # --- Combined ---
 
@@ -184,6 +191,14 @@ bootstrap: bootstrap-phase6
 bootstrap-phase6:
 	@chmod +x scripts/bootstrap-phase6.sh 2>/dev/null || true
 	./scripts/bootstrap-phase6.sh
+
+docker-client-help:
+	@echo "Поднять стек и дернуть хостовый client (без up будет connection refused):"
+	@echo "  make -f Makefile.docker up"
+	@echo "  make -f Makefile.docker connection   # подсказка по URL"
+	@echo "  make -f Makefile.docker client-status"
+	@echo "  make -f Makefile.docker client-deploy   # опционально: тестовый деплой"
+	@echo "См. также: make -f Makefile.docker help"
 
 # --- Clean ---
 

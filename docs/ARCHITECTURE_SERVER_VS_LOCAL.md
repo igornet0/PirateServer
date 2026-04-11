@@ -37,7 +37,7 @@ flowchart LR
 | [`server-stack/deploy/`](../server-stack/deploy/) | да | нет | Docker entrypoint, nginx examples, systemd/ubuntu. |
 | [`local-stack/client/`](../local-stack/client/) | нет | да | CLI: упаковка артефакта и gRPC. |
 | [`local-stack/local-agent/`](../local-stack/local-agent/) | нет | да | Заглушка; см. [`LOCAL_STACK_DESIGN.md`](LOCAL_STACK_DESIGN.md). |
-| [`local-stack/desktop-ui/`](../local-stack/desktop-ui/) + [`local-stack/desktop-client/`](../local-stack/desktop-client/) | нет | да | Локальный SPA + бинарь `pirate-client` (127.0.0.1); см. [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md). |
+| [`local-stack/desktop-ui/`](../local-stack/desktop-ui/) + [`local-stack/desktop-client/`](../local-stack/desktop-client/) | нет | да | Tauri-приложение `pirate-client` + SPA + crate `pirate-desktop`; см. [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md). |
 | [`server-stack/frontend/`](../server-stack/frontend/) | да (серверный UI) | отдельно при необходимости | Vite-дашборд; ходит в `control-api` на сервере. |
 | [`Dockerfile`](../Dockerfile), [`docker-compose.test.yml`](../docker-compose.test.yml) | да | нет | Сборка и e2e серверного стека. |
 

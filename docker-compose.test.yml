@@ -3,25 +3,34 @@
 #   docker compose -f docker-compose.test.yml up -d --build
 #   docker compose -f docker-compose.test.yml run --rm e2e
 # Or: ./scripts/e2e-docker.sh (wraps the above)
+# Postgres data: named volume postgres-data. Reset: docker compose … down -v
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # Debian-based image: fewer musl/locale edge cases than alpine; explicit data volume + shm for stable init.
+    image: postgres:16-bookworm
+    shm_size: 256mb
     environment:
       POSTGRES_USER: deploy
       POSTGRES_PASSWORD: deploy
       POSTGRES_DB: deploy
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U deploy -d deploy"]
       interval: 2s
       timeout: 5s
-      retries: 15
+      retries: 30
+      start_period: 10s
 
   deploy-server:
     build:
       context: .
       target: runtime-base
-    image: pirete-test-runtime
+    image: pirate-test-runtime
+    ports:
+      # Host → gRPC (local `client --endpoint http://127.0.0.1:50051` or desktop tooling)
+      - "${DOCKER_E2E_GRPC_PORT:-50051}:50051"
     command:
       - deploy-server
       - --root
@@ -32,6 +41,12 @@ services:
       - "50051"
       - --database-url
       - postgresql://deploy:deploy@postgres:5432/deploy
+    environment:
+      # E2E uses open gRPC; production should omit this and use Pair + signed requests.
+      DEPLOY_GRPC_ALLOW_UNAUTHENTICATED: "1"
+      # Optional dashboard seed (with CONTROL_API_JWT_SECRET on control-api):
+      CONTROL_UI_ADMIN_USERNAME: admin
+      CONTROL_UI_ADMIN_PASSWORD: testpass
     volumes:
       - deploy-data:/data
     depends_on:
@@ -39,7 +54,11 @@ services:
         condition: service_healthy
 
   control-api:
-    image: pirete-test-runtime
+    image: pirate-test-runtime
+    pull_policy: never
+    ports:
+      # Direct HTTP API from host (bearer tests, debugging); dashboard still via nginx :18080
+      - "${DOCKER_E2E_CONTROL_API_PORT:-18081}:8080"
     command:
       - control-api
       - --deploy-root
@@ -56,6 +75,8 @@ services:
       - deploy-data:/data
     environment:
       CONTROL_API_CORS_ALLOW_ANY: "1"
+      # Optional: require JWT for /api/v1/* (set matching seed on deploy-server):
+      CONTROL_API_JWT_SECRET: dev-secret-change-me
     depends_on:
       - deploy-server
       - postgres
@@ -70,7 +91,7 @@ services:
     build:
       context: .
       target: nginx-with-ui
-    image: pirete-test-nginx
+    image: pirate-test-nginx
     ports:
       - "18080:80"
     depends_on:
@@ -80,7 +101,8 @@ services:
   e2e:
     profiles:
       - e2e
-    image: pirete-test-runtime
+    image: pirate-test-runtime
+    pull_policy: never
     command: ["bash", "-lc", "bash /e2e/e2e-docker.sh"]
     volumes:
       - ./scripts/e2e-docker.sh:/e2e/e2e-docker.sh:ro
@@ -89,6 +111,7 @@ services:
       - nginx_public=http://nginx:80
       - GRPC_ENDPOINT=http://deploy-server:50051
       - CONTROL_API_DIRECT=http://control-api:8080
+      - DOCKER_E2E_API_TOKEN=${DOCKER_E2E_API_TOKEN-}
     depends_on:
       nginx:
         condition: service_started
@@ -99,3 +122,4 @@ services:
 
 volumes:
   deploy-data:
+  postgres-data:

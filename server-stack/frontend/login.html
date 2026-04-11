@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title data-i18n="page.loginTitle">PirateServer — Sign in</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="login-panel" class="login-panel">
+      <div class="login-card">
+        <div class="login-card-top">
+          <div class="lang-block lang-block--login">
+            <label
+              id="login-lang-label"
+              for="lang-switcher"
+              class="lang-switch-label"
+              data-i18n="lang.label"
+              >Language</label
+            >
+            <select
+              id="lang-switcher"
+              class="lang-switcher"
+              aria-labelledby="login-lang-label"
+            >
+              <option value="en" data-i18n="lang.en">English</option>
+              <option value="ru" data-i18n="lang.ru">Русский</option>
+            </select>
+          </div>
+        </div>
+        <div class="brand-row brand-row--hero">
+          <span
+            class="brand-logo"
+            role="img"
+            data-i18n-aria="brand.logoAria"
+            aria-label="PirateServer"
+          ></span>
+          <div class="brand-titles">
+            <span class="brand-product">PirateServer</span>
+            <h1 data-i18n="dash.title">Deploy dashboard</h1>
+          </div>
+        </div>
+        <p class="muted" data-i18n="login.blurb">
+          Sign in with the admin account from the server (or skip for open API / static token).
+        </p>
+        <form id="login-form">
+          <div class="row">
+            <label for="login-username" data-i18n="login.username">Username</label>
+            <input id="login-username" type="text" autocomplete="username" />
+          </div>
+          <div class="row">
+            <label for="login-password" data-i18n="login.password">Password</label>
+            <input id="login-password" type="password" autocomplete="current-password" />
+          </div>
+          <p id="login-error" class="login-error" role="alert"></p>
+          <div class="row actions">
+            <button type="submit" class="primary" data-i18n="login.signIn">Sign in</button>
+            <button type="button" id="login-skip" class="ghost" data-i18n="login.skip">
+              Skip (open API / manual token)
+            </button>
+          </div>
+        </form>
+        <p class="muted">
+          <button type="button" id="login-advanced-toggle" class="linkish" data-i18n="login.advancedToggle">
+            Advanced: static bearer token
+          </button>
+        </p>
+        <div id="login-advanced" class="login-advanced" hidden>
+          <div class="row">
+            <label for="api-token-login" data-i18n-html="login.apiTokenLabel"
+              >API Bearer token (<code>CONTROL_API_BEARER_TOKEN</code>)</label
+            >
+            <input
+              id="api-token-login"
+              type="password"
+              autocomplete="off"
+              data-i18n-placeholder="login.apiTokenPlaceholder"
+              placeholder="Optional; copied to dashboard when you skip"
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/login-main.ts"></script>
+  </body>
+</html>

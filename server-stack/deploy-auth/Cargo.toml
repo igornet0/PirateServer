@@ -1,0 +1,16 @@
+[package]
+name = "deploy-auth"
+version = "0.1.0"
+edition = "2021"
+description = "Ed25519 identity, pairing, and gRPC request signing for deploy-server"
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+parking_lot = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+hex = "0.4"
+tonic = "0.12"

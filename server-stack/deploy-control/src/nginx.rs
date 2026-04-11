@@ -57,11 +57,14 @@ pub async fn apply_nginx_put(
         });
     }
 
-    let reload_res = tokio::task::spawn_blocking(|| {
-        std::process::Command::new("nginx")
-            .arg("-s")
-            .arg("reload")
-            .output()
+    let reload_path = path.to_path_buf();
+    let reload_full = test_full_config;
+    let reload_res = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("nginx");
+        if reload_full {
+            cmd.arg("-c").arg(&reload_path);
+        }
+        cmd.arg("-s").arg("reload").output()
     })
     .await??;
 

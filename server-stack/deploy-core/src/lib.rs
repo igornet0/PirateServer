@@ -5,6 +5,50 @@ use std::path::{Path, PathBuf};
 /// Max length for a version label (directory name under `releases/`).
 pub const MAX_VERSION_LEN: usize = 128;
 
+/// Max length for a non-default project id segment under `projects/<id>/`.
+pub const MAX_PROJECT_ID_LEN: usize = 64;
+
+/// Normalize `project_id`: empty or `default` → deploy to legacy `--root` layout.
+pub fn normalize_project_id(project_id: &str) -> String {
+    let s = project_id.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("default") {
+        "default".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Validate a project id (single path segment; same charset as version).
+pub fn validate_project_id(project_id: &str) -> Result<(), &'static str> {
+    let n = normalize_project_id(project_id);
+    if n == "default" {
+        return Ok(());
+    }
+    if n.len() > MAX_PROJECT_ID_LEN {
+        return Err("project_id too long");
+    }
+    if !n
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err("project_id may only contain [a-zA-Z0-9._-]");
+    }
+    if n.contains("..") || n.contains('/') || n.contains('\\') {
+        return Err("invalid project_id");
+    }
+    Ok(())
+}
+
+/// Deploy root for a project: legacy `default` uses `base`; others use `base/projects/<id>/`.
+pub fn project_deploy_root(base: &Path, project_id: &str) -> PathBuf {
+    let n = normalize_project_id(project_id);
+    if n == "default" {
+        base.to_path_buf()
+    } else {
+        base.join("projects").join(n)
+    }
+}
+
 /// Runtime state shared between gRPC handlers (and mirrored to DB for UI).
 pub struct AppState {
     pub child: Option<tokio::process::Child>,

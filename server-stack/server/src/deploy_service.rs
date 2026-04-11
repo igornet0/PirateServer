@@ -1,18 +1,28 @@
 //! Deploy: stream → temp file, SHA-256, tar unpack, symlink, process control.
 
 use deploy_core::{
-    read_current_version_from_symlink, refresh_process_state, release_dir_for_version,
+    normalize_project_id, project_deploy_root, read_current_version_from_symlink,
+    refresh_process_state, release_dir_for_version, validate_project_id,
     validate_version as validate_version_core, AppState,
 };
 use deploy_db::DbStore;
+use crate::auth::ServerAuth;
+use deploy_auth::{
+    now_unix_ms, signing_payload, verify_rpc_metadata, verify_upload_metadata, META_PROJECT,
+    META_VERSION,
+};
+use std::collections::HashMap;
 use deploy_proto::deploy::{
-    deploy_service_server::DeployService, DeployChunk, DeployResponse, RollbackRequest,
-    RollbackResponse, StatusRequest, StatusResponse,
+    deploy_service_server::DeployService, DeployChunk, DeployResponse, PairRequest, PairResponse,
+    RestartProcessRequest, RollbackRequest, RollbackResponse, StatusRequest, StatusResponse,
+    StopProcessRequest,
 };
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use crate::auth::{sign_pair_response, verify_pair_signature};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tonic::{Request, Response, Status, Streaming};
@@ -24,36 +34,41 @@ fn validate_version(version: &str) -> Result<(), Status> {
 
 #[derive(Clone)]
 pub struct DeployServiceImpl {
-    pub root: PathBuf,
+    /// Base path; each project uses [`project_deploy_root`] under this path.
+    pub base_root: PathBuf,
     pub max_upload_bytes: u64,
     pub binary_fallback: String,
-    pub state: Arc<tokio::sync::Mutex<AppState>>,
+    pub states: Arc<tokio::sync::Mutex<HashMap<String, AppState>>>,
     pub db: Option<Arc<DbStore>>,
+    pub auth: Option<Arc<ServerAuth>>,
 }
 
 impl DeployServiceImpl {
     pub fn new(
-        root: PathBuf,
+        base_root: PathBuf,
         max_upload_bytes: u64,
         binary_fallback: String,
-        state: Arc<tokio::sync::Mutex<AppState>>,
+        states: Arc<tokio::sync::Mutex<HashMap<String, AppState>>>,
         db: Option<Arc<DbStore>>,
+        auth: Option<Arc<ServerAuth>>,
     ) -> Self {
         Self {
-            root,
+            base_root,
             max_upload_bytes,
             binary_fallback,
-            state,
+            states,
             db,
+            auth,
         }
     }
 
-    fn staging_dir(&self) -> PathBuf {
-        self.root.join(".staging")
+    fn staging_dir(project_root: &Path) -> PathBuf {
+        project_root.join(".staging")
     }
 
     fn spawn_db_record(
         &self,
+        project_id: &str,
         kind: &'static str,
         deployed_version: &str,
         current_version: &str,
@@ -63,6 +78,7 @@ impl DeployServiceImpl {
         let Some(db) = self.db.clone() else {
             return;
         };
+        let pid = project_id.to_string();
         let deployed_version = deployed_version.to_string();
         let current_version = current_version.to_string();
         let state = state.to_string();
@@ -70,13 +86,13 @@ impl DeployServiceImpl {
         let snapshot = format!("{state}|{current_version}|{:?}", last_err);
         tokio::spawn(async move {
             if let Err(e) = db
-                .record_event(kind, &deployed_version, Some(&snapshot))
+                .record_event(&pid, kind, &deployed_version, Some(&snapshot))
                 .await
             {
                 error!(%e, "deploy_db record_event");
             }
             if let Err(e) = db
-                .upsert_snapshot(&current_version, &state, last_err.as_deref())
+                .upsert_snapshot(&pid, &current_version, &state, last_err.as_deref())
                 .await
             {
                 error!(%e, "deploy_db upsert_snapshot");
@@ -191,80 +207,184 @@ async fn stop_child(child: &mut tokio::process::Child) {
 
 #[tonic::async_trait]
 impl DeployService for DeployServiceImpl {
+    async fn pair(
+        &self,
+        request: Request<PairRequest>,
+    ) -> Result<Response<PairResponse>, Status> {
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            Status::failed_precondition("authentication disabled; pairing unavailable")
+        })?;
+        let _ = auth
+            .reload_pairing_code()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let r = request.into_inner();
+        if r.client_public_key_b64.is_empty()
+            || r.nonce.is_empty()
+            || r.client_signature_b64.is_empty()
+        {
+            return Err(Status::invalid_argument("missing pair fields"));
+        }
+        let now = now_unix_ms();
+        if (now - r.timestamp_ms).abs() > auth.config.max_clock_skew_ms {
+            return Err(Status::deadline_exceeded("timestamp skew"));
+        }
+        auth.verify_pairing(&r.pairing_code)?;
+        verify_pair_signature(
+            &r.client_public_key_b64,
+            &auth.server_pubkey_b64,
+            r.timestamp_ms,
+            &r.nonce,
+            &r.pairing_code,
+            &r.client_signature_b64,
+        )?;
+        auth.add_peer(&r.client_public_key_b64)?;
+        let server_sig = sign_pair_response(
+            &auth.signing_key,
+            &auth.server_pubkey_b64,
+            &r.client_public_key_b64,
+            r.timestamp_ms,
+            &r.nonce,
+        );
+        Ok(Response::new(PairResponse {
+            server_public_key_b64: auth.server_pubkey_b64.clone(),
+            server_signature_b64: server_sig,
+            status: "paired".to_string(),
+        }))
+    }
+
     async fn upload(
         &self,
         request: Request<Streaming<DeployChunk>>,
     ) -> Result<Response<DeployResponse>, Status> {
+        let meta = request.metadata().clone();
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_upload_metadata(&meta, &peers, &auth.config, &auth.nonce_tracker)
+                .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        }
+        let expected_version = meta
+            .get(META_VERSION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let mut stream = request.into_inner();
 
         let mut version: Option<String> = None;
+        let mut project_key: Option<String> = None;
+        let mut project_root: Option<PathBuf> = None;
         let mut hasher = Sha256::new();
         let mut written: u64 = 0;
         let mut expected_sha_hex: Option<String> = None;
+        let mut temp_path: Option<PathBuf> = None;
+        let mut file: Option<tokio::fs::File> = None;
 
-        tokio::fs::create_dir_all(&self.staging_dir())
-            .await
-            .map_err(|e| Status::internal(format!("staging dir: {e}")))?;
+        while let Some(item) = stream.next().await {
+            let chunk = item.map_err(|e| Status::internal(e.to_string()))?;
 
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let temp_path = self.staging_dir().join(format!("upload_{stamp}.tar.gz"));
-
-        {
-            let mut file = tokio::fs::File::create(&temp_path)
-                .await
-                .map_err(|e| Status::internal(format!("temp file: {e}")))?;
-
-            while let Some(item) = stream.next().await {
-                let chunk = item.map_err(|e| Status::internal(e.to_string()))?;
-
-                if version.is_none() {
-                    if chunk.version.is_empty() {
-                        let _ = tokio::fs::remove_file(&temp_path).await;
-                        return Err(Status::invalid_argument("first chunk must set version"));
+            if version.is_none() {
+                if chunk.version.is_empty() {
+                    if let Some(ref p) = temp_path {
+                        let _ = tokio::fs::remove_file(p).await;
                     }
-                    validate_version(&chunk.version)?;
-                    version = Some(chunk.version.clone());
-                } else if !chunk.version.is_empty()
-                    && chunk.version.as_str() != version.as_deref().unwrap()
-                {
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    return Err(Status::invalid_argument("version mismatch between chunks"));
+                    return Err(Status::invalid_argument("first chunk must set version"));
                 }
-
-                let n = chunk.data.len() as u64;
-                if written.saturating_add(n) > self.max_upload_bytes {
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    return Err(Status::resource_exhausted(format!(
-                        "artifact exceeds limit of {} bytes",
-                        self.max_upload_bytes
-                    )));
-                }
-
-                hasher.update(&chunk.data);
-                file.write_all(&chunk.data)
-                    .await
-                    .map_err(|e| Status::internal(format!("write: {e}")))?;
-                written = written.saturating_add(n);
-
-                if chunk.is_last {
-                    if chunk.sha256_hex.is_empty() {
-                        let _ = tokio::fs::remove_file(&temp_path).await;
+                if let Some(ref ev) = expected_version {
+                    if chunk.version != *ev {
+                        if let Some(ref p) = temp_path {
+                            let _ = tokio::fs::remove_file(p).await;
+                        }
                         return Err(Status::invalid_argument(
-                            "sha256_hex required when is_last is true",
+                            "first chunk version must match x-deploy-version metadata",
                         ));
                     }
-                    expected_sha_hex = Some(chunk.sha256_hex.clone());
                 }
+                validate_version(&chunk.version)?;
+                validate_project_id(&chunk.project_id).map_err(Status::invalid_argument)?;
+                let chunk_proj = normalize_project_id(&chunk.project_id);
+                let meta_proj = meta.get(META_PROJECT).and_then(|v| v.to_str().ok());
+                match meta_proj {
+                    Some(m) => {
+                        if normalize_project_id(m) != chunk_proj {
+                            return Err(Status::invalid_argument(
+                                "project_id mismatch between metadata and first chunk",
+                            ));
+                        }
+                    }
+                    None => {
+                        if chunk_proj != "default" {
+                            return Err(Status::invalid_argument(
+                                "non-default project_id requires x-deploy-project metadata",
+                            ));
+                        }
+                    }
+                }
+
+                let root = project_deploy_root(&self.base_root, &chunk.project_id);
+                tokio::fs::create_dir_all(Self::staging_dir(&root))
+                    .await
+                    .map_err(|e| Status::internal(format!("staging dir: {e}")))?;
+                let stamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let tp = Self::staging_dir(&root).join(format!("upload_{stamp}.tar.gz"));
+                let f = tokio::fs::File::create(&tp)
+                    .await
+                    .map_err(|e| Status::internal(format!("temp file: {e}")))?;
+                file = Some(f);
+                temp_path = Some(tp);
+                project_root = Some(root);
+                project_key = Some(chunk_proj);
+                version = Some(chunk.version.clone());
+            } else if !chunk.version.is_empty()
+                && chunk.version.as_str() != version.as_deref().unwrap()
+            {
+                if let Some(ref p) = temp_path {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
+                return Err(Status::invalid_argument("version mismatch between chunks"));
+            }
+
+            let n = chunk.data.len() as u64;
+            if written.saturating_add(n) > self.max_upload_bytes {
+                if let Some(ref p) = temp_path {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
+                return Err(Status::resource_exhausted(format!(
+                    "artifact exceeds limit of {} bytes",
+                    self.max_upload_bytes
+                )));
+            }
+
+            hasher.update(&chunk.data);
+            file.as_mut()
+                .ok_or_else(|| Status::internal("internal: file not open"))?
+                .write_all(&chunk.data)
+                .await
+                .map_err(|e| Status::internal(format!("write: {e}")))?;
+            written = written.saturating_add(n);
+
+            if chunk.is_last {
+                if chunk.sha256_hex.is_empty() {
+                    if let Some(ref p) = temp_path {
+                        let _ = tokio::fs::remove_file(p).await;
+                    }
+                    return Err(Status::invalid_argument(
+                        "sha256_hex required when is_last is true",
+                    ));
+                }
+                expected_sha_hex = Some(chunk.sha256_hex.clone());
             }
         }
 
         let version = version.ok_or_else(|| {
-            let _ = std::fs::remove_file(&temp_path);
+            if let Some(ref p) = temp_path {
+                let _ = std::fs::remove_file(p);
+            }
             Status::invalid_argument("no version in stream")
         })?;
+        let project_key = project_key.ok_or_else(|| Status::invalid_argument("no project in stream"))?;
+        let project_root = project_root.ok_or_else(|| Status::internal("internal: no project root"))?;
+        let temp_path = temp_path.ok_or_else(|| Status::internal("internal: no temp path"))?;
 
         let expected_hex = expected_sha_hex.ok_or_else(|| {
             let _ = std::fs::remove_file(&temp_path);
@@ -285,8 +405,8 @@ impl DeployService for DeployServiceImpl {
             return Err(Status::invalid_argument("SHA-256 mismatch"));
         }
 
-        let release_dir = release_dir_for_version(&self.root, &version);
-        tokio::fs::create_dir_all(deploy_core::releases_dir(&self.root))
+        let release_dir = release_dir_for_version(&project_root, &version);
+        tokio::fs::create_dir_all(deploy_core::releases_dir(&project_root))
             .await
             .map_err(|e| Status::internal(format!("releases dir: {e}")))?;
 
@@ -306,11 +426,12 @@ impl DeployService for DeployServiceImpl {
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(|e| Status::internal(e))?;
 
-        info!(version = %version, "artifact unpacked");
+        info!(project = %project_key, version = %version, "artifact unpacked");
 
-        let root = self.root.clone();
+        let root = project_root.clone();
         let bf = self.binary_fallback.clone();
-        let mut st = self.state.lock().await;
+        let mut map = self.states.lock().await;
+        let st = map.entry(project_key.clone()).or_insert_with(AppState::default);
 
         if let Some(ref mut c) = st.child {
             stop_child(c).await;
@@ -330,12 +451,19 @@ impl DeployService for DeployServiceImpl {
                 st.current_version = version.clone();
                 st.state = "running".to_string();
                 st.last_error = None;
-                info!(version = %version, "deployed and started");
+                info!(project = %project_key, version = %version, "deployed and started");
                 let cur = st.current_version.clone();
                 let state = st.state.clone();
                 let err = st.last_error.clone();
-                drop(st);
-                self.spawn_db_record("upload", &version, &cur, &state, err.as_deref());
+                drop(map);
+                self.spawn_db_record(
+                    &project_key,
+                    "upload",
+                    &version,
+                    &cur,
+                    &state,
+                    err.as_deref(),
+                );
             }
             Err(e) => {
                 st.state = "error".to_string();
@@ -352,14 +480,33 @@ impl DeployService for DeployServiceImpl {
 
     async fn get_status(
         &self,
-        _request: Request<StatusRequest>,
+        request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        let mut st = self.state.lock().await;
-        refresh_process_state(&mut st);
+        let meta = request.metadata().clone();
+        let inner = request.into_inner();
+        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
+        let key = normalize_project_id(&inner.project_id);
+        let sign_payload = signing_payload("GetStatus", &inner.project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "GetStatus",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        }
+        let root = project_deploy_root(&self.base_root, &inner.project_id);
+        let mut map = self.states.lock().await;
+        let st = map.entry(key.clone()).or_insert_with(AppState::default);
+        refresh_process_state(st);
 
         let mut current = st.current_version.clone();
         if current.is_empty() {
-            if let Some(v) = read_current_version_from_symlink(&self.root) {
+            if let Some(v) = read_current_version_from_symlink(&root) {
                 current = v;
             }
         }
@@ -374,17 +521,35 @@ impl DeployService for DeployServiceImpl {
         &self,
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
-        let v = request.into_inner().version;
+        let meta = request.metadata().clone();
+        let inner = request.into_inner();
+        let v = inner.version;
+        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
+        let key = normalize_project_id(&inner.project_id);
+        let sign_payload = signing_payload("Rollback", &inner.project_id, &v);
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "Rollback",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        }
         validate_version(&v)?;
 
-        let target = release_dir_for_version(&self.root, &v);
+        let root = project_deploy_root(&self.base_root, &inner.project_id);
+        let target = release_dir_for_version(&root, &v);
         if !target.is_dir() {
             return Err(Status::not_found(format!("release {v} not found")));
         }
 
-        let root = self.root.clone();
         let bf = self.binary_fallback.clone();
-        let mut st = self.state.lock().await;
+        let mut map = self.states.lock().await;
+        let st = map.entry(key.clone()).or_insert_with(AppState::default);
 
         if let Some(ref mut c) = st.child {
             stop_child(c).await;
@@ -404,12 +569,12 @@ impl DeployService for DeployServiceImpl {
                 st.current_version = v.clone();
                 st.state = "running".to_string();
                 st.last_error = None;
-                info!(version = %v, "rollback complete");
+                info!(project = %key, version = %v, "rollback complete");
                 let cur = st.current_version.clone();
                 let state = st.state.clone();
                 let err = st.last_error.clone();
-                drop(st);
-                self.spawn_db_record("rollback", &v, &cur, &state, err.as_deref());
+                drop(map);
+                self.spawn_db_record(&key, "rollback", &v, &cur, &state, err.as_deref());
             }
             Err(e) => {
                 st.state = "error".to_string();
@@ -421,6 +586,137 @@ impl DeployService for DeployServiceImpl {
         Ok(Response::new(RollbackResponse {
             status: "ok".to_string(),
             active_version: v,
+        }))
+    }
+
+    async fn stop_process(
+        &self,
+        request: Request<StopProcessRequest>,
+    ) -> Result<Response<StatusResponse>, Status> {
+        let meta = request.metadata().clone();
+        let inner = request.into_inner();
+        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
+        let key = normalize_project_id(&inner.project_id);
+        let sign_payload = signing_payload("StopProcess", &inner.project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "StopProcess",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        }
+
+        let root = project_deploy_root(&self.base_root, &inner.project_id);
+        let mut map = self.states.lock().await;
+        let st = map.entry(key.clone()).or_insert_with(AppState::default);
+        refresh_process_state(st);
+
+        if let Some(ref mut c) = st.child {
+            stop_child(c).await;
+            st.child = None;
+        }
+        st.state = "stopped".to_string();
+        st.last_error = None;
+
+        let mut current = st.current_version.clone();
+        if current.is_empty() {
+            if let Some(v) = read_current_version_from_symlink(&root) {
+                current = v;
+                st.current_version = current.clone();
+            }
+        }
+
+        let cur = st.current_version.clone();
+        let state = st.state.clone();
+        drop(map);
+        self.spawn_db_record(&key, "stop", &cur, &cur, &state, None);
+
+        Ok(Response::new(StatusResponse {
+            current_version: current,
+            state: "stopped".to_string(),
+        }))
+    }
+
+    async fn restart_process(
+        &self,
+        request: Request<RestartProcessRequest>,
+    ) -> Result<Response<StatusResponse>, Status> {
+        let meta = request.metadata().clone();
+        let inner = request.into_inner();
+        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
+        let key = normalize_project_id(&inner.project_id);
+        let sign_payload = signing_payload("RestartProcess", &inner.project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "RestartProcess",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        }
+
+        let root = project_deploy_root(&self.base_root, &inner.project_id);
+        let bf = self.binary_fallback.clone();
+        let mut map = self.states.lock().await;
+        let st = map.entry(key.clone()).or_insert_with(AppState::default);
+        refresh_process_state(st);
+
+        let mut ver = st.current_version.clone();
+        if ver.is_empty() {
+            ver = read_current_version_from_symlink(&root).unwrap_or_default();
+        }
+        if ver.is_empty() {
+            return Err(Status::failed_precondition(
+                "no active release; deploy or rollback first",
+            ));
+        }
+
+        let target = release_dir_for_version(&root, &ver);
+        if !target.is_dir() {
+            return Err(Status::failed_precondition(format!(
+                "release directory for {ver} missing"
+            )));
+        }
+
+        if let Some(ref mut c) = st.child {
+            stop_child(c).await;
+            st.child = None;
+        }
+
+        match spawn_release(&root, &ver, &bf).await {
+            Ok(child) => {
+                st.child = Some(child);
+                st.current_version = ver.clone();
+                st.state = "running".to_string();
+                st.last_error = None;
+                info!(project = %key, version = %ver, "process restarted");
+                let cur = st.current_version.clone();
+                let state = st.state.clone();
+                let err = st.last_error.clone();
+                drop(map);
+                self.spawn_db_record(&key, "restart", &ver, &cur, &state, err.as_deref());
+            }
+            Err(e) => {
+                st.state = "error".to_string();
+                st.last_error = Some(e.message().to_string());
+                return Err(e);
+            }
+        }
+
+        let map = self.states.lock().await;
+        let st = map.get(&key).ok_or_else(|| Status::internal("internal: project state"))?;
+        Ok(Response::new(StatusResponse {
+            current_version: st.current_version.clone(),
+            state: st.state.clone(),
         }))
     }
 }

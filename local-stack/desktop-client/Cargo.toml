@@ -2,21 +2,22 @@
 name = "pirate-desktop"
 version = "0.1.0"
 edition = "2021"
-description = "Local desktop HTTP server + static UI for Pirate Client (127.0.0.1 only)"
+description = "Pirate Client desktop shared library (Tauri backend helpers)"
 autobins = false
 
-[[bin]]
-name = "pirate-client"
-path = "src/main.rs"
+[lib]
+name = "pirate_desktop"
+path = "src/lib.rs"
 
 [dependencies]
-axum = { version = "0.7", features = ["macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
-tower-http = { version = "0.5", features = ["fs", "trace"] }
-clap = { version = "4", features = ["derive"] }
+deploy-client = { path = "../client" }
+deploy-auth = { path = "../../server-stack/deploy-auth" }
+deploy-core = { path = "../../server-stack/deploy-core" }
 serde = { version = "1", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
-tracing-appender = "0.2"
+serde_json = "1"
 dirs = "5"
-open = "5"
+deploy-proto = { path = "../../proto" }
+ed25519-dalek = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+tonic = { version = "0.12", features = ["transport"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

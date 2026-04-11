@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Full stack + control-api image with nginx (for /api/v1/nginx/config integration tests).
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+COMPOSE=(docker compose -f docker-compose.test.yml -f docker-compose.nginx-e2e.yml)
+
+"${COMPOSE[@]}" up -d --build
+bash "${ROOT}/scripts/print-docker-connection.sh"
+"${COMPOSE[@]}" --profile e2e run --rm -e NGINX_E2E_TESTS=1 e2e
+
+if [[ "${1:-}" == "--down" ]]; then
+  "${COMPOSE[@]}" down -v
+fi

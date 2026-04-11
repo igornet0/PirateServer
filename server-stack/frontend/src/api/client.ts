@@ -3,14 +3,34 @@ import type {
   HistoryView,
   NginxConfigView,
   NginxPutResponseView,
+  ProcessControlView,
+  ProjectsView,
   ReleasesView,
+  RollbackView,
   StatusView,
 } from "./types.js";
 import { ApiRequestError } from "./types.js";
 
+const ACCESS_TOKEN_KEY = "deploy.accessToken";
+
+/**
+ * Manual `#api-token` overrides session JWT; else JWT from login session.
+ */
 function apiToken(): string {
-  const el = document.getElementById("api-token") as HTMLInputElement | null;
-  return el?.value?.trim() ?? "";
+  const dash = document.getElementById("api-token") as HTMLInputElement | null;
+  const manual = dash?.value?.trim() ?? "";
+  if (manual) {
+    return manual;
+  }
+  try {
+    const s = sessionStorage.getItem(ACCESS_TOKEN_KEY);
+    if (s?.trim()) {
+      return s.trim();
+    }
+  } catch {
+    /* ignore */
+  }
+  return "";
 }
 
 function nginxAdminToken(): string {
@@ -25,6 +45,24 @@ function baseHeaders(): Record<string, string> {
     h.Authorization = `Bearer ${t}`;
   }
   return h;
+}
+
+/** From dashboard `#active-project` input; persisted in sessionStorage. */
+export function activeProject(): string {
+  const el = document.getElementById("active-project") as HTMLInputElement | null;
+  const v = el?.value?.trim();
+  const p = v && v.length > 0 ? v : "default";
+  try {
+    sessionStorage.setItem("deploy.activeProject", p);
+  } catch {
+    /* ignore */
+  }
+  return p;
+}
+
+function projectQuery(): string {
+  const p = encodeURIComponent(activeProject());
+  return `?project=${p}`;
 }
 
 async function parseError(res: Response): Promise<never> {
@@ -55,16 +93,55 @@ async function getJson<T>(path: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+async function postJson<T>(path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...baseHeaders(),
+  };
+  const r = await fetch(path, {
+    method: "POST",
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) {
+    await parseError(r);
+  }
+  return r.json() as Promise<T>;
+}
+
 export async function fetchStatus(): Promise<StatusView> {
-  return getJson<StatusView>("/api/v1/status");
+  return getJson<StatusView>(`/api/v1/status${projectQuery()}`);
 }
 
 export async function fetchReleases(): Promise<ReleasesView> {
-  return getJson<ReleasesView>("/api/v1/releases");
+  return getJson<ReleasesView>(`/api/v1/releases${projectQuery()}`);
+}
+
+export async function fetchProjects(): Promise<ProjectsView> {
+  return getJson<ProjectsView>("/api/v1/projects");
 }
 
 export async function fetchHistory(): Promise<HistoryView> {
-  return getJson<HistoryView>("/api/v1/history");
+  return getJson<HistoryView>(`/api/v1/history${projectQuery()}`);
+}
+
+export async function postRollback(version: string): Promise<RollbackView> {
+  return postJson<RollbackView>("/api/v1/rollback", {
+    version,
+    project_id: activeProject(),
+  });
+}
+
+export async function postProcessStop(): Promise<ProcessControlView> {
+  return postJson<ProcessControlView>(
+    `/api/v1/process/stop${projectQuery()}`,
+  );
+}
+
+export async function postProcessRestart(): Promise<ProcessControlView> {
+  return postJson<ProcessControlView>(
+    `/api/v1/process/restart${projectQuery()}`,
+  );
 }
 
 export async function fetchNginxConfig(): Promise<NginxConfigView> {

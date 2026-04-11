@@ -7,15 +7,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY proto proto
 COPY server-stack/server server-stack/server
 COPY server-stack/control-api server-stack/control-api
+COPY server-stack/deploy-auth server-stack/deploy-auth
 COPY server-stack/deploy-control server-stack/deploy-control
 COPY server-stack/deploy-db server-stack/deploy-db
 COPY server-stack/deploy-core server-stack/deploy-core
-COPY local-stack/client local-stack/client
+COPY server-stack/tunnel-gateway server-stack/tunnel-gateway
+COPY local-stack local-stack
 RUN cargo build --release -p deploy-server -p control-api -p deploy-client
 
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 curl gosu \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 curl gosu jq \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 1000 -d /deploy -s /bin/bash deploy
 COPY server-stack/deploy/docker/entrypoint-deploy.sh /usr/local/bin/entrypoint-deploy.sh
@@ -25,6 +27,16 @@ COPY --from=rust-builder /app/target/release/control-api /usr/local/bin/control-
 COPY --from=rust-builder /app/target/release/client /usr/local/bin/client
 WORKDIR /deploy
 ENTRYPOINT ["/usr/local/bin/entrypoint-deploy.sh"]
+
+# control-api + nginx in one container for nginx /api/v1/nginx/config e2e (see docker-compose.nginx-e2e.yml).
+FROM runtime-base AS runtime-nginx-e2e
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx \
+    && rm -rf /var/lib/apt/lists/*
+COPY server-stack/deploy/docker/entrypoint-nginx-e2e.sh /usr/local/bin/entrypoint-nginx-e2e.sh
+RUN chmod +x /usr/local/bin/entrypoint-nginx-e2e.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint-nginx-e2e.sh"]
 
 FROM node:20-bookworm AS frontend-build
 WORKDIR /ui

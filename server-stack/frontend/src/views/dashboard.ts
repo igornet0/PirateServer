@@ -1,9 +1,19 @@
 import {
   fetchHistory,
+  fetchProjects,
   fetchReleases,
   fetchStatus,
 } from "../api/client.js";
 import { ApiRequestError } from "../api/types.js";
+import { t } from "../i18n/index.js";
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
 function formatErr(e: unknown): string {
   if (e instanceof ApiRequestError) {
@@ -14,6 +24,7 @@ function formatErr(e: unknown): string {
 
 export async function refreshDashboard(): Promise<void> {
   const statusEl = document.getElementById("status")!;
+  const projectsEl = document.getElementById("projects")! as HTMLElement;
   const releasesEl = document.getElementById("releases")!;
   const historyEl = document.getElementById("history")!;
 
@@ -22,6 +33,20 @@ export async function refreshDashboard(): Promise<void> {
     statusEl.textContent = JSON.stringify(data, null, 2);
   } catch (e) {
     statusEl.textContent = formatErr(e);
+  }
+
+  try {
+    const data = await fetchProjects();
+    const rows = data.projects
+      .map(
+        (p) =>
+          `<tr><td><code>${escapeHtml(p.id)}</code></td><td>${escapeHtml(p.deploy_root)}</td></tr>`,
+      )
+      .join("");
+    projectsEl.innerHTML =
+      `<table class="proj-table"><thead><tr><th>${escapeHtml(t("inv.table.id"))}</th><th>${escapeHtml(t("inv.table.deployRoot"))}</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch (e) {
+    projectsEl.textContent = formatErr(e);
   }
 
   try {

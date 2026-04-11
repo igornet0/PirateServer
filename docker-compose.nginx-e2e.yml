@@ -1,0 +1,29 @@
+# Merge with docker-compose.test.yml to run control-api with nginx binary for /api/v1/nginx/config e2e.
+# Usage:
+#   ./scripts/run-docker-e2e-nginx.sh
+# Or:
+#   docker compose -f docker-compose.test.yml -f docker-compose.nginx-e2e.yml up -d --build
+#   docker compose -f docker-compose.test.yml -f docker-compose.nginx-e2e.yml --profile e2e run --rm -e NGINX_E2E_TESTS=1 e2e
+
+services:
+  control-api:
+    build:
+      context: .
+      target: runtime-nginx-e2e
+    image: pirate-test-runtime-nginx-e2e
+    entrypoint: ["/usr/local/bin/entrypoint-nginx-e2e.sh"]
+    command:
+      - control-api
+      - --deploy-root
+      - /data
+      - --bind
+      - "0.0.0.0"
+      - --listen-port
+      - "8080"
+      - --grpc-endpoint
+      - http://deploy-server:50051
+      - --database-url
+      - postgresql://deploy:deploy@postgres:5432/deploy
+      - --nginx-config-path
+      - /data/nginx-e2e.conf
+      - --nginx-test-full-config

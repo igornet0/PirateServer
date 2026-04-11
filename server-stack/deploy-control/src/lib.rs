@@ -7,5 +7,6 @@ mod types;
 pub use nginx::{apply_nginx_put, read_nginx_config, NginxPutOutcome};
 pub use service::{ControlError, ControlPlane};
 pub use types::{
-    HistoryView, NginxConfigPut, NginxConfigView, NginxPutResponseView, ReleasesView, StatusView,
+    HistoryView, NginxConfigPut, NginxConfigView, NginxPutResponseView, ProcessControlView,
+    ProjectView, ProjectsView, ReleasesView, RollbackBody, RollbackView, StatusView,
 };

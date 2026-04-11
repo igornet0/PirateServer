@@ -4,12 +4,39 @@ package deploy;
 
 // Artifact-based deployment service (gRPC only).
 service DeployService {
+  // One-time enrollment: exchange public keys and register this client (requires pairing_code).
+  rpc Pair(PairRequest) returns (PairResponse);
+
   // Client streams tarball chunks; server assembles, verifies, deploys.
   rpc Upload(stream DeployChunk) returns (DeployResponse);
 
   rpc GetStatus(StatusRequest) returns (StatusResponse);
 
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  // Stop managed child without changing the active release (symlink unchanged).
+  rpc StopProcess(StopProcessRequest) returns (StatusResponse);
+
+  // Kill and respawn the process for the current `current` release (same version).
+  rpc RestartProcess(RestartProcessRequest) returns (StatusResponse);
+}
+
+message PairRequest {
+  // Ed25519 public key (32 bytes), standard Base64 URL-safe no padding.
+  string client_public_key_b64 = 1;
+  int64 timestamp_ms = 2;
+  // Random nonce (unique per request); ASCII, max 128 chars.
+  string nonce = 3;
+  // Must match server's pairing.code from install output (until rotated).
+  string pairing_code = 4;
+  // Signature over canonical v1|PAIR|... message (see docs), Base64 standard.
+  string client_signature_b64 = 5;
+}
+
+message PairResponse {
+  string server_public_key_b64 = 1;
+  string server_signature_b64 = 2;
+  string status = 3;
 }
 
 message DeployChunk {
@@ -18,6 +45,8 @@ message DeployChunk {
   bool is_last = 3;
   // SHA-256 of the full artifact (hex, lowercase). Required when is_last = true.
   string sha256_hex = 4;
+  // Logical project id; empty means `default` (legacy single-root layout under --root).
+  string project_id = 5;
 }
 
 message DeployResponse {
@@ -25,7 +54,10 @@ message DeployResponse {
   string deployed_version = 2;
 }
 
-message StatusRequest {}
+message StatusRequest {
+  // Empty or omitted means `default`.
+  string project_id = 1;
+}
 
 message StatusResponse {
   string current_version = 1;
@@ -35,9 +67,18 @@ message StatusResponse {
 
 message RollbackRequest {
   string version = 1;
+  string project_id = 2;
 }
 
 message RollbackResponse {
   string status = 1;
   string active_version = 2;
+}
+
+message StopProcessRequest {
+  string project_id = 1;
+}
+
+message RestartProcessRequest {
+  string project_id = 1;
 }

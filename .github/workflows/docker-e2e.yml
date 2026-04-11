@@ -1,0 +1,25 @@
+name: Docker E2E
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  docker-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Default stack (deploy + HTTP + rollback + history)
+        run: ./scripts/run-docker-e2e.sh --down
+
+      - name: control-api Bearer token
+        env:
+          DOCKER_E2E_API_TOKEN: ci-docker-e2e-bearer
+        run: ./scripts/run-docker-e2e-bearer.sh --down
+
+      - name: Nginx config API (merged compose + PUT /api/v1/nginx/config)
+        run: ./scripts/run-docker-e2e-nginx.sh --down

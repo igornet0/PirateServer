@@ -10,12 +10,22 @@ export interface ReleasesView {
   releases: string[];
 }
 
+export interface ProjectView {
+  id: string;
+  deploy_root: string;
+}
+
+export interface ProjectsView {
+  projects: ProjectView[];
+}
+
 export interface DeployEventRow {
   id: number;
   kind: string;
   version: string;
   created_at: string;
   state_snapshot: string | null;
+  project_id: string;
 }
 
 export interface HistoryView {
@@ -33,6 +43,16 @@ export interface NginxPutResponseView {
   message: string;
   test_output?: string;
   reload_output?: string;
+}
+
+export interface RollbackView {
+  status: string;
+  active_version: string;
+}
+
+export interface ProcessControlView {
+  current_version: string;
+  state: string;
 }
 
 export interface ApiErrorPayload {

@@ -27,7 +27,13 @@ pub fn build_cors_layer() -> CorsLayer {
     } else {
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))
-            .allow_methods([Method::GET, Method::PUT, Method::OPTIONS, Method::HEAD])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::OPTIONS,
+                Method::HEAD,
+            ])
             .allow_headers(tower_http::cors::Any)
     }
 }

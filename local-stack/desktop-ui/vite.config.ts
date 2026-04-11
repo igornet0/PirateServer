@@ -2,11 +2,10 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   base: "./",
+  clearScreen: false,
   server: {
     port: 5174,
-    proxy: {
-      "/api": "http://127.0.0.1:9090",
-    },
+    strictPort: true,
   },
   build: {
     outDir: "dist",

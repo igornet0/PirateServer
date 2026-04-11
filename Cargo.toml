@@ -7,7 +7,10 @@ members = [
     "server-stack/deploy-control",
     "server-stack/deploy-db",
     "server-stack/deploy-core",
+    "server-stack/deploy-auth",
+    "server-stack/tunnel-gateway",
     "local-stack/client",
     "local-stack/local-agent",
     "local-stack/desktop-client",
+    "local-stack/desktop-ui/src-tauri",
 ]

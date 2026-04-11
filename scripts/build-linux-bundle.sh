@@ -5,7 +5,7 @@
 #
 # Использование:
 #   ./scripts/build-linux-bundle.sh
-# Архив: dist/pirete-linux-amd64-<date>.tar.gz
+# Архив: dist/pirate-linux-amd64-<date>.tar.gz
 #
 set -euo pipefail
 
@@ -17,8 +17,8 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 
 TARGET_TRIPLE="${TARGET_TRIPLE:-x86_64-unknown-linux-gnu}"
 DIST_DIR="$REPO_ROOT/dist"
-STAGE="$DIST_DIR/stage/pirete-linux-amd64"
-OUT_TGZ="$DIST_DIR/pirete-linux-amd64-$(date +%Y%m%d).tar.gz"
+STAGE="$DIST_DIR/stage/pirate-linux-amd64"
+OUT_TGZ="$DIST_DIR/pirate-linux-amd64-$(date +%Y%m%d).tar.gz"
 
 rustup target add "$TARGET_TRIPLE" >/dev/null 2>&1 || true
 
@@ -58,15 +58,23 @@ cp -a "$REPO_ROOT/server-stack/frontend/dist/." "$STAGE/share/ui/dist/"
 
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/deploy-server.service" "$STAGE/systemd/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/control-api.service" "$STAGE/systemd/"
-cp "$REPO_ROOT/server-stack/deploy/ubuntu/nginx-pirete-site.conf" "$STAGE/nginx/"
+cp "$REPO_ROOT/server-stack/deploy/ubuntu/nginx-pirate-site.conf" "$STAGE/nginx/"
+cp "$REPO_ROOT/server-stack/deploy/ubuntu/nginx-pirate-site-domain.conf.in" "$STAGE/nginx/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/env.example" "$STAGE/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/install.sh" "$STAGE/"
-chmod +x "$STAGE/install.sh"
+cp "$REPO_ROOT/server-stack/deploy/ubuntu/Makefile" "$STAGE/"
+cp "$REPO_ROOT/server-stack/deploy/ubuntu/uninstall.sh" "$STAGE/"
+cp "$REPO_ROOT/server-stack/deploy/ubuntu/purge-pirate-data.sh" "$STAGE/"
+chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/purge-pirate-data.sh"
 
 rm -f "$OUT_TGZ"
 mkdir -p "$DIST_DIR"
-( cd "$DIST_DIR/stage" && tar -czf "$OUT_TGZ" pirete-linux-amd64 )
+# macOS: не класть xattr в tar (иначе GNU tar на Linux шумит LIBARCHIVE.xattr…)
+export COPYFILE_DISABLE=1
+( cd "$DIST_DIR/stage" && tar -czf "$OUT_TGZ" pirate-linux-amd64 )
 
 echo ""
 echo "Готово: $OUT_TGZ"
-echo "На сервере: tar xzf $(basename "$OUT_TGZ") && cd pirete-linux-amd64 && sudo ./install.sh"
+echo "Отправить на сервер: scp dist/pirate-linux-amd64-*.tar.gz root@<IP>:<PATH>"
+echo "На сервере: tar xzf $(basename "$OUT_TGZ") && cd pirate-linux-amd64 && sudo ./install.sh"
+echo "  Удаление: sudo ./uninstall.sh  затем  sudo ./purge-pirate-data.sh [--remove-postgres] [--remove-linux-user]"

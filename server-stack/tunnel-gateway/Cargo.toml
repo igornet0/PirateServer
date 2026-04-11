@@ -1,0 +1,15 @@
+[package]
+name = "tunnel-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Inbound tunnel endpoint: forwards framed HTTP to local control-api (local-agent connects outbound)"
+
+[[bin]]
+name = "tunnel-gateway"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

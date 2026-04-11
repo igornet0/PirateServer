@@ -1,0 +1,13 @@
+[Unit]
+Description=Framed HTTP tunnel for local-agent (optional)
+After=network.target control-api.service
+
+[Service]
+Type=simple
+User=deploy
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/tunnel-gateway --listen [::]:8445 --control-api 127.0.0.1:8080
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

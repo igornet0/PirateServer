@@ -1,0 +1,50 @@
+# Генерируется install.sh из шаблона: __pirate_SERVER_NAMES__ — список имён для server_name.
+# Первый блок — явный vhost; второй — default_server для доступа по IP и несовпавшего Host.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __pirate_SERVER_NAMES__;
+
+    root /var/lib/pirate/ui/dist;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_pass http://[::1]:8080;
+    }
+
+    location /health {
+        proxy_pass http://[::1]:8080/health;
+    }
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    root /var/lib/pirate/ui/dist;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_pass http://[::1]:8080;
+    }
+
+    location /health {
+        proxy_pass http://[::1]:8080/health;
+    }
+}
