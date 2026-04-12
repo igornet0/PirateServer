@@ -7,7 +7,8 @@
 	rust rust-release frontend frontend-install ui \
 	desktop-ui pirate-desktop pirate-desktop-release pirate-desktop-bundle \
 	build-local build-stack-release dist dist-manifest dist-linux dist-arm64-linux install install-release \
-	bootstrap bootstrap-phase6 e2e local-e2e docker-client-help build-desktop-ui
+	bootstrap bootstrap-phase6 e2e local-e2e docker-client-help build-desktop-ui \
+	test-dist-arm64-docker-install up-version
 
 CARGO       ?= cargo
 NPM         ?= npm
@@ -44,6 +45,10 @@ help:
 	@echo "    UI_BUILD=0 — без статики дашборда, архив с .bundle-no-ui (установка UI недоступна)"
 	@echo "  Cross-compile:  TARGET=x86_64-unknown-linux-gnu make client-release"
 	@echo ""
+	@echo "Docker + Linux arm64 bundle (install.sh + client pair + version):"
+	@echo "  make test-dist-arm64-docker-install   - make dist-arm64-linux, build arm64 image, run install.sh in container"
+	@echo "    SKIP_DIST_BUILD=1 — reuse existing dist/pirate-linux-aarch64-*.tar.gz"
+	@echo ""
 	@echo "Single crates (debug):"
 	@echo "  make server | client | pirate | control-api | local-agent"
 	@echo "  make pirate-desktop - Tauri binary pirate-client (Vite build + cargo debug)"
@@ -73,6 +78,8 @@ help:
 	@echo "Other:"
 	@echo "  make clippy | fmt | clean"
 	@echo "  make bootstrap-phase6 - scripts/bootstrap-phase6.sh (hints + build)"
+	@echo "  make up-version PROJECT=... VERSION=...  - bump one version source"
+	@echo "    PROJECT=client|deploy_server|control_api|dashboard_ui|release (then: make dist-manifest or make dist)"
 	@echo ""
 
 # --- Full workspace ---
@@ -223,6 +230,15 @@ docker-client-help:
 	@echo "  make -f Makefile.docker client-status"
 	@echo "  make -f Makefile.docker client-deploy   # опционально: тестовый деплой"
 	@echo "См. также: make -f Makefile.docker help"
+	@echo "Сборка aarch64 бандла + install.sh в Docker: make test-dist-arm64-docker-install"
+
+test-dist-arm64-docker-install:
+	@chmod +x scripts/docker-dist-arm64-install-e2e.sh
+	./scripts/docker-dist-arm64-install-e2e.sh
+
+up-version:
+	@chmod +x scripts/up-version.sh
+	./scripts/up-version.sh
 
 # --- Clean ---
 

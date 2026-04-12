@@ -45,7 +45,8 @@ services:
       # E2E uses open gRPC; production should omit this and use Pair + signed requests.
       DEPLOY_GRPC_ALLOW_UNAUTHENTICATED: "1"
       # Enables UploadServerStack RPC (still needs native install + sudo helper on real hosts).
-      DEPLOY_ALLOW_SERVER_STACK_UPDATE: "1"
+      # deploy-server accepts 1/true/yes or 0/false (see allow_server_stack_update_effective in main.rs).
+      DEPLOY_ALLOW_SERVER_STACK_UPDATE: "true"
       # Shown in dashboard “local client” JSON (host browser → published gRPC port).
       DEPLOY_GRPC_PUBLIC_URL: "http://127.0.0.1:${DOCKER_E2E_GRPC_PORT:-50051}"
       # Optional dashboard seed (with CONTROL_API_JWT_SECRET on control-api):
@@ -81,8 +82,8 @@ services:
       CONTROL_API_HOST_STATS_SERIES: "1"  # Required for history charts in dashboard.
       CONTROL_API_HOST_STATS_STREAM: "1"  # Required for SSE stats chart in dashboard.
       CONTROL_API_CORS_ALLOW_ANY: "1"
-      # Optional: require JWT for /api/v1/* (set matching seed on deploy-server):
-      CONTROL_API_JWT_SECRET: dev-secret-change-me
+      # Omit CONTROL_API_JWT_SECRET here so e2e-docker.sh can curl /api/v1/status without Bearer.
+      # Bearer/JWT flows: scripts/run-docker-e2e-bearer.sh with DOCKER_E2E_API_TOKEN + secret in env.
     depends_on:
       - deploy-server
       - postgres

@@ -69,7 +69,7 @@ else
 fi
 
 BIN_DIR="$CARGO_TARGET_DIR/$TARGET_TRIPLE/release"
-for b in deploy-server control-api client; do
+for b in deploy-server control-api client pirate; do
   if [[ ! -f "$BIN_DIR/$b" ]]; then
     echo "missing: $BIN_DIR/$b"
     exit 1
@@ -79,7 +79,7 @@ done
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/systemd" "$STAGE/nginx" "$STAGE/lib/pirate"
 
-cp -a "$BIN_DIR/deploy-server" "$BIN_DIR/control-api" "$BIN_DIR/client" "$STAGE/bin/"
+cp -a "$BIN_DIR/deploy-server" "$BIN_DIR/control-api" "$BIN_DIR/client" "$BIN_DIR/pirate" "$STAGE/bin/"
 chmod +x "$STAGE/bin/"*
 if [[ "$UI_BUILD" == "1" ]]; then
   mkdir -p "$STAGE/share/ui/dist"

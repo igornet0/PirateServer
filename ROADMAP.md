@@ -46,7 +46,7 @@
 
 ## Цель и критерий успеха
 
-- `client deploy ./build` → сервер принимает архив, проверяет хеш, распаковывает, переключает `current`, запускает приложение.
+- `client deploy ./build --release <метка>` → сервер принимает архив, проверяет хеш, распаковывает, переключает `current`, запускает приложение.
 - `client status` → актуальная версия и состояние процесса (`running` / `stopped` / `error`).
 - `client rollback <version>` → откат на указанную сохранённую версию с перезапуском.
 - Без Docker на первом этапе, без БД, без лишней архитектуры.
@@ -87,6 +87,25 @@
 ```
 
 Артефакт: поток байтов → временный файл → проверка SHA-256 (хеш передаётся в контракте или вычисляется на сервере — уточнение на этапе proto: минимум — хеш в финальном сообщении или отдельное поле в `DeployChunk` / метаданные до `is_last`).
+
+### `pirate auth`, `GetStatus.current_version` и dist/install (зафиксировано)
+
+**Семантика (ожидания оператора):**
+
+- **`current_version`** в `GetStatus` — это **метка задеплоенного приложения** (symlink `current` → `releases/<версия>` под `DEPLOY_ROOT`, см. `deploy-core`). **Pairing и установка стека её не создают.**
+- Сразу после **`make dist-linux` / `dist-arm64-linux`** и **`install.sh`** каталогов `releases/<ver>` и symlink `current` **нет** — сервер подставляет в **`current_version` строку вида `stack@…`** (файл `server-stack-version` в `/var/lib/pirate` или `stack@binary-<semver deploy-server>`), чтобы было видно, **какой стек установлен**, без путаницы с именем релиза приложения (префикс `stack@` не является допустимой меткой `releases/`, см. `deploy-core::idle_server_stack_status_label`). Старые серверы без этого fallback могли отдавать пустую строку.
+- Непустая **`current_version`** появляется **только после первого успешного деплоя приложения** (`Upload` / CLI `deploy` с каталогом и меткой версии).
+- **Версия серверного бандла** (что лежало в tar.gz и поставилось скриптом) отражается в **`GetServerStackInfo`** (файлы в `/var/lib/pirate/`, см. `install.sh`). CLI `pirate auth` при пустом `current_version` дополнительно печатает строки вроде `server_stack_bundle=…` / `deploy_server_binary=…` — это **не** то же самое, что `current_version`.
+
+**Чеклист, если локально `cargo run -p deploy-client --bin pirate -- auth '<json>'` должен успешно пройти pair и `GetStatus`:**
+
+1. **Сервисы:** `deploy-server` и `control-api` в systemd в состоянии `active (running)`.
+2. **Endpoint:** поле `url` в JSON — тот же хост и порт gRPC, куда реально достигает клиент (часто `http://<хост>:50051` из `DEPLOY_GRPC_PUBLIC_URL` в `/etc/pirate-deploy.env`); не путать HTTP дашборда с gRPC.
+3. **Сеть:** firewall / security groups пропускают **TCP на порт gRPC** с машины, где запускается клиент.
+4. **Pairing:** `pairing` и `token` из **актуального** вывода `print-install-bundle` / логов установки; после ротации pairing старый JSON недействителен.
+5. **Проект:** флаг `--project` (по умолчанию `default`) должен совпадать с layout под `DEPLOY_ROOT` (`deploy-core::project_deploy_root`).
+
+**Опциональное продуктовое изменение (не реализовано):** если нужна **непустая строка «версии» сразу после install без деплоя приложения**, это отдельное решение: например новое поле в `StatusResponse`, или сидирование минимального релиза в `install.sh` — потребуется согласование контракта с дашбордом и клиентами.
 
 ---
 

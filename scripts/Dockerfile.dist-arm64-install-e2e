@@ -1,0 +1,27 @@
+# E2E: aarch64 Linux bundle from `make dist-arm64-linux`, real install.sh, fake systemctl (no systemd in container).
+# Build from repo root: docker buildx build --platform linux/arm64 -f scripts/Dockerfile.dist-arm64-install-e2e -t pirate-dist-arm64-install-e2e .
+# Run: docker run --rm --platform linux/arm64 -v "$PWD/dist:/dist:ro" pirate-dist-arm64-install-e2e
+
+# Platform: pass `docker buildx build --platform linux/arm64` (see docker-dist-arm64-install-e2e.sh).
+FROM debian:bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    sudo \
+    openssl \
+    file \
+    util-linux \
+    procps \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/fake-systemctl-install-docker.sh /usr/local/bin/systemctl
+RUN chmod +x /usr/local/bin/systemctl
+
+COPY scripts/docker-dist-arm64-install-e2e-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

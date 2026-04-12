@@ -9,15 +9,18 @@
 #   make -f Makefile.docker e2e
 #   DOCKER_E2E_API_TOKEN=secret make -f Makefile.docker e2e-bearer
 #   make -f Makefile.docker e2e-nginx
+#   make -f Makefile.docker grpc-client-e2e  # Pair + board (ProxyTunnel) + signed deploy в контейнере
 
 CARGO ?= cargo
 # Дашборд из server-stack/frontend/dist на хосте (без пересборки образа nginx при правках UI).
 COMPOSE := docker compose -f docker-compose.test.yml -f docker-compose.dev-frontend.yml
+# Отдельный project name — не пересоздаёт deploy-server стека из `make up` / `make e2e`.
+COMPOSE_GRPC_CLIENT := docker compose -p pirateserver-grpc -f docker-compose.test.yml -f docker-compose.dev-frontend.yml -f docker-compose.grpc-client-e2e.yml
 COMPOSE_NGINX := $(COMPOSE) -f docker-compose.nginx-e2e.yml
 COMPOSE_BEARER := docker compose -f docker-compose.test.yml -f docker-compose.bearer-override.yml -f docker-compose.dev-frontend.yml
 TAIL ?= 100
 
-.PHONY: help up down down-v build restart stop ps status logs logs-follow e2e e2e-bearer e2e-nginx connection \
+.PHONY: help up down down-v build restart stop ps status logs logs-follow e2e e2e-bearer e2e-nginx grpc-client-e2e connection \
 	client-status client-deploy doctor
 
 help:
@@ -38,6 +41,7 @@ help:
 	@echo "  e2e           — прогнать e2e (профиль e2e)"
 	@echo "  e2e-bearer    — стек + bearer (нужен DOCKER_E2E_API_TOKEN в env)"
 	@echo "  e2e-nginx     — merge nginx-e2e + тест PUT /api/v1/nginx/config"
+	@echo "  grpc-client-e2e — отдельный compose project pirateserver-grpc: Pair, board→control-api, два signed deploy"
 	@echo ""
 	@echo "Переменные: TAIL=число  SERVICE=имя_сервиса  (для logs / logs-follow)"
 	@echo "  DOCKER_E2E_HOST (default 127.0.0.1)  DOCKER_E2E_GRPC_PORT (default 50051)"
@@ -97,7 +101,7 @@ client-deploy:
 	EP="http://$$HOST:$$PORT"; \
 	V="$${DOCKER_CLIENT_TEST_VERSION:-v-docker-test}"; \
 	echo "==> client deploy minimal-app -> $$EP version $$V"; \
-	$(CARGO) run -q -p deploy-client --bin client -- --endpoint "$$EP" deploy tests/fixtures/minimal-app --version "$$V"
+	$(CARGO) run -q -p deploy-client --bin client -- --endpoint "$$EP" deploy tests/fixtures/minimal-app --release "$$V"
 
 e2e:
 	$(COMPOSE) --profile e2e run --rm e2e
@@ -108,3 +112,7 @@ e2e-bearer:
 
 e2e-nginx:
 	./scripts/run-docker-e2e-nginx.sh --down
+
+# Стек с DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=0; тест поднимает зависимости и прогоняет scripts/grpc-client-docker-e2e.sh
+grpc-client-e2e:
+	$(COMPOSE_GRPC_CLIENT) --profile grpc-client run --rm --build grpc-client-e2e

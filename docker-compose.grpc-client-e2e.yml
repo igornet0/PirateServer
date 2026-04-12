@@ -1,0 +1,46 @@
+# Merge with docker-compose.test.yml (+ optional dev-frontend) for gRPC Pair + ProxyTunnel + signed deploy.
+# Install bundle URL must be reachable from inside Docker (not 127.0.0.1 on the host).
+#
+# Makefile uses `docker compose -p pirateserver-grpc …` so this stack does not replace the default
+# `pirateserver` project or bind host ports (see ports: !override []).
+#
+# Teardown: docker compose -p pirateserver-grpc -f docker-compose.test.yml -f docker-compose.dev-frontend.yml -f docker-compose.grpc-client-e2e.yml down -v
+#
+# grpc-client-e2e mounts deploy-data read-only at /mnt/rodata (not /data) so entrypoint-deploy.sh
+# does not try chown on a read-only mount.
+
+services:
+  deploy-server:
+    # Стек только для внутрисетевых тестов — не занимать 50051/18080/18081 на хосте, если уже поднят основной compose.
+    ports: !override []
+    environment:
+      DEPLOY_GRPC_ALLOW_UNAUTHENTICATED: "0"
+      DEPLOY_GRPC_PUBLIC_URL: "http://deploy-server:50051"
+
+  control-api:
+    ports: !override []
+
+  nginx:
+    ports: !override []
+
+  grpc-client-e2e:
+    profiles:
+      - grpc-client
+    image: pirate-test-runtime
+    pull_policy: never
+    command: ["bash", "-lc", "bash /e2e/grpc-client-docker-e2e.sh"]
+    volumes:
+      - ./scripts/grpc-client-docker-e2e.sh:/e2e/grpc-client-docker-e2e.sh:ro
+      - ./tests/fixtures:/fixtures:ro
+      - deploy-data:/mnt/rodata:ro
+    environment:
+      - GRPC_ENDPOINT=http://deploy-server:50051
+      - CONTROL_API_DIRECT=http://control-api:8080
+      - nginx_public=http://nginx:80
+    depends_on:
+      nginx:
+        condition: service_started
+      control-api:
+        condition: service_healthy
+      deploy-server:
+        condition: service_started

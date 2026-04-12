@@ -37,7 +37,7 @@ curl_api "$NGINX/api/v1/status"
 echo ""
 
 echo "==> deploy v-e2e-1"
-client --endpoint "$GRPC" deploy /fixtures/minimal-app --version v-e2e-1
+client --endpoint "$GRPC" deploy /fixtures/minimal-app --release v-e2e-1
 
 echo "==> status after first deploy"
 curl_api "$API/api/v1/status" | grep -q '"state":"running"'
@@ -47,7 +47,7 @@ REL=$(curl_api "$API/api/v1/releases")
 echo "$REL" | grep -q v-e2e-1
 
 echo "==> deploy v-e2e-2"
-client --endpoint "$GRPC" deploy /fixtures/minimal-app --version v-e2e-2
+client --endpoint "$GRPC" deploy /fixtures/minimal-app --release v-e2e-2
 
 echo "==> current version v-e2e-2"
 curl_api "$API/api/v1/status" | grep -q '"current_version":"v-e2e-2"'

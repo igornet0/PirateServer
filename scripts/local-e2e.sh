@@ -64,13 +64,13 @@ run_client() {
 }
 
 echo "==> client deploy v1"
-run_client deploy "$BUILD_DIR" --version v1
+run_client deploy "$BUILD_DIR" --release v1
 
 echo "==> client status (expect v1)"
 run_client status
 
 echo "==> client deploy v2"
-run_client deploy "$BUILD_DIR" --version v2
+run_client deploy "$BUILD_DIR" --release v2
 
 echo "==> client status (expect v2)"
 run_client status
