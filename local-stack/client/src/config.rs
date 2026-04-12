@@ -1,5 +1,6 @@
 //! Paths and JSON for client identity and server connection (shared layout with desktop).
 
+use deploy_auth::endpoints_equivalent_for_signing;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -14,6 +15,10 @@ pub fn identity_path() -> Option<PathBuf> {
 
 pub fn connection_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("connection.json"))
+}
+
+pub fn settings_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("settings.json"))
 }
 
 /// Normalize gRPC URL for comparison and storage (trim, strip trailing `/`).
@@ -32,6 +37,9 @@ pub struct StoredConnection {
     pub server_pubkey_b64: String,
     #[serde(default)]
     pub paired: bool,
+    /// `deploy.proto` `ConnectionKind` as i32 (0 unspecified, 1 proxy, 2 resource).
+    #[serde(default)]
+    pub connection_kind: i32,
 }
 
 pub fn load_connection() -> Option<StoredConnection> {
@@ -44,7 +52,7 @@ pub fn load_connection() -> Option<StoredConnection> {
 pub fn use_signed_requests(endpoint: &str) -> bool {
     let ep = normalize_endpoint(endpoint);
     load_connection()
-        .map(|c| c.paired && normalize_endpoint(&c.url) == ep)
+        .map(|c| c.paired && endpoints_equivalent_for_signing(&normalize_endpoint(&c.url), &ep))
         .unwrap_or(false)
 }
 

@@ -1,5 +1,9 @@
-use deploy_auth::attach_auth_metadata;
-use deploy_proto::deploy::{DeployResponse, ServerStackInfo, ServerStackResponse};
+use deploy_auth::{
+    attach_auth_metadata, attach_auth_metadata_upload_server_stack,
+    insert_stack_apply_sha256_metadata,
+};
+use deploy_proto::deploy::{DeployResponse, ServerStackInfo, ServerStackResponse, StackApplyOptions};
+use prost::Message;
 
 /// Result of packing + upload (for CLI / desktop metrics).
 pub struct DeploySummary {
@@ -90,6 +94,7 @@ pub async fn upload_server_stack_artifact(
     version: &str,
     chunk_size: usize,
     signing_key: Option<&SigningKey>,
+    apply_options: Option<StackApplyOptions>,
 ) -> Result<ServerStackResponse, tonic::Status> {
     upload_server_stack_artifact_with_progress(
         endpoint,
@@ -97,6 +102,7 @@ pub async fn upload_server_stack_artifact(
         version,
         chunk_size,
         signing_key,
+        apply_options,
         |_, _| {},
     )
     .await
@@ -109,6 +115,7 @@ pub async fn upload_server_stack_artifact_with_progress<F>(
     version: &str,
     chunk_size: usize,
     signing_key: Option<&SigningKey>,
+    apply_options: Option<StackApplyOptions>,
     on_progress: F,
 ) -> Result<ServerStackResponse, tonic::Status>
 where
@@ -116,7 +123,18 @@ where
 {
     let digest = Sha256::digest(artifact);
     let sha256_hex = hex::encode(digest);
-    let chunks = build_server_stack_chunks(artifact, version, &sha256_hex, chunk_size);
+    let stack_apply_sha_hex: Option<String> = apply_options.as_ref().map(|o| {
+        let mut buf = Vec::new();
+        o.encode(&mut buf).unwrap_or_default();
+        hex::encode(Sha256::digest(&buf))
+    });
+    let chunks = build_server_stack_chunks(
+        artifact,
+        version,
+        &sha256_hex,
+        chunk_size,
+        apply_options,
+    );
     let total = artifact.len() as u64;
     let mut chunk_iter = chunks.into_iter();
     let mut sent = 0u64;
@@ -139,7 +157,15 @@ where
         .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
     let mut req = Request::new(Box::pin(st));
     if let Some(sk) = signing_key {
-        attach_auth_metadata(&mut req, sk, "UploadServerStack", "", version)
+        attach_auth_metadata_upload_server_stack(
+            &mut req,
+            sk,
+            version,
+            stack_apply_sha_hex.as_deref(),
+        )
+        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+    } else {
+        insert_stack_apply_sha256_metadata(&mut req, stack_apply_sha_hex.as_deref())
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
     }
 

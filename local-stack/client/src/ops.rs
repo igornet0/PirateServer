@@ -1,4 +1,4 @@
-use deploy_proto::deploy::{DeployChunk, ServerStackChunk};
+use deploy_proto::deploy::{DeployChunk, ServerStackChunk, StackApplyOptions};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::path::Path;
@@ -109,12 +109,13 @@ pub fn build_chunks(
     out
 }
 
-/// Chunks for `UploadServerStack` (no `project_id`).
+/// Chunks for `UploadServerStack` (no `project_id`). `apply_options` is attached only to the last chunk.
 pub fn build_server_stack_chunks(
     bytes: &[u8],
     version: &str,
     sha256_hex: &str,
     chunk_size: usize,
+    apply_options: Option<StackApplyOptions>,
 ) -> Vec<ServerStackChunk> {
     assert!(chunk_size > 0, "chunk_size must be > 0");
     if bytes.is_empty() {
@@ -123,6 +124,7 @@ pub fn build_server_stack_chunks(
             version: version.to_string(),
             is_last: true,
             sha256_hex: sha256_hex.to_string(),
+            apply_options,
         }];
     }
     let mut out = Vec::new();
@@ -145,6 +147,7 @@ pub fn build_server_stack_chunks(
             } else {
                 String::new()
             },
+            apply_options: if is_last { apply_options.clone() } else { None },
         });
         first = false;
         offset = end;

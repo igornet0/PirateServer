@@ -1,23 +1,34 @@
 //! CLI: pack `build/` as tar.gz, stream over gRPC (IPv6 endpoint); optional Ed25519 pairing.
 
 mod board;
+mod board_probe;
+mod bypass;
 mod config;
+mod connection_manager;
+mod metrics_collector;
+mod routing;
+mod settings;
+mod stack_update_prompt;
 mod version_info;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use config::{
-    load_connection, load_or_create_identity, normalize_endpoint, save_connection,
+    load_connection, load_or_create_identity, normalize_endpoint, save_connection, settings_path,
     use_signed_requests, StoredConnection,
 };
+use connection_manager::ConnectionManager;
 use deploy_auth::{
-    attach_auth_metadata, pair_request_canonical, pubkey_b64_url, verify_pair_response,
-    ConnectionBundle, now_unix_ms,
+    attach_auth_metadata, endpoints_equivalent_for_signing, pair_request_canonical, pubkey_b64_url,
+    verify_pair_response, ConnectionBundle, now_unix_ms,
 };
 use deploy_client::{
-    default_version, deploy_directory, fetch_server_stack_info, read_or_pack_bundle,
-    upload_server_stack_artifact_with_progress, validate_version_label,
+    default_version, deploy_directory, fetch_server_stack_info, inspect_bundle_path,
+    read_or_pack_bundle, upload_server_stack_artifact_with_progress, validate_version_label,
 };
-use deploy_proto::deploy::{PairRequest, RollbackRequest};
+use deploy_proto::deploy::{
+    ListSessionsRequest, PairRequest, QuerySessionLogsRequest, ReportResourceUsageRequest,
+    RollbackRequest, UpdateConnectionProfileRequest,
+};
 use deploy_proto::DeployServiceClient;
 use rand_core::{OsRng, RngCore};
 use std::io::Write;
@@ -70,13 +81,30 @@ enum Commands {
         bundle: Option<String>,
     },
     /// Local HTTP CONNECT proxy → server outbound TCP (requires prior `auth`).
+    ///
+    /// Pass the deploy-server gRPC URL with global `--url` / `--endpoint` (or rely on `connection.json` from `pirate auth`).
     Board {
-        /// gRPC endpoint (must match saved paired connection).
-        #[arg(long)]
-        url: String,
         /// Listen address for the HTTP proxy (CONNECT).
         #[arg(long, default_value = "127.0.0.1:3128")]
         listen: String,
+        /// Run gRPC reachability, bandwidth probe, and session summary (does not start the proxy).
+        #[arg(long)]
+        test_connect: bool,
+        /// Upload size for `ConnectionProbe` (max 4 MiB).
+        #[arg(long, default_value_t = 1024 * 1024)]
+        probe_upload_bytes: u64,
+        /// Requested download payload size in the probe result (max 4 MiB).
+        #[arg(long, default_value_t = 256 * 1024)]
+        probe_download_bytes: u32,
+        /// Board id from `settings.json` (omit: use `default_board` and host routing rules).
+        #[arg(long)]
+        board: Option<String>,
+        /// Session token for managed `ProxyTunnel` (overrides per-board `session_token` in settings).
+        #[arg(long)]
+        session_token: Option<String>,
+        /// Path to `settings.json` (default: pirate-client config dir).
+        #[arg(long)]
+        settings: Option<PathBuf>,
     },
     /// Register this machine's public key with the server (install JSON bundle) only; does not print GetStatus.
     ///
@@ -120,6 +148,54 @@ enum Commands {
         #[arg(long, default_value_t = 64 * 1024)]
         chunk_size: usize,
     },
+    /// List registered gRPC client keys and last activity from the server metadata DB.
+    ///
+    /// Requires `DEPLOY_SQLITE_URL` / `DATABASE_URL` on deploy-server. When the server uses signed gRPC (normal install), you must run `pirate auth` first so `connection.json` matches this `--endpoint`. Use `--last-log` / `--export-log -o file.csv` for audit rows.
+    Sessions {
+        /// Recent session audit events (TCP open/close, pair, …), newest first.
+        #[arg(long)]
+        last_log: bool,
+        /// Export all audit rows to CSV (paginates until exhausted). Requires `-o` / `--output`.
+        #[arg(long)]
+        export_log: bool,
+        /// Output path for `--export-log` (CSV).
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        /// Page size for `--last-log` / `--export-log` (server max 500; default 50).
+        #[arg(long, default_value_t = 50)]
+        limit: i32,
+    },
+    /// Set this client's connection role on the server: `proxy` or `resource` (signed gRPC).
+    Profile {
+        /// `proxy` or `resource`
+        #[arg(value_name = "KIND")]
+        kind: String,
+    },
+    /// Report local CPU/RAM (and optional GPU) usage to the server for RESOURCE clients.
+    ResourceReport,
+    /// Uninstall native server stack (Linux) or remove local CLI pairing state.
+    Uninstall {
+        #[command(subcommand)]
+        target: UninstallTarget,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum UninstallTarget {
+    /// Remove native server stack (runs `/usr/local/share/pirate-uninstall/uninstall.sh` via sudo).
+    Stack {
+        /// Only stop services and remove units/binaries/env (keep data and user).
+        #[arg(long)]
+        services_only: bool,
+        /// After uninstall, remove the recorded or default bundle directory (see uninstall.sh).
+        #[arg(long)]
+        remove_bundle_dir: bool,
+        /// Explicit directory to remove (implies `--remove-bundle-dir` with this path).
+        #[arg(long, value_name = "PATH")]
+        bundle_dir: Option<PathBuf>,
+    },
+    /// Remove local connection, identity, and settings under the config directory.
+    Client,
 }
 
 /// `GetStatus.current_version`: empty until the first app release (`deploy` creates `releases/<ver>` and `current`).
@@ -240,6 +316,7 @@ async fn run_pair(bundle_arg: Option<String>) -> Result<(), Box<dyn std::error::
         url: url.clone(),
         server_pubkey_b64: b.server_pubkey_b64,
         paired: true,
+        connection_kind: 0,
     })?;
     eprintln!("paired with server; saved connection to config dir");
     println!("status={}", resp.status);
@@ -305,6 +382,375 @@ async fn run_auth(
     Ok(())
 }
 
+fn parse_connection_kind_arg(s: &str) -> Result<i32, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "proxy" => Ok(1),
+        "resource" => Ok(2),
+        "unspecified" | "" => Ok(0),
+        _ => Err(format!(
+            "unknown connection kind '{s}'; use proxy, resource, or unspecified"
+        )),
+    }
+}
+
+async fn run_profile_cmd(
+    cli: &Cli,
+    kind: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = resolve_endpoint_normalized(cli);
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        eprintln!("endpoint must start with http:// or https://");
+        std::process::exit(2);
+    }
+    if !use_signed_requests(&endpoint) {
+        eprintln!("no paired connection for this URL. Run: pirate auth '<install-json>' first");
+        std::process::exit(2);
+    }
+    let kind_i = parse_connection_kind_arg(kind)?;
+    let sk = load_or_create_identity()?;
+    let mut client = DeployServiceClient::connect(endpoint.clone()).await?;
+    let mut req = Request::new(UpdateConnectionProfileRequest {
+        project_id: cli.project.clone(),
+        connection_kind: kind_i,
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+    });
+    attach_auth_metadata(
+        &mut req,
+        &sk,
+        "UpdateConnectionProfile",
+        &cli.project,
+        "",
+    )?;
+    client.update_connection_profile(req).await?;
+    if let Some(mut c) = load_connection() {
+        c.connection_kind = kind_i;
+        save_connection(&c)?;
+    }
+    println!("connection profile updated (kind={kind_i})");
+    Ok(())
+}
+
+fn try_nvidia_gpu_util_percent() -> Option<f64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.lines()
+        .next()
+        .and_then(|line| line.trim().parse::<f64>().ok())
+}
+
+async fn run_resource_report_cmd(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+    use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+
+    let endpoint = resolve_endpoint_normalized(cli);
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        eprintln!("endpoint must start with http:// or https://");
+        std::process::exit(2);
+    }
+    if !use_signed_requests(&endpoint) {
+        eprintln!("no paired connection for this URL. Run: pirate auth '<install-json>' first");
+        std::process::exit(2);
+    }
+    let sk = load_or_create_identity()?;
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new()
+            .with_cpu(CpuRefreshKind::everything())
+            .with_memory(MemoryRefreshKind::everything()),
+    );
+    sys.refresh_cpu_all();
+    std::thread::sleep(Duration::from_millis(200));
+    sys.refresh_cpu_usage();
+    let cpu_percent = sys.global_cpu_usage() as f64;
+    sys.refresh_memory();
+    let total_mem = sys.total_memory();
+    let used_mem = sys.used_memory();
+    let ram_percent = if total_mem > 0 {
+        100.0 * (used_mem as f64) / (total_mem as f64)
+    } else {
+        0.0
+    };
+    let gpu_percent = try_nvidia_gpu_util_percent();
+
+    let mut client = DeployServiceClient::connect(endpoint.clone()).await?;
+    let mut req = Request::new(ReportResourceUsageRequest {
+        project_id: cli.project.clone(),
+        cpu_percent: Some(cpu_percent),
+        ram_percent: Some(ram_percent),
+        gpu_percent,
+        ram_used_bytes: Some(used_mem),
+        storage_used_bytes: None,
+    });
+    attach_auth_metadata(
+        &mut req,
+        &sk,
+        "ReportResourceUsage",
+        &cli.project,
+        "",
+    )?;
+    client.report_resource_usage(req).await?;
+    println!(
+        "reported cpu={cpu_percent:.1}% ram={ram_percent:.1}% gpu={}",
+        gpu_percent
+            .map(|g| format!("{g:.1}%"))
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    Ok(())
+}
+
+fn csv_escape_cell(s: &str) -> String {
+    if s.contains(['"', ',', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn print_sessions_unauthenticated_hint(status: &tonic::Status, endpoint: &str) {
+    if status.code() != Code::Unauthenticated {
+        return;
+    }
+    let msg = status.message();
+    if !msg.contains("x-deploy-pubkey") {
+        return;
+    }
+    eprintln!(
+        "hint: run `pirate auth '<install-json>'` (or `pirate pair`) for this host so signed gRPC metadata is sent."
+    );
+    eprintln!("      Without pair, no x-deploy-pubkey is sent; endpoint was: {endpoint}");
+    if let Some(c) = load_connection() {
+        let saved = normalize_endpoint(&c.url);
+        let want = normalize_endpoint(endpoint);
+        if c.paired && !endpoints_equivalent_for_signing(&saved, &want) {
+            eprintln!(
+                "note: connection.json is paired for URL `{saved}` but this command used `{want}` — omit `--endpoint`, use the same URL, or run `pirate auth` with a bundle for this address."
+            );
+        } else if !c.paired {
+            eprintln!("note: connection.json exists but paired=false; complete `pirate auth` or `pirate pair`.");
+        }
+    } else {
+        eprintln!("note: no saved connection in ~/.config/pirate-client/connection.json for this user.");
+        eprintln!("      Run `pirate auth` as the same OS user (avoid `sudo pirate` so ~/.config/pirate-client matches).");
+    }
+}
+
+async fn run_sessions_cmd(
+    cli: &Cli,
+    last_log: bool,
+    export_log: bool,
+    output: Option<&Path>,
+    limit: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = resolve_endpoint_normalized(cli);
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        eprintln!("endpoint must start with http:// or https://");
+        std::process::exit(2);
+    }
+    let sk = if use_signed_requests(&endpoint) {
+        Some(load_or_create_identity()?)
+    } else {
+        None
+    };
+    if sk.is_none() {
+        match load_connection() {
+            Some(c)
+                if c.paired
+                    && !endpoints_equivalent_for_signing(
+                        &normalize_endpoint(&c.url),
+                        &normalize_endpoint(&endpoint),
+                    ) =>
+            {
+                let saved = normalize_endpoint(&c.url);
+                let want = normalize_endpoint(&endpoint);
+                eprintln!(
+                    "note: connection.json is paired for `{saved}`; this command uses `{want}` — signed metadata will not be sent. Omit `--endpoint`, use that URL, or re-run `pirate auth` for this host."
+                );
+            }
+            Some(c) if !c.paired => {
+                eprintln!(
+                    "note: connection.json exists but paired=false; complete `pirate auth` or `pirate pair`."
+                );
+            }
+            None => {
+                eprintln!(
+                    "note: no ~/.config/pirate-client/connection.json for this user — run `pirate auth '<install-json>'` (avoid `sudo pirate` so the config path matches)."
+                );
+            }
+            _ => {}
+        }
+    }
+    let mut client = DeployServiceClient::connect(endpoint.clone()).await?;
+
+    if export_log {
+        let path = output.ok_or("--export-log requires -o/--output PATH")?;
+        let mut f = std::fs::File::create(path)?;
+        writeln!(
+            f,
+            "id,created_at_ms,kind,client_public_key_b64,peer_ip,grpc_method,status,detail"
+        )?;
+        let mut before_id: i64 = 0;
+        let page_size = if limit <= 0 { 500 } else { limit.min(500) };
+        loop {
+            let mut req = Request::new(QuerySessionLogsRequest {
+                project_id: cli.project.clone(),
+                limit: page_size,
+                before_id,
+            });
+            if let Some(ref k) = sk {
+                attach_auth_metadata(&mut req, k, "QuerySessionLogs", &cli.project, "")?;
+            }
+            let resp = client
+                .query_session_logs(req)
+                .await
+                .map_err(|e| {
+                    print_sessions_unauthenticated_hint(&e, &endpoint);
+                    e
+                })?
+                .into_inner();
+            if resp.events.is_empty() {
+                break;
+            }
+            let min_id = resp.events.iter().map(|e| e.id).min().unwrap_or(0);
+            for e in &resp.events {
+                writeln!(
+                    f,
+                    "{},{},{},{},{},{},{},{}",
+                    e.id,
+                    e.created_at_ms,
+                    csv_escape_cell(&e.kind),
+                    csv_escape_cell(&e.client_public_key_b64),
+                    csv_escape_cell(&e.peer_ip),
+                    csv_escape_cell(&e.grpc_method),
+                    csv_escape_cell(&e.status),
+                    csv_escape_cell(&e.detail),
+                )?;
+            }
+            if !resp.has_more || min_id <= 0 {
+                break;
+            }
+            before_id = min_id;
+        }
+        println!("wrote {}", path.display());
+        return Ok(());
+    }
+
+    if last_log {
+        let page = if limit <= 0 { 50 } else { limit.min(500) };
+        let mut req = Request::new(QuerySessionLogsRequest {
+            project_id: cli.project.clone(),
+            limit: page,
+            before_id: 0,
+        });
+        if let Some(ref k) = sk {
+            attach_auth_metadata(&mut req, k, "QuerySessionLogs", &cli.project, "")?;
+        }
+        let resp = client
+            .query_session_logs(req)
+            .await
+            .map_err(|e| {
+                print_sessions_unauthenticated_hint(&e, &endpoint);
+                e
+            })?
+            .into_inner();
+        println!(
+            "{:<12} {:<22} {:<12} {:<10} {:<18} {:<42} {}",
+            "id", "created_at_ms", "kind", "status", "peer_ip", "client_pubkey", "grpc_method"
+        );
+        for e in &resp.events {
+            let pk = if e.client_public_key_b64.chars().count() > 40 {
+                let mut it = e.client_public_key_b64.chars();
+                let head: String = it.by_ref().take(39).collect();
+                format!("{head}…")
+            } else {
+                e.client_public_key_b64.clone()
+            };
+            println!(
+                "{:<12} {:<22} {:<12} {:<10} {:<18} {:<42} {}",
+                e.id,
+                e.created_at_ms,
+                e.kind,
+                e.status,
+                e.peer_ip,
+                pk,
+                e.grpc_method
+            );
+        }
+        return Ok(());
+    }
+
+    let mut req = Request::new(ListSessionsRequest {
+        project_id: cli.project.clone(),
+    });
+    if let Some(ref k) = sk {
+        attach_auth_metadata(&mut req, k, "ListSessions", &cli.project, "")?;
+    }
+    let resp = client
+        .list_sessions(req)
+        .await
+        .map_err(|e| {
+            print_sessions_unauthenticated_hint(&e, &endpoint);
+            e
+        })?
+        .into_inner();
+    println!(
+        "{:<36} {:>5} {:>4} {:>4} {:>4} {:>8} {:>9} {:<18} {}",
+        "client_public_key",
+        "kind",
+        "cpu%",
+        "ram%",
+        "gpu%",
+        "px_in",
+        "px_out",
+        "last_ip",
+        "method"
+    );
+    for p in &resp.peers {
+        let pk = truncate_pubkey_display(&p.client_public_key_b64, 35);
+        let cpu = p
+            .last_cpu_percent
+            .map(|x| format!("{x:.0}"))
+            .unwrap_or_else(|| "—".to_string());
+        let ram = p
+            .last_ram_percent
+            .map(|x| format!("{x:.0}"))
+            .unwrap_or_else(|| "—".to_string());
+        let gpu = p
+            .last_gpu_percent
+            .map(|x| format!("{x:.0}"))
+            .unwrap_or_else(|| "—".to_string());
+        println!(
+            "{:<36} {:>5} {:>4} {:>4} {:>4} {:>8} {:>9} {:<18} {}",
+            pk,
+            p.connection_kind,
+            cpu,
+            ram,
+            gpu,
+            p.proxy_bytes_in_total,
+            p.proxy_bytes_out_total,
+            p.last_peer_ip,
+            p.last_grpc_method,
+        );
+    }
+    Ok(())
+}
+
+fn truncate_pubkey_display(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -329,10 +775,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_auth(bundle.clone(), cli.project.clone()).await?;
             return Ok(());
         }
-        Commands::Board { url, listen } => {
-            let url = normalize_endpoint(&url);
+        Commands::Board {
+            listen,
+            test_connect,
+            probe_upload_bytes,
+            probe_download_bytes,
+            board,
+            session_token,
+            settings,
+        } => {
+            let url = resolve_endpoint_normalized(&cli);
             if !url.starts_with("http://") && !url.starts_with("https://") {
-                eprintln!("--url must start with http:// or https://");
+                eprintln!("URL must start with http:// or https://");
                 std::process::exit(2);
             }
             if !use_signed_requests(&url) {
@@ -342,11 +796,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             }
             let sk = load_or_create_identity()?;
-            board::run_board(listen, url.as_str(), &sk).await?;
+            if *test_connect {
+                board_probe::run_board_test_connect(
+                    url.as_str(),
+                    &cli.project,
+                    &sk,
+                    *probe_upload_bytes,
+                    *probe_download_bytes,
+                )
+                .await?;
+            } else {
+                let settings_path = settings
+                    .clone()
+                    .or_else(settings_path)
+                    .unwrap_or_else(|| PathBuf::from("settings.json"));
+                let snap = settings::init_global_settings(settings_path)?;
+                let pool = std::sync::Arc::new(ConnectionManager::new(512));
+                let conn_url = load_connection()
+                    .map(|c| c.url)
+                    .unwrap_or_else(|| url.clone());
+                board::run_board(
+                    listen,
+                    url.as_str(),
+                    conn_url.as_str(),
+                    &sk,
+                    &cli.project,
+                    board.as_deref().unwrap_or(""),
+                    snap,
+                    pool,
+                    session_token.as_deref(),
+                )
+                .await?;
+            }
             return Ok(());
         }
         Commands::Pair { bundle } => {
             run_pair(bundle.clone()).await?;
+            return Ok(());
+        }
+        Commands::Sessions {
+            last_log,
+            export_log,
+            output,
+            limit,
+        } => {
+            if *export_log && output.is_none() {
+                eprintln!("--export-log requires -o/--output PATH");
+                std::process::exit(2);
+            }
+            if *last_log && *export_log {
+                eprintln!("use either --last-log or --export-log, not both");
+                std::process::exit(2);
+            }
+            run_sessions_cmd(&cli, *last_log, *export_log, output.as_deref(), *limit).await?;
+            return Ok(());
+        }
+        Commands::Profile { kind } => {
+            run_profile_cmd(&cli, kind).await?;
+            return Ok(());
+        }
+        Commands::ResourceReport => {
+            run_resource_report_cmd(&cli).await?;
             return Ok(());
         }
         Commands::Deploy {
@@ -464,6 +974,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("status={} active_version={}", r.status, r.active_version);
         }
+        Commands::Uninstall { target } => {
+            match target {
+                UninstallTarget::Stack {
+                    services_only,
+                    remove_bundle_dir,
+                    bundle_dir,
+                } => {
+                    deploy_client::local_uninstall::run_uninstall_stack(
+                        *services_only,
+                        *remove_bundle_dir,
+                        bundle_dir.as_deref(),
+                    )?;
+                }
+                UninstallTarget::Client => {
+                    deploy_client::local_uninstall::remove_local_client_config()?;
+                    eprintln!(
+                        "Removed local Pirate client config (connection, identity, settings)."
+                    );
+                    eprintln!(
+                        "If `pirate board` or similar is still running, stop it manually (no PID file is used)."
+                    );
+                }
+            }
+            return Ok(());
+        }
         Commands::Update {
             path,
             release,
@@ -480,18 +1015,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "server-stack update → {} (version label: {})",
                 endpoint, version
             );
-            eprintln!("reading {} …", path.display());
-            let artifact = read_or_pack_bundle(path.as_path()).map_err(|e| {
-                format!("cannot read bundle {}: {e}", path.display())
-            })?;
-            let total = artifact.len() as u64;
-            eprintln!("artifact_bytes={total}");
 
             let sk = if use_signed_requests(&endpoint) {
                 Some(load_or_create_identity()?)
             } else {
                 None
             };
+
+            let sk_info = fetch_server_stack_info(&endpoint, sk.as_ref())
+                .await
+                .map_err(|e| format!("GetServerStackInfo: {}", e.message()))?;
+
+            let bundle_profile = inspect_bundle_path(path.as_path())
+                .map_err(|e| format!("inspect bundle {}: {e}", path.display()))?;
+            let apply_options = stack_update_prompt::resolve_stack_apply_options(
+                sk_info.host_dashboard_enabled,
+                &bundle_profile,
+            )?;
+
+            eprintln!("reading {} …", path.display());
+            let artifact = read_or_pack_bundle(path.as_path()).map_err(|e| {
+                format!("cannot read bundle {}: {e}", path.display())
+            })?;
+            let total = artifact.len() as u64;
+            eprintln!("artifact_bytes={total}");
 
             let last_shown_pct: Arc<Mutex<i32>> = Arc::new(Mutex::new(-1));
             let last_pct = Arc::clone(&last_shown_pct);
@@ -526,6 +1073,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &version,
                 *chunk_size,
                 sk.as_ref(),
+                apply_options,
                 on_progress,
             )
             .await

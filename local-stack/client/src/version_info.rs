@@ -61,6 +61,10 @@ async fn print_remote_versions(endpoint: &str) -> Result<(), Box<dyn std::error:
     if !info.bundle_version.is_empty() {
         println!("bundle={}", info.bundle_version);
     }
+    println!("host_dashboard_enabled={}", info.host_dashboard_enabled);
+    if let Some(n) = info.host_nginx_pirate_site {
+        println!("host_nginx_pirate_site={n}");
+    }
 
     let Some(ref raw) = info.manifest_json else {
         eprintln!("note: no server-stack-manifest.json on server; control_api and dashboard_ui unknown");
