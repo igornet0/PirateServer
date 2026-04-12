@@ -1,5 +1,8 @@
 //! Shared deployment root layout, version validation, and [`AppState`] for the deploy service.
 
+/// Cargo package version of this crate (linked into `pirate` / deploy clients).
+pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use std::path::{Path, PathBuf};
 
 /// Max length for a version label (directory name under `releases/`).
@@ -103,6 +106,48 @@ pub fn read_current_version_from_symlink(root: &Path) -> Option<String> {
     target.file_name()?.to_str().map(|s| s.to_string())
 }
 
+/// Native install (and bundles that mimic it) write bundle metadata here.
+pub const PIRATE_VAR_LIB: &str = "/var/lib/pirate";
+
+/// Contents of `server-stack-version` when present and non-empty after trim.
+pub fn read_server_stack_bundle_version_from_var_lib() -> Option<String> {
+    let path = Path::new(PIRATE_VAR_LIB).join("server-stack-version");
+    let s = std::fs::read_to_string(path).ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Shown as `GetStatus.current_version` when no app release is active (no `current` symlink).
+/// The `stack@` prefix is not a valid [`validate_version`] label (`@` is disallowed), so it
+/// cannot be mistaken for a directory under `releases/` or used as a rollback target.
+pub fn idle_server_stack_status_label(deploy_server_pkg_version: &str) -> String {
+    let tail = read_server_stack_bundle_version_from_var_lib()
+        .unwrap_or_else(|| format!("binary-{}", deploy_server_pkg_version));
+    format!("stack@{tail}")
+}
+
+/// Resolved application release for status, or [`idle_server_stack_status_label`] when none.
+pub fn status_current_version_display(
+    in_memory_or_symlink: &str,
+    project_root: &Path,
+    deploy_server_pkg_version: &str,
+) -> String {
+    let mut current = in_memory_or_symlink.to_string();
+    if current.is_empty() {
+        if let Some(v) = read_current_version_from_symlink(project_root) {
+            current = v;
+        }
+    }
+    if current.is_empty() {
+        current = idle_server_stack_status_label(deploy_server_pkg_version);
+    }
+    current
+}
+
 /// Sorted list of subdirectory names under `releases/`.
 pub fn list_release_versions(root: &Path) -> std::io::Result<Vec<String>> {
     let dir = releases_dir(root);
@@ -145,5 +190,33 @@ pub fn refresh_process_state(st: &mut AppState) {
         }
     } else if st.current_version.is_empty() {
         st.state = "stopped".to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_stack_status_label_is_not_valid_app_version() {
+        let s = idle_server_stack_status_label("9.9.9");
+        assert!(s.starts_with("stack@"));
+        assert!(validate_version(&s).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_display_uses_symlink_over_idle_label() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "deploy-core-status-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(releases_dir(&root).join("v9")).unwrap();
+        symlink(Path::new("releases").join("v9"), root.join("current")).unwrap();
+        let out = status_current_version_display("", &root, "0.0.1");
+        assert_eq!(out, "v9");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

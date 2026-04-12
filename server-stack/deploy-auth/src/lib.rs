@@ -1,5 +1,8 @@
 //! Ed25519 identities, pairing messages, and per-RPC request signing for gRPC metadata.
 
+/// Cargo package version of this crate (linked into `pirate` / deploy clients).
+pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod nonce;
 mod peers;
 

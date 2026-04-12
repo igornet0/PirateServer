@@ -1,4 +1,5 @@
-# Удобные цели для CLI `client` на хосте с установленным стеком (или из распакованного архива).
+# Удобные цели для CLI `client` / `pirate` на хосте с установленным стеком (или из распакованного архива).
+# После install.sh: /usr/local/bin/pirate → client (один бинарник deploy-client).
 # sudo make install - install.sh
 # После install.sh (бинарники в /usr/local/bin, env в /etc/pirate-deploy.env):
 #   sudo make status
@@ -40,7 +41,7 @@ help:
 	@echo "  (если в каталоге есть .bundle-no-ui — install-ui и install-all недоступны)"
 	@echo ""
 	@echo "После install.sh (бинарники в /usr/local/bin, env в /etc/pirate-deploy.env):"
-	@echo "  make status          — client status (gRPC к deploy-server)"
+	@echo "  make status          — client status (gRPC к deploy-server; можно CLIENT=/usr/local/bin/pirate)"
 	@echo "  make pair BUNDLE=…   — pair с JSON из print-bundle или файла"
 	@echo "  make print-bundle    — JSON для pair (нужен установленный стек, пользователь pirate)"
 	@echo "  make deploy DIR=… VERSION=… — загрузить каталог как релиз"
@@ -86,7 +87,7 @@ print-bundle:
 
 deploy:
 	@if [[ -z "$(DIR)" ]] || [[ -z "$(VERSION)" ]]; then echo "Нужны DIR=путь и VERSION=метка"; exit 1; fi
-	@"$(CLIENT)" $(EP) --project "$(PROJECT)" deploy "$(DIR)" --version "$(VERSION)"
+	@"$(CLIENT)" $(EP) --project "$(PROJECT)" deploy "$(DIR)" --release "$(VERSION)"
 
 rollback:
 	@if [[ -z "$(VERSION)" ]]; then echo "Задайте VERSION=имя_каталога_в_releases"; exit 1; fi

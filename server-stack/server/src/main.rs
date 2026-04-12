@@ -72,7 +72,11 @@ struct Args {
     max_server_stack_bytes: u64,
 
     /// Allow `UploadServerStack` (requires `/usr/local/lib/pirate/pirate-apply-stack-bundle.sh` + sudoers).
-    #[arg(long, env = "DEPLOY_ALLOW_SERVER_STACK_UPDATE", default_value_t = false)]
+    ///
+    /// Do **not** wire `DEPLOY_ALLOW_SERVER_STACK_UPDATE` through clap's `env = …`: clap only accepts `true`/`false`
+    /// for bool flags, while `/etc/pirate-deploy.env` commonly uses `1`/`0`. The server reads that variable in `main`
+    /// after parse (see `allow_server_stack_update_effective` below).
+    #[arg(long, default_value_t = false)]
     allow_server_stack_update: bool,
 
     /// Fallback executable name inside a release if `run.sh` is missing.
@@ -113,6 +117,19 @@ fn ensure_not_root() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(unix))]
 fn ensure_not_root() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
+}
+
+/// CLI flag `--allow-server-stack-update` **or** env `DEPLOY_ALLOW_SERVER_STACK_UPDATE` (`1`, `true`, case-insensitive).
+fn allow_server_stack_update_effective(cli_flag: bool) -> bool {
+    cli_flag
+        || std::env::var("DEPLOY_ALLOW_SERVER_STACK_UPDATE")
+            .map(|v| {
+                let t = v.trim();
+                t == "1"
+                    || t.eq_ignore_ascii_case("true")
+                    || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
 }
 
 fn print_install_bundle(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -216,10 +233,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     ensure_not_root()?;
-    let allow_server_stack_update = args.allow_server_stack_update
-        || std::env::var("DEPLOY_ALLOW_SERVER_STACK_UPDATE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+    let allow_server_stack_update =
+        allow_server_stack_update_effective(args.allow_server_stack_update);
 
     info!(
         root = %args.root.display(),

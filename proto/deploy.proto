@@ -75,6 +75,8 @@ message StatusRequest {
 }
 
 message StatusResponse {
+  // Active app release (symlink `current` → `releases/<ver>`), or when none yet: `stack@…`
+  // from server install metadata (`server-stack-version` or `binary-<deploy-server semver>`).
   string current_version = 1;
   // running | stopped | error
   string state = 2;

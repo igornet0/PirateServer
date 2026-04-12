@@ -136,7 +136,7 @@ if command -v nginx >/dev/null 2>&1; then
 fi
 
 echo "==> бинарники"
-for b in deploy-server control-api client tunnel-gateway; do
+for b in deploy-server control-api pirate client tunnel-gateway; do
   if [[ -f "/usr/local/bin/$b" ]]; then
     rm -f "/usr/local/bin/$b"
   fi

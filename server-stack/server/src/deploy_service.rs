@@ -2,7 +2,8 @@
 
 use deploy_core::{
     normalize_project_id, project_deploy_root, read_current_version_from_symlink,
-    refresh_process_state, release_dir_for_version, validate_project_id,
+    read_server_stack_bundle_version_from_var_lib, refresh_process_state,
+    release_dir_for_version, status_current_version_display, validate_project_id,
     validate_version as validate_version_core, AppState,
 };
 use deploy_db::DbStore;
@@ -563,12 +564,11 @@ impl DeployService for DeployServiceImpl {
         let st = map.entry(key.clone()).or_insert_with(AppState::default);
         refresh_process_state(st);
 
-        let mut current = st.current_version.clone();
-        if current.is_empty() {
-            if let Some(v) = read_current_version_from_symlink(&root) {
-                current = v;
-            }
-        }
+        let current = status_current_version_display(
+            &st.current_version,
+            &root,
+            env!("CARGO_PKG_VERSION"),
+        );
 
         Ok(Response::new(
             self.status_response(current, st.state.clone()),
@@ -694,8 +694,13 @@ impl DeployService for DeployServiceImpl {
         drop(map);
         self.spawn_db_record(&key, "stop", &cur, &cur, &state, None);
 
+        let for_response = status_current_version_display(
+            &cur,
+            &root,
+            env!("CARGO_PKG_VERSION"),
+        );
         Ok(Response::new(
-            self.status_response(current, "stopped".to_string()),
+            self.status_response(for_response, "stopped".to_string()),
         ))
     }
 
@@ -1104,13 +1109,8 @@ impl DeployService for DeployServiceImpl {
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
         }
 
-        let root = PathBuf::from("/var/lib/pirate");
-        let ver_path = root.join("server-stack-version");
-        let bundle_version = tokio::fs::read_to_string(&ver_path)
-            .await
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let root = PathBuf::from(deploy_core::PIRATE_VAR_LIB);
+        let bundle_version = read_server_stack_bundle_version_from_var_lib().unwrap_or_default();
 
         let manifest_path = root.join("server-stack-manifest.json");
         let manifest_json = if manifest_path.exists() {

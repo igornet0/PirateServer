@@ -15,6 +15,7 @@
 # Без вопроса (автоматизация): sudo pirate_NONINTERACTIVE=1 ./install.sh
 # Явно задать домен: sudo pirate_DOMAIN=deploy.example.com ./install.sh  или  --domain deploy.example.com
 # Каталог: распакованный pirate-linux-amd64/ (рядом с bin/, share/, install.sh).
+# После установки в PATH: client и pirate (симлинк на client) — gRPC CLI к deploy-server на этом хосте.
 # Если в каталоге есть .bundle-no-ui (архив собран с UI_BUILD=0), флаги --ui и pirate_UI=1 запрещены.
 
 set -euo pipefail
@@ -312,6 +313,13 @@ echo "==> бинарники -> /usr/local/bin"
 install -m 0755 "$BIN_LOCAL/deploy-server" /usr/local/bin/deploy-server
 install -m 0755 "$BIN_LOCAL/control-api" /usr/local/bin/control-api
 install -m 0755 "$BIN_LOCAL/client" /usr/local/bin/client
+# То же приложение deploy-client, что и pirate (два bin в Cargo.toml). В новых архивах есть оба файла;
+# в старых — только client, тогда симлинк (корректный CARGO_BIN_NAME в `pirate --help` даёт отдельный бинарник).
+if [[ -f "$BIN_LOCAL/pirate" ]]; then
+  install -m 0755 "$BIN_LOCAL/pirate" /usr/local/bin/pirate
+else
+  ( cd /usr/local/bin && ln -sf client pirate )
+fi
 
 if [[ -f "$SCRIPT_DIR/server-stack-manifest.json" ]]; then
   echo "==> server-stack manifest -> /var/lib/pirate (release metadata for GetServerStackInfo)"
@@ -496,11 +504,13 @@ else
   echo "             Откройте порт 50051 в firewall, если клиенты подключаются не с этого хоста."
 fi
 echo "  API health: curl -s http://127.0.0.1:8080/health"
-echo "  Клиент: JSON для client pair (поля token, url, pairing):"
+echo "  Клиент (CLI: client и pirate — одно приложение, pirate → client в /usr/local/bin):"
+echo "           JSON для pair (поля token, url, pairing):"
 sudo -u pirate bash -c 'set -a; . /etc/pirate-deploy.env; set +a; exec /usr/local/bin/deploy-server --root /var/lib/pirate/deploy print-install-bundle'
-echo "           Пример: client pair --bundle '<JSON выше>'   или сохраните JSON в файл и: client pair --bundle ./bundle.json"
-echo "           Без pair команды client status / deploy вернут missing metadata (x-deploy-pubkey)."
-echo "           После pair: client status / deploy (URL сохраняется из поля url в JSON)."
-echo "  Проверка gRPC: не через curl к :50051 (это HTTP/2 gRPC); используйте client или grpcurl."
+echo "           Пример: pirate pair --bundle '<JSON выше>'   или: client pair --bundle ./bundle.json"
+echo "           Версии: pirate --version   или   pirate --version-all [--endpoint URL]"
+echo "           Без pair команды pirate status / deploy вернут missing metadata (x-deploy-pubkey)."
+echo "           После pair: pirate status / deploy (URL сохраняется из поля url в JSON)."
+echo "  Проверка gRPC: не через curl к :50051 (это HTTP/2 gRPC); используйте pirate (или client) или grpcurl."
 echo ""
 echo "Логи: journalctl -u deploy-server -f   /   journalctl -u control-api -f"
