@@ -14,6 +14,7 @@ use deploy_db::{
 use uuid::Uuid;
 use deploy_proto::deploy::deploy_service_client::DeployServiceClient;
 use deploy_proto::deploy::{
+    CreateConnectionRequest, CreateConnectionResponse, ProxyConnectionPolicy,
     RestartProcessRequest, RollbackRequest, StatusRequest, StopProcessRequest,
 };
 use ed25519_dalek::SigningKey;
@@ -541,6 +542,87 @@ impl ControlPlane {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Create a managed proxy session via deploy-server `CreateConnection` (signed gRPC).
+    pub async fn create_proxy_invitation(
+        &self,
+        project_id: String,
+        board_label: String,
+        policy: ProxyConnectionPolicy,
+        recipient_client_pubkey_b64: Option<String>,
+    ) -> Result<CreateConnectionResponse, ControlError> {
+        validate_project_id(&project_id).map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let pid = normalize_project_id(&project_id);
+        let sk = self.grpc_signing_key.as_ref().ok_or_else(|| {
+            ControlError::Grpc(
+                "grpc signing key is not configured; cannot create proxy tunnel invitations"
+                    .to_string(),
+            )
+        })?;
+        let recipient = recipient_client_pubkey_b64
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let mut req = tonic::Request::new(CreateConnectionRequest {
+            project_id: pid.clone(),
+            board_label,
+            policy: Some(policy),
+            recipient_client_pubkey_b64: recipient,
+        });
+        attach_auth_metadata(&mut req, sk, "CreateConnection", &pid, "")
+            .map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let mut client = DeployServiceClient::connect(self.grpc_endpoint.clone())
+            .await
+            .map_err(|e| ControlError::Grpc(e.to_string()))?;
+        client
+            .create_connection(req)
+            .await
+            .map_err(|e| ControlError::Grpc(e.to_string()))
+            .map(|r| r.into_inner())
+    }
+
+    pub async fn list_proxy_invitations(
+        &self,
+        limit: i64,
+        offset: i64,
+        revoked_filter: Option<bool>,
+    ) -> Result<Vec<deploy_db::GrpcProxySessionRow>, ControlError> {
+        let db = self.db.as_ref().ok_or_else(|| {
+            ControlError::Grpc(
+                "metadata database is not configured (set DEPLOY_SQLITE_URL or DATABASE_URL)"
+                    .to_string(),
+            )
+        })?;
+        db.list_grpc_proxy_sessions_page(limit, offset, revoked_filter)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn revoke_proxy_invitation(&self, session_id: &str) -> Result<u64, ControlError> {
+        let db = self.db.as_ref().ok_or_else(|| {
+            ControlError::Grpc(
+                "metadata database is not configured (set DEPLOY_SQLITE_URL or DATABASE_URL)"
+                    .to_string(),
+            )
+        })?;
+        db.revoke_grpc_proxy_session_by_id(session_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn fetch_proxy_invitation(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<deploy_db::GrpcProxySessionRow>, ControlError> {
+        let db = self.db.as_ref().ok_or_else(|| {
+            ControlError::Grpc(
+                "metadata database is not configured (set DEPLOY_SQLITE_URL or DATABASE_URL)"
+                    .to_string(),
+            )
+        })?;
+        db.fetch_grpc_proxy_session_by_id_only(session_id)
+            .await
+            .map_err(Into::into)
     }
 }
 

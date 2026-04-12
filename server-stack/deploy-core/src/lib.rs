@@ -109,6 +109,49 @@ pub fn read_current_version_from_symlink(root: &Path) -> Option<String> {
 /// Native install (and bundles that mimic it) write bundle metadata here.
 pub const PIRATE_VAR_LIB: &str = "/var/lib/pirate";
 
+/// Systemd `EnvironmentFile` for deploy-server / control-api (see `install.sh`).
+pub const PIRATE_DEPLOY_ENV_PATH: &str = "/etc/pirate-deploy.env";
+
+/// True when env file defines non-empty JWT + UI admin credentials (dashboard auth enabled).
+pub fn pirate_deploy_env_dashboard_enabled(contents: &str) -> bool {
+    let mut jwt = false;
+    let mut user = false;
+    let mut pass = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("CONTROL_API_JWT_SECRET=") {
+            jwt = !rest.trim().is_empty();
+        } else if let Some(rest) = line.strip_prefix("CONTROL_UI_ADMIN_USERNAME=") {
+            user = !rest.trim().is_empty();
+        } else if let Some(rest) = line.strip_prefix("CONTROL_UI_ADMIN_PASSWORD=") {
+            pass = !rest.trim().is_empty();
+        }
+    }
+    jwt && user && pass
+}
+
+/// `Some(true)` if symlink exists, `Some(false)` if missing, `None` if we could not stat (e.g. permission).
+pub fn host_nginx_pirate_site_enabled() -> Option<bool> {
+    let p = Path::new("/etc/nginx/sites-enabled/pirate");
+    match std::fs::symlink_metadata(p) {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// Read dashboard flag from [`PIRATE_DEPLOY_ENV_PATH`] and nginx site presence.
+pub fn read_host_stack_ui_flags() -> (bool, Option<bool>) {
+    let dash = match std::fs::read_to_string(Path::new(PIRATE_DEPLOY_ENV_PATH)) {
+        Ok(s) => pirate_deploy_env_dashboard_enabled(&s),
+        Err(_) => false,
+    };
+    (dash, host_nginx_pirate_site_enabled())
+}
+
 /// Contents of `server-stack-version` when present and non-empty after trim.
 pub fn read_server_stack_bundle_version_from_var_lib() -> Option<String> {
     let path = Path::new(PIRATE_VAR_LIB).join("server-stack-version");
@@ -202,6 +245,18 @@ mod tests {
         let s = idle_server_stack_status_label("9.9.9");
         assert!(s.starts_with("stack@"));
         assert!(validate_version(&s).is_err());
+    }
+
+    #[test]
+    fn pirate_deploy_env_dashboard_reads_flags() {
+        let s = r#"
+DEPLOY_SQLITE_URL=sqlite:///x
+CONTROL_API_JWT_SECRET=secret
+CONTROL_UI_ADMIN_USERNAME=admin
+CONTROL_UI_ADMIN_PASSWORD=pw
+"#;
+        assert!(pirate_deploy_env_dashboard_enabled(s));
+        assert!(!pirate_deploy_env_dashboard_enabled("CONTROL_API_JWT_SECRET=\nCONTROL_UI_ADMIN_USERNAME=a\nCONTROL_UI_ADMIN_PASSWORD=b"));
     }
 
     #[test]
