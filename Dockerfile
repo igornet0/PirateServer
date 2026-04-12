@@ -6,6 +6,7 @@ FROM rust:bookworm AS rust-builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY proto proto
+COPY wire-protocol wire-protocol
 COPY server-stack/server server-stack/server
 COPY server-stack/control-api server-stack/control-api
 COPY server-stack/deploy-auth server-stack/deploy-auth

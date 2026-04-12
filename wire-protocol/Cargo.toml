@@ -1,0 +1,22 @@
+[package]
+name = "wire-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "VLESS / Trojan / VMess framing over byte streams (Pirate gRPC ProxyTunnel)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+aes-gcm = "0.10"
+aes = "0.8"
+md5 = "0.7"
+rand = "0.8"
+chrono = "0.4"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

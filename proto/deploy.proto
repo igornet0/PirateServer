@@ -34,6 +34,27 @@ service DeployService {
 
   // Bidirectional TCP tunnel for outbound HTTP CONNECT / HTTPS (signed like GetStatus; default project).
   rpc ProxyTunnel(stream ProxyClientMsg) returns (stream ProxyServerMsg);
+
+  // Authorized peers + last activity from metadata DB (requires DEPLOY_SQLITE_URL / DATABASE_URL on server).
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+
+  // Paginated session / audit log (newest first). Same DB requirement as ListSessions.
+  rpc QuerySessionLogs(QuerySessionLogsRequest) returns (QuerySessionLogsResponse);
+
+  // Declare connection role (proxy vs resource compute); signed like GetStatus.
+  rpc UpdateConnectionProfile(UpdateConnectionProfileRequest) returns (UpdateConnectionProfileResponse);
+
+  // Client-reported CPU/RAM/GPU/storage snapshot for RESOURCE connections; signed like GetStatus.
+  rpc ReportResourceUsage(ReportResourceUsageRequest) returns (ReportResourceUsageResponse);
+
+  // Client streams payload bytes; server measures upload throughput and returns a download blob (signed like GetStatus).
+  rpc ConnectionProbe(stream ConnectionProbeChunk) returns (ConnectionProbeResult);
+
+  // Managed proxy session (limits, stats); signed like GetStatus. Optional for legacy ProxyTunnel without token.
+  rpc CreateConnection(CreateConnectionRequest) returns (CreateConnectionResponse);
+  rpc CloseConnection(CloseConnectionRequest) returns (CloseConnectionResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc UpdateSettings(UpdateProxySettingsRequest) returns (UpdateProxySettingsResponse);
 }
 
 message PairRequest {
@@ -104,12 +125,39 @@ message RestartProcessRequest {
   string project_id = 1;
 }
 
+// OTA apply hint for pirate-apply-stack-bundle.sh (only honored on the last chunk when set).
+enum StackApplyMode {
+  STACK_APPLY_MODE_UNSPECIFIED = 0;
+  // No transition: only refresh binaries / optional static copy (legacy behavior).
+  STACK_APPLY_MODE_NONE = 1;
+  // Host had no dashboard JWT; incoming bundle includes UI — merge env, JWT, optional nginx.
+  STACK_APPLY_MODE_ENABLE_UI = 2;
+  // Host had dashboard; incoming bundle has no UI — strip UI static, JWT, reconfigure nginx.
+  STACK_APPLY_MODE_DISABLE_UI = 3;
+}
+
+message StackApplyOptions {
+  StackApplyMode mode = 1;
+  // ENABLE_UI: domain (empty = IP-only in install terms).
+  string domain = 2;
+  string ui_admin_username = 3;
+  string ui_admin_password = 4;
+  bool install_nginx = 5;
+  bool deploy_allow_server_stack_update = 6;
+  bool control_api_host_stats_series = 7;
+  bool control_api_host_stats_stream = 8;
+  // DISABLE_UI: if true, keep nginx with API-only site; if false, disable pirate nginx site.
+  bool nginx_keep_api_proxy = 9;
+}
+
 message ServerStackChunk {
   bytes data = 1;
   string version = 2;
   bool is_last = 3;
   // SHA-256 of the full artifact (hex, lowercase). Required when is_last = true.
   string sha256_hex = 4;
+  // Only on the last chunk: must match signing metadata x-deploy-stack-apply-sha256 when present.
+  StackApplyOptions apply_options = 5;
 }
 
 message ServerStackResponse {
@@ -124,9 +172,100 @@ message ServerStackInfoRequest {
 
 // --- Outbound proxy tunnel (paired clients only) ---
 
+// Wire protocol inside gRPC ProxyTunnel `data` frames (Pirate client ↔ deploy-server only).
+enum ProxyWireMode {
+  PROXY_WIRE_MODE_RAW_TCP_RELAY = 0;
+  PROXY_WIRE_MODE_VLESS = 1;
+  PROXY_WIRE_MODE_TROJAN = 2;
+  PROXY_WIRE_MODE_VMESS = 3;
+}
+
 message ProxyOpen {
   string host = 1;
   uint32 port = 2;
+  // Opaque token from CreateConnection; empty = legacy mode (no per-session limits on server).
+  string session_token = 3;
+  // Optional client correlation id for logging / UI.
+  string stream_correlation_id = 4;
+  // When set to non-RAW, `wire_config_json` carries protocol params; destination is taken from protocol handshake, not from host/port alone.
+  optional ProxyWireMode wire_mode = 5;
+  optional string wire_config_json = 6;
+}
+
+// --- Managed proxy sessions (control plane) ---
+
+message ProxyAccessWindow {
+  // 1 = Monday .. 7 = Sunday (ISO weekday).
+  repeated uint32 days = 1;
+  string start = 2;
+  string end = 3;
+}
+
+message ProxyAccessSchedule {
+  string timezone = 1;
+  repeated ProxyAccessWindow windows = 2;
+}
+
+message ProxyConnectionPolicy {
+  optional uint64 max_session_duration_sec = 1;
+  optional uint64 traffic_total_bytes = 2;
+  optional uint64 traffic_bytes_in_limit = 3;
+  optional uint64 traffic_bytes_out_limit = 4;
+  optional ProxyAccessSchedule access_schedule = 5;
+  // Idle gap (seconds) after which active time stops accruing until next bytes.
+  optional uint32 active_idle_timeout_sec = 6;
+}
+
+message CreateConnectionRequest {
+  string project_id = 1;
+  string board_label = 2;
+  ProxyConnectionPolicy policy = 3;
+  // If set, the session token is bound to this client public key (share with recipient).
+  optional string recipient_client_pubkey_b64 = 4;
+}
+
+message CreateConnectionResponse {
+  string session_id = 1;
+  string session_token = 2;
+  int64 expires_at_unix_ms = 3;
+  string status = 4;
+}
+
+message CloseConnectionRequest {
+  string project_id = 1;
+  string session_id = 2;
+}
+
+message CloseConnectionResponse {
+  string status = 1;
+}
+
+message GetStatsRequest {
+  string project_id = 1;
+  // Empty: summary for authenticated pubkey (all sessions aggregate or server-defined).
+  string session_id = 2;
+}
+
+message GetStatsResponse {
+  string session_id = 1;
+  uint64 bytes_in = 2;
+  uint64 bytes_out = 3;
+  uint64 active_ms = 4;
+  int64 last_activity_unix_ms = 5;
+  bool revoked = 6;
+  int64 created_at_unix_ms = 7;
+  int64 expires_at_unix_ms = 8;
+}
+
+message UpdateProxySettingsRequest {
+  string project_id = 1;
+  string session_id = 2;
+  ProxyConnectionPolicy policy = 3;
+}
+
+message UpdateProxySettingsResponse {
+  string status = 1;
+  int64 expires_at_unix_ms = 2;
 }
 
 message ProxyClientMsg {
@@ -160,6 +299,10 @@ message ServerStackInfo {
   optional string manifest_json = 2;
   // deploy-server binary Cargo version (always available); useful when manifest files are absent.
   optional string deploy_server_binary_version = 3;
+  // True when /etc/pirate-deploy.env has CONTROL_API_JWT_SECRET and UI admin vars (dashboard auth).
+  bool host_dashboard_enabled = 4;
+  // True when /etc/nginx/sites-enabled/pirate exists; unset means unknown (could not stat).
+  optional bool host_nginx_pirate_site = 5;
 }
 
 // --- Host stats (control-plane parity with GET /api/v1/host-stats) ---
@@ -324,4 +467,101 @@ message HostStatsDetailResponse {
     NetworkDetailProto network = 4;
     ProcessesDetailProto processes = 5;
   }
+}
+
+// --- Client session audit (metadata DB) ---
+
+// How this enrolled client intends to use the connection (operator-set after pair).
+enum ConnectionKind {
+  CONNECTION_KIND_UNSPECIFIED = 0;
+  CONNECTION_KIND_PROXY = 1;
+  CONNECTION_KIND_RESOURCE = 2;
+}
+
+message ListSessionsRequest {
+  // For signing parity with other RPCs; empty means `default`.
+  string project_id = 1;
+}
+
+message SessionPeerRow {
+  string client_public_key_b64 = 1;
+  int64 last_seen_ms = 2;
+  string last_peer_ip = 3;
+  string last_grpc_method = 4;
+  ConnectionKind connection_kind = 5;
+  // Client-reported load (RESOURCE); unset when never reported or not applicable.
+  optional double last_cpu_percent = 6;
+  optional double last_ram_percent = 7;
+  optional double last_gpu_percent = 8;
+  // Milliseconds since Unix epoch; 0 if never reported.
+  int64 resource_reported_at_ms = 9;
+  optional uint64 ram_used_bytes = 10;
+  optional uint64 storage_used_bytes = 11;
+  // Cumulative ProxyTunnel bytes attributed to this peer (sum of hourly buckets).
+  uint64 proxy_bytes_in_total = 12;
+  uint64 proxy_bytes_out_total = 13;
+}
+
+message ListSessionsResponse {
+  repeated SessionPeerRow peers = 1;
+}
+
+message UpdateConnectionProfileRequest {
+  string project_id = 1;
+  ConnectionKind connection_kind = 2;
+  string agent_version = 3;
+}
+
+message UpdateConnectionProfileResponse {
+  string status = 1;
+}
+
+message ReportResourceUsageRequest {
+  string project_id = 1;
+  optional double cpu_percent = 2;
+  optional double ram_percent = 3;
+  optional double gpu_percent = 4;
+  optional uint64 ram_used_bytes = 5;
+  optional uint64 storage_used_bytes = 6;
+}
+
+message ReportResourceUsageResponse {
+  string status = 1;
+}
+
+// First chunk should set project_id (empty = default) and optional download_request_bytes; all chunks contribute to upload measurement.
+message ConnectionProbeChunk {
+  string project_id = 1;
+  uint32 download_request_bytes = 2;
+  bytes data = 3;
+}
+
+message ConnectionProbeResult {
+  uint64 upload_bytes = 1;
+  int64 upload_duration_ms = 2;
+  bytes download_payload = 3;
+}
+
+message QuerySessionLogsRequest {
+  string project_id = 1;
+  // Server clamps to max 500.
+  int32 limit = 2;
+  // Next page: pass smallest `id` from the previous page; 0 = first page (newest).
+  int64 before_id = 3;
+}
+
+message SessionLogEvent {
+  int64 id = 1;
+  int64 created_at_ms = 2;
+  string kind = 3;
+  string client_public_key_b64 = 4;
+  string peer_ip = 5;
+  string grpc_method = 6;
+  string status = 7;
+  string detail = 8;
+}
+
+message QuerySessionLogsResponse {
+  repeated SessionLogEvent events = 1;
+  bool has_more = 2;
 }
