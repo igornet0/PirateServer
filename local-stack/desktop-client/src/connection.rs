@@ -158,7 +158,13 @@ fn load_stored() -> Option<StoredConnection> {
 
 fn use_signed_for_endpoint(endpoint: &str) -> bool {
     load_stored()
-        .map(|s| s.paired && normalize_endpoint(&s.url) == normalize_endpoint(endpoint))
+        .map(|s| {
+            s.paired
+                && deploy_auth::endpoints_equivalent_for_signing(
+                    &normalize_endpoint(&s.url),
+                    &normalize_endpoint(endpoint),
+                )
+        })
         .unwrap_or(false)
 }
 

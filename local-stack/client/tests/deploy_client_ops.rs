@@ -62,7 +62,7 @@ fn build_chunks_single_non_empty_artifact() {
 fn build_server_stack_chunks_matches_deploy_shape() {
     let data = vec![1u8; 100];
     let sha = hex::encode(sha2::Sha256::digest(&data));
-    let chunks = build_server_stack_chunks(&data, "stack-v1", &sha, 40);
+    let chunks = build_server_stack_chunks(&data, "stack-v1", &sha, 40, None);
     assert!(!chunks.is_empty());
     assert!(chunks.last().unwrap().is_last);
     assert_eq!(chunks.first().unwrap().version, "stack-v1");

@@ -39,6 +39,7 @@ where
         &version,
         chunk_size,
         sk.as_ref(),
+        None,
         on_progress,
     ))
     .map_err(|s| {
@@ -73,6 +74,8 @@ pub fn fetch_server_stack_info_json() -> Result<String, String> {
         "bundleVersion": info.bundle_version,
         "manifestJson": info.manifest_json,
         "deployServerBinaryVersion": info.deploy_server_binary_version,
+        "hostDashboardEnabled": info.host_dashboard_enabled,
+        "hostNginxPirateSite": info.host_nginx_pirate_site,
     })
     .to_string())
 }
