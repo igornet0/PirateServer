@@ -79,7 +79,8 @@ Skips if `client` is not on `PATH` (build with `cargo build -p deploy-client --r
 3. `GET /api/v1/status` direct and via nginx (Bearer when token is set).
 4. `client deploy` of [`tests/fixtures/minimal-app`](../tests/fixtures/minimal-app) (`v-e2e-1`, then `v-e2e-2`).
 5. Status, releases, `client rollback`, history.
-6. If `NGINX_E2E_TESTS=1`: `GET`/`PUT /api/v1/nginx/config` with [`tests/fixtures/nginx-e2e-put.conf`](../tests/fixtures/nginx-e2e-put.conf).
+6. `pirate` / `client sessions`, `sessions --last-log`, and `sessions --export-log` against `GRPC_ENDPOINT` (compose sets `DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1`, so no prior `auth` is required in this profile). `pirate board --test-connect` is not run here: it needs a paired client identity (`pirate auth`) matching the endpoint, unlike the unsigned `sessions` checks above.
+7. If `NGINX_E2E_TESTS=1`: `GET`/`PUT /api/v1/nginx/config` with [`tests/fixtures/nginx-e2e-put.conf`](../tests/fixtures/nginx-e2e-put.conf).
 
 ## CI
 

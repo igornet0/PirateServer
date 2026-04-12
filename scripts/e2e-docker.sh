@@ -65,6 +65,16 @@ echo "$HIST" | grep -q '"events":\[{' || {
   exit 1
 }
 
+echo "==> pirate sessions (ListSessions; unsigned gRPC in compose)"
+client --endpoint "$GRPC" sessions
+
+echo "==> pirate sessions --last-log (session audit table)"
+client --endpoint "$GRPC" sessions --last-log --limit 20 | head -n 8
+
+echo "==> pirate sessions --export-log (CSV)"
+client --endpoint "$GRPC" sessions --export-log -o /tmp/pirate-sessions-e2e.csv
+grep -q '^id,created_at_ms,kind,' /tmp/pirate-sessions-e2e.csv
+
 if [[ "${NGINX_E2E_TESTS:-}" == "1" ]]; then
   echo "==> nginx config API: GET (enabled)"
   GET=$(curl_api "$API/api/v1/nginx/config")

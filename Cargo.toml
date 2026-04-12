@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "proto",
+    "wire-protocol",
     "server-stack/server",
     "server-stack/control-api",
     "server-stack/deploy-control",

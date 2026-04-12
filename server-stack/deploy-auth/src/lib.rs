@@ -31,6 +31,8 @@ pub const META_NONCE: &str = "x-deploy-nonce";
 pub const META_SIG: &str = "x-deploy-sig";
 /// Must match the first chunk's `version` for Upload streams.
 pub const META_VERSION: &str = "x-deploy-version";
+/// Optional; SHA-256 hex (lowercase) of protobuf-encoded [`StackApplyOptions`] for `UploadServerStack`.
+pub const META_STACK_APPLY_SHA256: &str = "x-deploy-stack-apply-sha256";
 /// Optional; when set, must match first chunk `project_id` (omit for `default`).
 pub const META_PROJECT: &str = "x-deploy-project";
 
@@ -120,6 +122,11 @@ pub fn pubkey_b64_url(sk: &SigningKey) -> String {
     B64U.encode(sk.verifying_key().as_bytes())
 }
 
+/// URL-safe Base64 (no padding) for a raw 32-byte Ed25519 public key.
+pub fn raw_pubkey_b64_url(bytes: &[u8; 32]) -> String {
+    B64U.encode(bytes)
+}
+
 pub fn parse_verifying_key_b64(b64: &str) -> Result<VerifyingKey, AuthError> {
     let bytes = B64U
         .decode(b64.trim())
@@ -129,6 +136,101 @@ pub fn parse_verifying_key_b64(b64: &str) -> Result<VerifyingKey, AuthError> {
     }
     let arr: [u8; 32] = bytes.try_into().map_err(|_| AuthError::InvalidKeyLength)?;
     VerifyingKey::from_bytes(&arr).map_err(|_| AuthError::InvalidKeyLength)
+}
+
+/// Trim and strip trailing `/` (same convention as deploy clients’ `connection.json` URLs).
+pub fn normalize_endpoint_url(s: &str) -> String {
+    s.trim().trim_end_matches('/').to_string()
+}
+
+struct ParsedHttpEndpoint {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+fn parse_http_endpoint(s: &str) -> Option<ParsedHttpEndpoint> {
+    let s = normalize_endpoint_url(s);
+    let (scheme, after_scheme) = s.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let default_port: u16 = if scheme == "https" { 443 } else { 80 };
+    let authority_end = after_scheme
+        .find(|c| matches!(c, '/' | '?' | '#'))
+        .unwrap_or(after_scheme.len());
+    let authority = after_scheme.get(..authority_end)?;
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = parse_authority_host_port(authority, default_port)?;
+    Some(ParsedHttpEndpoint { scheme, host, port })
+}
+
+fn parse_authority_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let host = authority.get(1..end)?.to_string();
+        let rest = &authority[end + 1..];
+        if rest.is_empty() {
+            return Some((host, default_port));
+        }
+        if rest.starts_with(':') {
+            let port: u16 = rest.get(1..)?.parse().ok()?;
+            return Some((host, port));
+        }
+        return None;
+    }
+    let colon_count = authority.matches(':').count();
+    if colon_count == 0 {
+        return Some((authority.to_ascii_lowercase(), default_port));
+    }
+    if colon_count == 1 {
+        let (h, p) = authority.rsplit_once(':')?;
+        if p.chars().all(|c| c.is_ascii_digit()) {
+            let port: u16 = p.parse().ok()?;
+            return Some((h.to_ascii_lowercase(), port));
+        }
+    }
+    Some((authority.to_ascii_lowercase(), default_port))
+}
+
+fn host_is_loopback_for_signing(host: &str) -> bool {
+    let h = host.trim();
+    if h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" {
+        return true;
+    }
+    if h == "::1" || h.eq_ignore_ascii_case("0:0:0:0:0:0:0:1") {
+        return true;
+    }
+    false
+}
+
+/// `true` when two deploy gRPC base URLs denote the same signing target for the client.
+///
+/// Exact match (after [`normalize_endpoint_url`]) returns `true`. Otherwise parses `http`/`https`
+/// authority; same scheme and port are required, and hosts must match or both be loopback
+/// (`127.0.0.1`, `localhost`, `[::1]` / `::1`, etc.).
+pub fn endpoints_equivalent_for_signing(a: &str, b: &str) -> bool {
+    let a = normalize_endpoint_url(a);
+    let b = normalize_endpoint_url(b);
+    if a == b {
+        return true;
+    }
+    let Some(pa) = parse_http_endpoint(&a) else {
+        return false;
+    };
+    let Some(pb) = parse_http_endpoint(&b) else {
+        return false;
+    };
+    if pa.scheme != pb.scheme || pa.port != pb.port {
+        return false;
+    }
+    if pa.host == pb.host {
+        return true;
+    }
+    host_is_loopback_for_signing(&pa.host) && host_is_loopback_for_signing(&pb.host)
 }
 
 /// Canonical message for authenticated RPCs (not Pair).
@@ -218,7 +320,9 @@ pub fn signing_payload(method: &str, project_id: &str, secondary: &str) -> Strin
         }
         // Same signing payload shape as GetStatus / StopProcess (project only when not default).
         "ProxyTunnel" | "GetStatus" | "StopProcess" | "RestartProcess" | "GetHostStats"
-        | "GetHostStatsDetail" | "GetServerStackInfo" => {
+        | "GetHostStatsDetail" | "GetServerStackInfo" | "ListSessions" | "QuerySessionLogs"
+        | "UpdateConnectionProfile" | "ReportResourceUsage" | "ConnectionProbe"
+        | "CreateConnection" | "CloseConnection" | "GetStats" | "UpdateSettings" => {
             if is_default {
                 String::new()
             } else {
@@ -375,6 +479,18 @@ pub fn verify_upload_metadata(
     verify_rpc_metadata(meta, peers, "Upload", &payload, config, nonce_tracker)
 }
 
+/// Signed gRPC payload for `UploadServerStack`: `version` or `version|sha256_hex(protobuf(StackApplyOptions))`.
+pub fn signing_payload_upload_server_stack(
+    version: &str,
+    stack_apply_sha256_hex: Option<&str>,
+) -> String {
+    let h = stack_apply_sha256_hex.map(str::trim).filter(|s| !s.is_empty());
+    match h {
+        None => version.to_string(),
+        Some(hex) => format!("{version}|{hex}"),
+    }
+}
+
 /// Same as [`verify_upload_metadata`] but for `UploadServerStack` (no project metadata).
 pub fn verify_upload_server_stack_metadata(
     meta: &MetadataMap,
@@ -386,7 +502,10 @@ pub fn verify_upload_server_stack_metadata(
         .get(META_VERSION)
         .and_then(|v| v.to_str().ok())
         .ok_or(AuthError::MissingMetadata(META_VERSION))?;
-    let payload = signing_payload("UploadServerStack", "default", ver);
+    let apply_sha = meta
+        .get(META_STACK_APPLY_SHA256)
+        .and_then(|v| v.to_str().ok());
+    let payload = signing_payload_upload_server_stack(ver, apply_sha);
     verify_rpc_metadata(
         meta,
         peers,
@@ -395,6 +514,45 @@ pub fn verify_upload_server_stack_metadata(
         config,
         nonce_tracker,
     )
+}
+
+/// Attach auth for `UploadServerStack`. `stack_apply_sha256_hex` must match protobuf bytes on the last chunk.
+pub fn attach_auth_metadata_upload_server_stack<T>(
+    request: &mut tonic::Request<T>,
+    sk: &SigningKey,
+    version: &str,
+    stack_apply_sha256_hex: Option<&str>,
+) -> Result<(), AuthError> {
+    let ts_ms = unix_ms();
+    let nonce: String = {
+        use rand_core::RngCore;
+        format!("{:016x}", OsRng.next_u64())
+    };
+    let payload = signing_payload_upload_server_stack(version, stack_apply_sha256_hex);
+    let msg = rpc_canonical("UploadServerStack", ts_ms, &nonce, &payload);
+    let sig_b64 = sign_bytes(sk, &msg);
+
+    let m = request.metadata_mut();
+    insert_ascii(m, META_PUBKEY, &pubkey_b64_url(sk))?;
+    insert_ascii(m, META_TS, &ts_ms.to_string())?;
+    insert_ascii(m, META_NONCE, &nonce)?;
+    insert_ascii(m, META_SIG, &sig_b64)?;
+    insert_ascii(m, META_VERSION, version)?;
+    if let Some(h) = stack_apply_sha256_hex.map(str::trim).filter(|s| !s.is_empty()) {
+        insert_ascii(m, META_STACK_APPLY_SHA256, h)?;
+    }
+    Ok(())
+}
+
+/// Set [`META_STACK_APPLY_SHA256`] without signing (unsigned gRPC; integrity hint for server).
+pub fn insert_stack_apply_sha256_metadata<T>(
+    request: &mut tonic::Request<T>,
+    stack_apply_sha256_hex: Option<&str>,
+) -> Result<(), AuthError> {
+    if let Some(h) = stack_apply_sha256_hex.map(str::trim).filter(|s| !s.is_empty()) {
+        insert_ascii(request.metadata_mut(), META_STACK_APPLY_SHA256, h)?;
+    }
+    Ok(())
 }
 
 /// Parse connection bundle JSON: `{"token":"...","url":"http://..."}` optional `pairing`.
@@ -490,5 +648,73 @@ mod tests {
             signing_payload("UploadServerStack", "default", "v2026-1"),
             "v2026-1"
         );
+    }
+
+    #[test]
+    fn signing_payload_upload_server_stack_with_apply_digest() {
+        assert_eq!(
+            signing_payload_upload_server_stack("v2026-1", None),
+            "v2026-1"
+        );
+        assert_eq!(
+            signing_payload_upload_server_stack("v2026-1", Some("abc")),
+            "v2026-1|abc"
+        );
+    }
+
+    #[test]
+    fn signing_payload_connection_probe_matches_get_status_shape() {
+        assert_eq!(signing_payload("ConnectionProbe", "default", ""), "");
+        assert_eq!(signing_payload("ConnectionProbe", "myproj", ""), "myproj");
+    }
+
+    #[test]
+    fn verify_rpc_metadata_connection_probe_roundtrip() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut peers = HashSet::new();
+        peers.insert(*sk.verifying_key().as_bytes());
+        let mut req = tonic::Request::new(());
+        attach_auth_metadata(&mut req, &sk, "ConnectionProbe", "default", "").unwrap();
+        let meta = req.metadata();
+        let tracker = NonceTracker::default();
+        let cfg = AuthConfig::default();
+        verify_rpc_metadata(meta, &peers, "ConnectionProbe", "", &cfg, &tracker).unwrap();
+    }
+
+    #[test]
+    fn verify_rpc_metadata_connection_probe_non_default_project() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut peers = HashSet::new();
+        peers.insert(*sk.verifying_key().as_bytes());
+        let mut req = tonic::Request::new(());
+        attach_auth_metadata(&mut req, &sk, "ConnectionProbe", "myproj", "").unwrap();
+        let meta = req.metadata();
+        let tracker = NonceTracker::default();
+        let cfg = AuthConfig::default();
+        verify_rpc_metadata(meta, &peers, "ConnectionProbe", "myproj", &cfg, &tracker).unwrap();
+    }
+
+    #[test]
+    fn endpoints_equivalent_loopback_variants() {
+        assert!(endpoints_equivalent_for_signing(
+            "http://127.0.0.1:50051",
+            "http://[::1]:50051"
+        ));
+        assert!(endpoints_equivalent_for_signing(
+            "http://localhost:50051/",
+            "http://[::1]:50051"
+        ));
+        assert!(!endpoints_equivalent_for_signing(
+            "http://127.0.0.1:50051",
+            "http://192.168.1.1:50051"
+        ));
+        assert!(!endpoints_equivalent_for_signing(
+            "http://127.0.0.1:50051",
+            "http://127.0.0.1:50052"
+        ));
+        assert!(!endpoints_equivalent_for_signing(
+            "http://127.0.0.1:50051",
+            "https://127.0.0.1:50051"
+        ));
     }
 }

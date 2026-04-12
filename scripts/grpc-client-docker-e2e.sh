@@ -46,7 +46,7 @@ echo "==> client status (signed)"
 client status
 
 echo "==> board + CONNECT proxy to control-api:8080"
-client board --url "$GRPC" --listen 127.0.0.1:3128 &
+client --url "$GRPC" board --listen 127.0.0.1:3128 &
 BOARD_PID=$!
 sleep 2
 curl --proxytunnel --proxy http://127.0.0.1:3128 -sf "$API/health" | grep -q ok
