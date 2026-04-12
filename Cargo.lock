@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "deploy-auth",

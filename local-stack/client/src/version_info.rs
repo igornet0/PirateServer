@@ -1,8 +1,11 @@
-//! `pirate --version` and optional server stack info via `GetServerStackInfo`.
+//! `pirate --version` / `pirate --version-all` and optional server stack info via `GetServerStackInfo`.
 
 use crate::config::{load_or_create_identity, normalize_endpoint, use_signed_requests};
 use crate::Cli;
 use deploy_client::fetch_server_stack_info;
+use deploy_auth::CRATE_VERSION as AUTH_VERSION;
+use deploy_core::CRATE_VERSION as CORE_VERSION;
+use deploy_proto::CRATE_VERSION as PROTO_VERSION;
 use serde_json::Value;
 
 pub fn local_version() -> &'static str {
@@ -19,6 +22,20 @@ fn explicit_endpoint(cli: &Cli) -> Option<String> {
 
 pub async fn run_version(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     println!("client={}", local_version());
+    if let Some(ep) = explicit_endpoint(cli) {
+        if !ep.starts_with("http://") && !ep.starts_with("https://") {
+            return Err("endpoint must start with http:// or https://".into());
+        }
+        print_remote_versions(&ep).await?;
+    }
+    Ok(())
+}
+
+pub async fn run_version_all(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    println!("deploy_client={}", local_version());
+    println!("deploy_auth={}", AUTH_VERSION);
+    println!("deploy_core={}", CORE_VERSION);
+    println!("deploy_proto={}", PROTO_VERSION);
     if let Some(ep) = explicit_endpoint(cli) {
         if !ep.starts_with("http://") && !ep.starts_with("https://") {
             return Err("endpoint must start with http:// or https://".into());

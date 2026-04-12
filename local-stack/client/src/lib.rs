@@ -4,7 +4,7 @@ pub mod ops;
 pub mod upload;
 
 pub use ops::{
-    build_chunks, default_version, pack_directory, read_or_pack_bundle,
+    build_chunks, build_server_stack_chunks, default_version, pack_directory, read_or_pack_bundle,
     validate_version as validate_version_label,
 };
 pub use upload::{
