@@ -13,6 +13,8 @@
 # Без --ui эти вопросы не задаются; JWT и учётка не записываются (клиенту достаточно pair по JSON).
 # install.sh всегда задаёт CONTROL_API_BIND=127.0.0.1 (control-api только на localhost; nginx проксирует на 127.0.0.1:8080).
 # Без вопроса (автоматизация): sudo pirate_NONINTERACTIVE=1 ./install.sh
+# OTA server-stack: интерактивно спросит DEPLOY_ALLOW_SERVER_STACK_UPDATE; иначе pirate_DEPLOY_ALLOW_SERVER_STACK_UPDATE=0|1
+# Статистика хостов в дашборде: CONTROL_API_HOST_STATS_SERIES / CONTROL_API_HOST_STATS_STREAM; см. pirate_CONTROL_API_HOST_STATS_* в usage.
 # Явно задать домен: sudo pirate_DOMAIN=deploy.example.com ./install.sh  или  --domain deploy.example.com
 # Каталог: распакованный pirate-linux-amd64/ (рядом с bin/, share/, install.sh).
 # После установки в PATH: client и pirate (симлинк на client) — gRPC CLI к deploy-server на этом хосте.
@@ -41,6 +43,8 @@ usage() {
   echo "  Без вопросов: sudo pirate_NONINTERACTIVE=1 $0" >&2
   echo "  Явно: sudo pirate_DOMAIN=FQDN $0 [--nginx] [--ui]" >&2
   echo "  С --ui: пользователь дашборда — pirate_UI_ADMIN_USERNAME, pirate_UI_ADMIN_PASSWORD" >&2
+  echo "  OTA server-stack: pirate_DEPLOY_ALLOW_SERVER_STACK_UPDATE=0|1 (без вопроса; иначе спросит в TTY)" >&2
+  echo "  Статистика хостов (дашборд): pirate_CONTROL_API_HOST_STATS_SERIES=0|1, pirate_CONTROL_API_HOST_STATS_STREAM=0|1" >&2
   echo "  Опционально: pirate_INSTALL_CIFS=1; pirate_INSTALL_POSTGRESQL=1; pirate_INSTALL_MYSQL=1;" >&2
   echo "    pirate_INSTALL_REDIS=1; pirate_INSTALL_MONGODB=1; pirate_INSTALL_MSSQL=1;" >&2
   echo "    pirate_INSTALL_CLICKHOUSE=1; pirate_INSTALL_ORACLE_NOTES=1 (установка СУБД на хост)." >&2
@@ -201,6 +205,88 @@ if [[ "$pirate_UI" == "1" ]]; then
   CONTROL_API_JWT_SECRET_VALUE="$(openssl rand -base64 48 | tr -d '\n')"
 fi
 
+# DEPLOY_ALLOW_SERVER_STACK_UPDATE: gRPC UploadServerStack (sudoers уже содержит pirate-apply-stack-bundle.sh).
+DEPLOY_ALLOW_SERVER_STACK_UPDATE_VALUE="0"
+if [[ -n "${pirate_DEPLOY_ALLOW_SERVER_STACK_UPDATE:-}" ]]; then
+  case "${pirate_DEPLOY_ALLOW_SERVER_STACK_UPDATE,,}" in
+    1|true|yes|y) DEPLOY_ALLOW_SERVER_STACK_UPDATE_VALUE="1" ;;
+    0|false|no|n) DEPLOY_ALLOW_SERVER_STACK_UPDATE_VALUE="0" ;;
+    *)
+      echo "Ошибка: pirate_DEPLOY_ALLOW_SERVER_STACK_UPDATE — ожидается 0/1, true/false, yes/no, y/n." >&2
+      exit 1
+      ;;
+  esac
+elif [[ -t 0 ]] && [[ "${pirate_NONINTERACTIVE:-}" != "1" ]]; then
+  echo ""
+  read -r -p "Разрешить OTA-обновление server-stack через gRPC (DEPLOY_ALLOW_SERVER_STACK_UPDATE)? [y/N]: " _allow_stack
+  _allow_stack="${_allow_stack#"${_allow_stack%%[![:space:]]*}"}"
+  _allow_stack="${_allow_stack%"${_allow_stack##*[![:space:]]}"}"
+  case "${_allow_stack,,}" in
+    y|yes|1|true|д|да) DEPLOY_ALLOW_SERVER_STACK_UPDATE_VALUE="1" ;;
+    ""|n|no|0|false) DEPLOY_ALLOW_SERVER_STACK_UPDATE_VALUE="0" ;;
+    *)
+      echo "Ошибка: введите y/да или n; пустой ввод — нет." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# CONTROL_API_HOST_STATS_*: история для графиков и SSE-телеметрия агентов (нагрузка на слабом сервере может быть заметной).
+CONTROL_API_HOST_STATS_SERIES_VALUE="0"
+if [[ -n "${pirate_CONTROL_API_HOST_STATS_SERIES:-}" ]]; then
+  case "${pirate_CONTROL_API_HOST_STATS_SERIES,,}" in
+    1|true|yes|y) CONTROL_API_HOST_STATS_SERIES_VALUE="1" ;;
+    0|false|no|n) CONTROL_API_HOST_STATS_SERIES_VALUE="0" ;;
+    *)
+      echo "Ошибка: pirate_CONTROL_API_HOST_STATS_SERIES — ожидается 0/1, true/false, yes/no, y/n." >&2
+      exit 1
+      ;;
+  esac
+elif [[ -t 0 ]] && [[ "${pirate_NONINTERACTIVE:-}" != "1" ]]; then
+  echo ""
+  echo "Предупреждение: сохранение истории метрик хостов (CONTROL_API_HOST_STATS_SERIES) и потоковая"
+  echo "телеметрия (CONTROL_API_HOST_STATS_STREAM) увеличивают нагрузку на CPU, диск и сеть; на слабом"
+  echo "сервере чаще имеет смысл отключить оба варианта (Enter — нет)."
+  read -r -p "Включить исторические данные для графиков (CONTROL_API_HOST_STATS_SERIES)? [y/N]: " _host_series
+  _host_series="${_host_series#"${_host_series%%[![:space:]]*}"}"
+  _host_series="${_host_series%"${_host_series##*[![:space:]]}"}"
+  case "${_host_series,,}" in
+    y|yes|1|true|д|да) CONTROL_API_HOST_STATS_SERIES_VALUE="1" ;;
+    ""|n|no|0|false) CONTROL_API_HOST_STATS_SERIES_VALUE="0" ;;
+    *)
+      echo "Ошибка: введите y/да или n; пустой ввод — нет." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+CONTROL_API_HOST_STATS_STREAM_VALUE="0"
+if [[ -n "${pirate_CONTROL_API_HOST_STATS_STREAM:-}" ]]; then
+  case "${pirate_CONTROL_API_HOST_STATS_STREAM,,}" in
+    1|true|yes|y) CONTROL_API_HOST_STATS_STREAM_VALUE="1" ;;
+    0|false|no|n) CONTROL_API_HOST_STATS_STREAM_VALUE="0" ;;
+    *)
+      echo "Ошибка: pirate_CONTROL_API_HOST_STATS_STREAM — ожидается 0/1, true/false, yes/no, y/n." >&2
+      exit 1
+      ;;
+  esac
+elif [[ -t 0 ]] && [[ "${pirate_NONINTERACTIVE:-}" != "1" ]]; then
+  if [[ -n "${pirate_CONTROL_API_HOST_STATS_SERIES:-}" ]]; then
+    echo "Потоковая телеметрия (STREAM), как и история (SERIES), на слабом сервере может заметно нагружать систему."
+  fi
+  read -r -p "Включить потоковую телеметрию для онлайн-обновления в UI (CONTROL_API_HOST_STATS_STREAM)? [y/N]: " _host_stream
+  _host_stream="${_host_stream#"${_host_stream%%[![:space:]]*}"}"
+  _host_stream="${_host_stream%"${_host_stream##*[![:space:]]}"}"
+  case "${_host_stream,,}" in
+    y|yes|1|true|д|да) CONTROL_API_HOST_STATS_STREAM_VALUE="1" ;;
+    ""|n|no|0|false) CONTROL_API_HOST_STATS_STREAM_VALUE="0" ;;
+    *)
+      echo "Ошибка: введите y/да или n; пустой ввод — нет." >&2
+      exit 1
+      ;;
+  esac
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 if [[ "$pirate_NGINX" == "1" ]]; then
@@ -291,6 +377,14 @@ for _pf in "$PIRATE_LIB_DIR"/*.sh; do
 done
 shopt -u nullglob
 
+echo "==> uninstall scripts -> /usr/local/share/pirate-uninstall"
+install -d -m 0755 /usr/local/share/pirate-uninstall
+install -m 0755 "$SCRIPT_DIR/uninstall.sh" /usr/local/share/pirate-uninstall/uninstall.sh
+install -m 0755 "$SCRIPT_DIR/purge-pirate-data.sh" /usr/local/share/pirate-uninstall/purge-pirate-data.sh
+printf '%s\n' "$SCRIPT_DIR" > /var/lib/pirate/original-bundle-path
+chown pirate:pirate /var/lib/pirate/original-bundle-path
+chmod 0644 /var/lib/pirate/original-bundle-path
+
 echo "==> sudoers (SMB helpers + OTA server-stack apply; только фиксированные пути)"
 SUDOERS_PIRATE=/etc/sudoers.d/99-pirate-smb
 cat >"$SUDOERS_PIRATE" <<'SUDOERS'
@@ -367,6 +461,9 @@ GRPC_ENDPOINT=http://[::1]:50051
 CONTROL_API_PORT=8080
 RUST_LOG=info
 CONTROL_API_BIND=127.0.0.1
+DEPLOY_ALLOW_SERVER_STACK_UPDATE=${DEPLOY_ALLOW_SERVER_STACK_UPDATE_VALUE}
+CONTROL_API_HOST_STATS_SERIES=${CONTROL_API_HOST_STATS_SERIES_VALUE}
+CONTROL_API_HOST_STATS_STREAM=${CONTROL_API_HOST_STATS_STREAM_VALUE}
 EOF
   if [[ "$pirate_UI" == "1" ]]; then
     cat <<EOF

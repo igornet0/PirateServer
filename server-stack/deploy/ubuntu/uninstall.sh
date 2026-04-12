@@ -10,6 +10,10 @@
 #
 # Дополнительно удалить каталог распаковки архива (после завершения скрипта, в фоне):
 #   sudo ./uninstall.sh --remove-bundle-dir
+#   sudo ./uninstall.sh --remove-bundle-dir=/path/to/pirate-linux-aarch64
+# Без аргумента: путь из /var/lib/pirate/original-bundle-path (пишет install.sh), иначе каталог,
+# где лежит этот скрипт (распаковка архива). Копия скриптов в /usr/local/share/pirate-uninstall
+# не удаляется этим флагом (путь попадёт под защиту от опасных каталогов).
 #
 # Запуск: sudo ./uninstall.sh [опции]
 
@@ -24,6 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SERVICES_ONLY=0
 REMOVE_BUNDLE_DIR=0
+BUNDLE_DIR_EXPLICIT=""
 
 usage() {
   echo "Использование: sudo $0 [опции]" >&2
@@ -36,8 +41,8 @@ usage() {
   echo "                      бинарники в /usr/local/bin и /etc/pirate-deploy.env." >&2
   echo "                      Каталог /var/lib/pirate, пользователь pirate, PostgreSQL и" >&2
   echo "                      /usr/local/lib/pirate не удаляются." >&2
-  echo "  --remove-bundle-dir После успешного завершения удалить каталог распаковки (где лежит" >&2
-  echo "                      этот скрипт). Выполняется с задержкой в фоне." >&2
+  echo "  --remove-bundle-dir[=PATH]  После успешного завершения удалить каталог распаковки" >&2
+  echo "                      (PATH или запись install, иначе каталог этого скрипта). В фоне." >&2
   echo "  -h, --help          Справка." >&2
 }
 
@@ -49,6 +54,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --remove-bundle-dir)
       REMOVE_BUNDLE_DIR=1
+      shift
+      ;;
+    --remove-bundle-dir=*)
+      REMOVE_BUNDLE_DIR=1
+      BUNDLE_DIR_EXPLICIT="${1#*=}"
       shift
       ;;
     -h|--help)
@@ -66,6 +76,30 @@ done
 if [[ "$REMOVE_BUNDLE_DIR" == "1" ]] && [[ "$SERVICES_ONLY" == "1" ]]; then
   echo "Ошибка: --remove-bundle-dir несовместим с --services-only (данные не очищены)." >&2
   exit 1
+fi
+
+BUNDLE_DIR_TO_REMOVE=""
+if [[ "$REMOVE_BUNDLE_DIR" == "1" ]]; then
+  if [[ -n "$BUNDLE_DIR_EXPLICIT" ]]; then
+    BUNDLE_DIR_TO_REMOVE="$BUNDLE_DIR_EXPLICIT"
+  elif [[ -f /var/lib/pirate/original-bundle-path ]]; then
+    BUNDLE_DIR_TO_REMOVE="$(cat /var/lib/pirate/original-bundle-path)"
+  else
+    BUNDLE_DIR_TO_REMOVE="$SCRIPT_DIR"
+  fi
+  case "${BUNDLE_DIR_TO_REMOVE}" in
+    /*) ;;
+    *)
+      echo "Ошибка: путь для --remove-bundle-dir должен быть абсолютным: ${BUNDLE_DIR_TO_REMOVE}" >&2
+      exit 1
+      ;;
+  esac
+  case "${BUNDLE_DIR_TO_REMOVE}" in
+    / | /usr | /usr/* | /etc | /etc/* | /bin | /bin/* | /sbin | /sbin/*)
+      echo "Ошибка: отказ удалить небезопасный путь: ${BUNDLE_DIR_TO_REMOVE}" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 echo "==> остановка и отключение служб"
@@ -155,15 +189,17 @@ else
 fi
 
 if [[ "$REMOVE_BUNDLE_DIR" == "1" ]]; then
-  case "$SCRIPT_DIR" in
-    / | /usr | /usr/* | /etc | /etc/* | /bin | /bin/* | /sbin | /sbin/*)
-      echo "Ошибка: отказ удалить небезопасный путь: $SCRIPT_DIR" >&2
-      exit 1
-      ;;
-  esac
   echo ""
-  echo "==> отложенное удаление каталога распаковки: $SCRIPT_DIR"
+  echo "==> отложенное удаление каталога распаковки: $BUNDLE_DIR_TO_REMOVE"
   # Удаление после выхода процесса: иначе удаляется открытый скрипт.
-  nohup bash -c "sleep 1; rm -rf \"${SCRIPT_DIR}\"" >/dev/null 2>&1 &
-  echo "    Запущено в фоне (через ~1 с). Проверьте: ls $(dirname "$SCRIPT_DIR")"
+  nohup bash -c "sleep 1; rm -rf \"${BUNDLE_DIR_TO_REMOVE}\"" >/dev/null 2>&1 &
+  echo "    Запущено в фоне (через ~1 с). Проверьте: ls $(dirname "$BUNDLE_DIR_TO_REMOVE")"
+fi
+
+if [[ "$SERVICES_ONLY" != "1" ]]; then
+  if [[ -d /usr/local/share/pirate-uninstall ]]; then
+    echo ""
+    echo "==> удаление копии uninstall-скриптов: /usr/local/share/pirate-uninstall"
+    rm -rf /usr/local/share/pirate-uninstall
+  fi
 fi

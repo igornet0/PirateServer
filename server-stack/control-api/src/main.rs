@@ -13,6 +13,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use futures::Stream;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use clap::{Parser, Subcommand};
 use deploy_auth::{
@@ -647,6 +648,186 @@ async fn api_history(
         .map_err(Into::into)
 }
 
+#[derive(serde::Deserialize)]
+struct GrpcSessionsQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+    /// Seconds within which a peer counts as "online" (default 120, clamped 10–86400).
+    #[serde(default)]
+    online_secs: Option<i64>,
+    /// When true, `recent` includes `tcp_open` / `tcp_close` rows (verbose audit).
+    #[serde(default)]
+    include_tcp_audit: bool,
+}
+
+#[derive(serde::Serialize)]
+struct GrpcSessionsSummaryView {
+    total_events: i64,
+    tcp_open_total: i64,
+    tcp_close_total: i64,
+    /// Best-effort: max(0, tcp_open_total − tcp_close_total).
+    estimated_open_tcp: i64,
+    /// Same as tcp_close_total (each `tcp_close` row is one logged disconnect).
+    closed_tcp_events: i64,
+    by_kind: HashMap<String, i64>,
+}
+
+#[derive(serde::Serialize)]
+struct GrpcSessionEventView {
+    id: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    kind: String,
+    peer_ip: String,
+    status: String,
+    grpc_method: String,
+    client_public_key_b64: Option<String>,
+    detail: String,
+}
+
+#[derive(serde::Serialize)]
+struct GrpcSessionPeerView {
+    client_public_key_b64: String,
+    last_seen_at: chrono::DateTime<chrono::Utc>,
+    last_peer_ip: String,
+    last_grpc_method: String,
+    online: bool,
+    connection_kind: i32,
+    last_cpu_percent: Option<f64>,
+    last_ram_percent: Option<f64>,
+    last_gpu_percent: Option<f64>,
+    proxy_bytes_in_total: u64,
+    proxy_bytes_out_total: u64,
+}
+
+#[derive(serde::Serialize)]
+struct ServerBenchmarkView {
+    run_at: chrono::DateTime<chrono::Utc>,
+    cpu_score: i32,
+    ram_score: i32,
+    storage_score: i32,
+    gpu_score: Option<i32>,
+}
+
+#[derive(serde::Serialize)]
+struct GrpcSessionsPageView {
+    summary: GrpcSessionsSummaryView,
+    /// One row per client key: last activity from the metadata DB (gRPC-oriented).
+    peers: Vec<GrpcSessionPeerView>,
+    recent: Vec<GrpcSessionEventView>,
+    /// Latest `deploy-server resource-benchmark` row for this metadata DB (if any).
+    server_benchmark: Option<ServerBenchmarkView>,
+}
+
+async fn api_grpc_sessions(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<GrpcSessionsQuery>,
+) -> Result<Json<GrpcSessionsPageView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let Some(db) = s.plane.db.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "metadata database is not configured (set DEPLOY_SQLITE_URL or DATABASE_URL)",
+        ));
+    };
+    let lim = q.limit.unwrap_or(100).clamp(1, 500);
+    let online_secs = q.online_secs.unwrap_or(120).clamp(10, 86_400);
+    let total = db
+        .count_grpc_session_events_total()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let kind_rows = db
+        .fetch_grpc_session_kind_counts()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut by_kind: HashMap<String, i64> = HashMap::new();
+    for row in kind_rows {
+        by_kind.insert(row.kind, row.event_count);
+    }
+    let tcp_open_total = *by_kind.get("tcp_open").unwrap_or(&0);
+    let tcp_close_total = *by_kind.get("tcp_close").unwrap_or(&0);
+    let estimated_open_tcp = (tcp_open_total - tcp_close_total).max(0);
+    let peer_rows = db
+        .fetch_grpc_session_peer_last_activity()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let now = chrono::Utc::now();
+    let mut peers: Vec<GrpcSessionPeerView> = Vec::new();
+    for r in peer_rows {
+        let kind = db
+            .fetch_grpc_peer_profile_kind(&r.client_pubkey_b64)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let snap = db
+            .fetch_grpc_peer_resource_snapshot(&r.client_pubkey_b64)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let (bin, bout) = db
+            .sum_grpc_proxy_traffic_totals(&r.client_pubkey_b64)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let online = (now - r.last_created_at).num_seconds() <= online_secs;
+        peers.push(GrpcSessionPeerView {
+            client_public_key_b64: r.client_pubkey_b64,
+            last_seen_at: r.last_created_at,
+            last_peer_ip: r.last_peer_ip,
+            last_grpc_method: r.last_grpc_method,
+            online,
+            connection_kind: kind.unwrap_or(0) as i32,
+            last_cpu_percent: snap.as_ref().and_then(|s| s.cpu_percent),
+            last_ram_percent: snap.as_ref().and_then(|s| s.ram_percent),
+            last_gpu_percent: snap.as_ref().and_then(|s| s.gpu_percent),
+            proxy_bytes_in_total: bin,
+            proxy_bytes_out_total: bout,
+        });
+    }
+    let server_benchmark = db
+        .fetch_latest_server_resource_benchmark()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map(|b| ServerBenchmarkView {
+            run_at: b.run_at,
+            cpu_score: b.cpu_score,
+            ram_score: b.ram_score,
+            storage_score: b.storage_score,
+            gpu_score: b.gpu_score,
+        });
+    let recent_rows = if q.include_tcp_audit {
+        db.fetch_grpc_session_events_page(0, lim)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        db.fetch_grpc_session_events_page_no_tcp(0, lim)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
+    let recent: Vec<GrpcSessionEventView> = recent_rows
+        .into_iter()
+        .map(|r| GrpcSessionEventView {
+            id: r.id,
+            created_at: r.created_at,
+            kind: r.kind,
+            peer_ip: r.peer_ip,
+            status: r.status,
+            grpc_method: r.grpc_method,
+            client_public_key_b64: r.client_pubkey_b64,
+            detail: r.detail,
+        })
+        .collect();
+    Ok(Json(GrpcSessionsPageView {
+        summary: GrpcSessionsSummaryView {
+            total_events: total,
+            tcp_open_total,
+            tcp_close_total,
+            estimated_open_tcp,
+            closed_tcp_events: tcp_close_total,
+            by_kind,
+        },
+        peers,
+        recent,
+        server_benchmark,
+    }))
+}
+
 async fn api_rollback(
     State(s): State<ApiState>,
     headers: HeaderMap,
@@ -1083,6 +1264,7 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/releases", get(api_releases))
         .route("/api/v1/projects", get(api_projects))
         .route("/api/v1/history", get(api_history))
+        .route("/api/v1/grpc-sessions", get(api_grpc_sessions))
         .route("/api/v1/database-info", get(api_database_info))
         .route("/api/v1/database/schemas", get(api_database_schemas))
         .route("/api/v1/database/tables", get(api_database_tables))
