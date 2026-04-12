@@ -930,6 +930,48 @@ pre {
   letter-spacing: 0.04em;
 }
 
+.grpc-sessions-block {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.grpc-sessions-summary {
+  margin: 0.35rem 0 0.75rem;
+  font-size: 0.875rem;
+}
+
+.grpc-sessions-sub {
+  margin-top: 1rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.9375rem;
+}
+
+.grpc-sessions-tcp-details {
+  margin-top: 1rem;
+}
+
+.grpc-sessions-tcp-details summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.grpc-sessions-scroll {
+  max-height: 22rem;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.grpc-sessions-table td {
+  vertical-align: top;
+  word-break: break-word;
+}
+
+.danger-text {
+  color: var(--status-crit);
+}
+
 textarea#nginx-editor {
   width: 100%;
   box-sizing: border-box;

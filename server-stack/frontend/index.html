@@ -142,6 +142,92 @@
                   Server information
                 </button>
               </div>
+              <section id="grpc-sessions-section" class="panel-block grpc-sessions-block">
+                <h3 class="subheading" data-i18n="status.sessions.heading">gRPC client connections</h3>
+                <p class="muted" data-i18n="status.sessions.hint">
+                  Peer keys, last IP, and presence; recent gRPC-level audit (TCP noise hidden by default).
+                </p>
+                <div id="grpc-sessions-summary" class="grpc-sessions-summary muted"></div>
+                <div id="grpc-sessions-summary-peers" class="grpc-sessions-summary muted"></div>
+                <div id="grpc-sessions-benchmark" class="grpc-sessions-summary muted"></div>
+                <h4 class="subheading grpc-sessions-sub" data-i18n="status.sessions.peersHeading">
+                  Registered gRPC clients
+                </h4>
+                <p class="muted" data-i18n="status.sessions.peersHint"></p>
+                <div class="grpc-sessions-scroll">
+                  <table
+                    class="proj-table grpc-sessions-table"
+                    aria-label="gRPC peer keys"
+                  >
+                    <thead>
+                      <tr>
+                        <th data-i18n="status.sessions.colClient">Client key</th>
+                        <th data-i18n="status.sessions.colConnKind">Kind</th>
+                        <th data-i18n="status.sessions.colCpu">CPU</th>
+                        <th data-i18n="status.sessions.colRam">RAM</th>
+                        <th data-i18n="status.sessions.colGpu">GPU</th>
+                        <th data-i18n="status.sessions.colProxyIn">Proxy in</th>
+                        <th data-i18n="status.sessions.colProxyOut">Proxy out</th>
+                        <th data-i18n="status.sessions.colIp">IP</th>
+                        <th data-i18n="status.sessions.colMethod">Method</th>
+                        <th data-i18n="status.sessions.colLastSeen">Last seen</th>
+                        <th data-i18n="status.sessions.colOnline">Presence</th>
+                      </tr>
+                    </thead>
+                    <tbody id="grpc-sessions-peers-tbody"></tbody>
+                  </table>
+                </div>
+                <h4 class="subheading grpc-sessions-sub" data-i18n="status.sessions.auditHeading">
+                  Recent gRPC audit events
+                </h4>
+                <p class="muted" data-i18n="status.sessions.auditHint"></p>
+                <div class="grpc-sessions-scroll">
+                  <table
+                    class="proj-table grpc-sessions-table"
+                    aria-describedby="grpc-sessions-section"
+                  >
+                    <thead>
+                      <tr>
+                        <th data-i18n="status.sessions.colTime">Time</th>
+                        <th data-i18n="status.sessions.colKind">Kind</th>
+                        <th data-i18n="status.sessions.colIp">IP</th>
+                        <th data-i18n="status.sessions.colStatus">Status</th>
+                        <th data-i18n="status.sessions.colMethod">Method</th>
+                        <th data-i18n="status.sessions.colClient">Client key</th>
+                        <th data-i18n="status.sessions.colDetail">Detail</th>
+                      </tr>
+                    </thead>
+                    <tbody id="grpc-sessions-audit-tbody"></tbody>
+                  </table>
+                </div>
+                <details id="grpc-sessions-tcp-details" class="grpc-sessions-tcp-details">
+                  <summary data-i18n="status.sessions.tcpAuditToggle">
+                    Show raw TCP connection events
+                  </summary>
+                  <p class="muted" data-i18n="status.sessions.tcpAuditHint"></p>
+                  <div class="grpc-sessions-scroll">
+                    <table class="proj-table grpc-sessions-table" aria-label="TCP audit">
+                      <thead>
+                        <tr>
+                          <th data-i18n="status.sessions.colTime">Time</th>
+                          <th data-i18n="status.sessions.colKind">Kind</th>
+                          <th data-i18n="status.sessions.colIp">IP</th>
+                          <th data-i18n="status.sessions.colStatus">Status</th>
+                          <th data-i18n="status.sessions.colMethod">Method</th>
+                          <th data-i18n="status.sessions.colClient">Client key</th>
+                          <th data-i18n="status.sessions.colDetail">Detail</th>
+                        </tr>
+                      </thead>
+                      <tbody id="grpc-sessions-tcp-tbody"></tbody>
+                    </table>
+                  </div>
+                  <p id="grpc-sessions-tcp-loading" class="muted" hidden data-i18n="status.sessions.tcpAuditLoading">
+                    Loading…
+                  </p>
+                  <p id="grpc-sessions-tcp-error" class="muted danger-text" hidden></p>
+                </details>
+                <p id="grpc-sessions-error" class="muted danger-text" hidden></p>
+              </section>
               <div id="local-client-bundle" class="local-client-bundle" hidden>
                 <h3 class="subheading" data-i18n="status.localClient.heading">
                   Local client connection

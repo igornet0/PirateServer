@@ -2,7 +2,12 @@
 
 mod admin_seed;
 mod auth;
+mod benchmark;
 mod deploy_service;
+mod wire_relay;
+mod metrics_http;
+mod proxy_session;
+mod session_audit;
 
 use clap::{Parser, Subcommand};
 use deploy_auth::format_install_bundle;
@@ -10,7 +15,12 @@ use deploy_control::NetCounters;
 use deploy_db::DbStore;
 use deploy_proto::deploy::deploy_service_server::DeployServiceServer;
 use deploy_service::DeployServiceImpl;
+use metrics_http::{serve_metrics_loop, ProxyTunnelMetrics};
+use futures_util::stream::TryStreamExt;
+use session_audit::{AuditedTcpStream, SessionAuditHub};
 use std::collections::HashMap;
+use tokio::net::TcpListener;
+use tonic::transport::server::TcpIncoming;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,6 +47,9 @@ enum Commands {
     /// Create or update a dashboard user (Argon2 hash in `dashboard_users`). Requires metadata DB URL.
     #[command(name = "dashboard-add-user")]
     DashboardAddUser(DashboardUserArgs),
+    /// Run CPU/RAM/disk (and optional GPU) benchmarks; store scores 0–1000 in the metadata DB.
+    #[command(name = "resource-benchmark")]
+    ResourceBenchmark,
 }
 
 #[derive(Parser, Debug)]
@@ -103,6 +116,10 @@ struct Args {
     /// URL shown in the install bundle (reachable gRPC endpoint for clients). Default from `DEPLOY_GRPC_PUBLIC_URL` or loopback.
     #[arg(long, env = "DEPLOY_GRPC_PUBLIC_URL")]
     public_url: Option<String>,
+
+    /// Optional `host:port` for Prometheus text metrics (`GET /metrics`). Env: `DEPLOY_METRICS_BIND`.
+    #[arg(long, env = "DEPLOY_METRICS_BIND")]
+    metrics_bind: Option<String>,
 }
 
 #[cfg(unix)]
@@ -185,6 +202,20 @@ fn metadata_database_url(args: &Args) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+async fn resource_benchmark_cmd(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_not_root()?;
+    let Some(ref url) = metadata_database_url(args) else {
+        return Err(
+            "deploy-server resource-benchmark: set DEPLOY_SQLITE_URL or DATABASE_URL".into(),
+        );
+    };
+    let store = DbStore::connect(url).await?;
+    store.migrate().await?;
+    benchmark::run_resource_benchmark(&store).await?;
+    println!("ok: resource benchmark row inserted");
+    Ok(())
+}
+
 async fn dashboard_add_user_cmd(
     args: &Args,
     uargs: &DashboardUserArgs,
@@ -222,6 +253,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(Commands::DashboardAddUser(ref uargs)) = top.command {
         return dashboard_add_user_cmd(&top.run, uargs).await;
+    }
+    if matches!(top.command, Some(Commands::ResourceBenchmark)) {
+        return resource_benchmark_cmd(&top.run).await;
     }
 
     let args = top.run;
@@ -300,6 +334,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    let session_hub = SessionAuditHub::new(db.clone());
+    let proxy_metrics = Arc::new(ProxyTunnelMetrics::default());
+    if let Some(s) = args.metrics_bind.as_ref().map(|x| x.trim()).filter(|s| !s.is_empty()) {
+        if let Ok(sock) = s.parse::<SocketAddr>() {
+            let m = proxy_metrics.clone();
+            tokio::spawn(serve_metrics_loop(sock, m));
+        } else {
+            info!(bind = %s, "DEPLOY_METRICS_BIND: invalid address, metrics disabled");
+        }
+    }
     let svc = DeployServiceServer::new(DeployServiceImpl::new(
         args.root,
         args.max_upload_bytes,
@@ -312,12 +356,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_auth,
         host_net,
         log_tail_path,
+        session_hub.clone(),
+        proxy_metrics,
     ));
+
+    let listener = TcpListener::bind(addr).await?;
+    let tcp_incoming =
+        TcpIncoming::from_listener(listener, true, None).map_err(|e| format!("listen: {e}"))?;
+    let incoming = tcp_incoming.map_ok({
+        let hub = session_hub.clone();
+        move |tcp| AuditedTcpStream::new(tcp, hub.clone())
+    });
 
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve(addr)
-        .await?;
+        .serve_with_incoming(incoming)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
     Ok(())
 }

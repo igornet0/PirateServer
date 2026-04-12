@@ -1,16 +1,20 @@
 //! Deploy: stream → temp file, SHA-256, tar unpack, symlink, process control.
 
+use crate::metrics_http::ProxyTunnelMetrics;
+use crate::proxy_session;
 use deploy_core::{
     normalize_project_id, project_deploy_root, read_current_version_from_symlink,
-    read_server_stack_bundle_version_from_var_lib, refresh_process_state,
+    read_host_stack_ui_flags, read_server_stack_bundle_version_from_var_lib, refresh_process_state,
     release_dir_for_version, status_current_version_display, validate_project_id,
     validate_version as validate_version_core, AppState,
 };
-use deploy_db::DbStore;
 use crate::auth::ServerAuth;
+use crate::session_audit::{peer_ip_from_request, register_authenticated_client, SessionAuditHub};
+use deploy_auth::{parse_verifying_key_b64, raw_pubkey_b64_url, META_PUBKEY};
+use deploy_db::{DbStore, GrpcProxySessionRow};
 use deploy_auth::{
     now_unix_ms, signing_payload, verify_rpc_metadata, verify_upload_metadata,
-    verify_upload_server_stack_metadata, META_PROJECT, META_VERSION,
+    verify_upload_server_stack_metadata, META_PROJECT, META_STACK_APPLY_SHA256, META_VERSION,
 };
 use deploy_control::{
     collect_cpu_detail, collect_disk_detail, collect_host_stats, collect_memory_detail,
@@ -23,22 +27,36 @@ use std::collections::HashMap;
 use deploy_proto::deploy::{
     deploy_service_server::DeployService, host_stats_detail_response::Detail as HostStatsDetailOneof,
     proxy_client_msg, proxy_server_msg,
-    CpuDetailProto, CpuTimesProto, DeployChunk, DeployResponse, DiskDetailProto, DiskIoSummaryProto,
+    CloseConnectionRequest, CloseConnectionResponse, ConnectionProbeChunk, ConnectionProbeResult,
+    CpuDetailProto, CpuTimesProto, CreateConnectionRequest, CreateConnectionResponse,
+    DeployChunk, DeployResponse, DiskDetailProto, DiskIoSummaryProto,
+    GetStatsRequest, GetStatsResponse,
     HostLogLineProto, HostMountStatsProto, HostNetInterfaceProto, HostStatsDetailKind,
     HostStatsDetailRequest, HostStatsDetailResponse, HostStatsRequest, HostStatsResponse, LoadAvgProto,
     MemoryDetailProto, MemoryOverviewProto, NetworkDetailProto, PairRequest, PairResponse,
     ProcessCpuProto, ProcessDiskProto, ProcessMemProto, ProcessRowProto, ProcessesDetailProto,
     ProxyClientMsg, ProxyOpenResult, ProxyServerMsg,
-    RestartProcessRequest, RollbackRequest, RollbackResponse, SeriesHintProto, ServerStackChunk,
-    ServerStackInfo, ServerStackInfoRequest, ServerStackResponse, StatusRequest, StatusResponse,
+    ReportResourceUsageRequest, ReportResourceUsageResponse,
+    RestartProcessRequest, RollbackRequest, RollbackResponse, SeriesHintProto, StackApplyMode,
+    StackApplyOptions, ServerStackChunk, ServerStackInfo, ServerStackInfoRequest, ServerStackResponse,
+    StatusRequest, StatusResponse,
     StopProcessRequest,
+    ListSessionsRequest, ListSessionsResponse, QuerySessionLogsRequest, QuerySessionLogsResponse,
+    SessionLogEvent, SessionPeerRow,
+    UpdateConnectionProfileRequest, UpdateConnectionProfileResponse,
+    UpdateProxySettingsRequest, UpdateProxySettingsResponse,
 };
 use futures_util::Stream;
 use futures_util::StreamExt;
+use prost::Message;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 use std::time::Duration;
 
 use crate::auth::{sign_pair_response, verify_pair_signature};
@@ -47,10 +65,145 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use rand::RngCore as _;
 use tracing::{error, info, warn};
+
+fn floor_to_utc_hour(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    let ts = dt.timestamp();
+    let hour_floor = ts - (ts.rem_euclid(3600));
+    chrono::DateTime::from_timestamp(hour_floor, 0)
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or(dt)
+}
+
+async fn session_peer_row_enriched(
+    db: &DbStore,
+    pk: String,
+    last_seen_ms: i64,
+    last_peer_ip: String,
+    last_grpc_method: String,
+) -> Result<SessionPeerRow, deploy_db::DbError> {
+    let kind_db = db
+        .fetch_grpc_peer_profile_kind(&pk)
+        .await?
+        .unwrap_or(0) as i32;
+    let snap = db.fetch_grpc_peer_resource_snapshot(&pk).await?;
+    let (proxy_in, proxy_out) = db.sum_grpc_proxy_traffic_totals(&pk).await?;
+    Ok(SessionPeerRow {
+        client_public_key_b64: pk,
+        last_seen_ms,
+        last_peer_ip,
+        last_grpc_method,
+        connection_kind: kind_db,
+        last_cpu_percent: snap.as_ref().and_then(|s| s.cpu_percent),
+        last_ram_percent: snap.as_ref().and_then(|s| s.ram_percent),
+        last_gpu_percent: snap.as_ref().and_then(|s| s.gpu_percent),
+        resource_reported_at_ms: snap
+            .as_ref()
+            .map(|s| s.reported_at.timestamp_millis())
+            .unwrap_or(0),
+        ram_used_bytes: snap
+            .as_ref()
+            .and_then(|s| s.ram_used_bytes)
+            .map(|v| v.max(0) as u64),
+        storage_used_bytes: snap
+            .as_ref()
+            .and_then(|s| s.storage_used_bytes)
+            .map(|v| v.max(0) as u64),
+        proxy_bytes_in_total: proxy_in,
+        proxy_bytes_out_total: proxy_out,
+    })
+}
 
 fn validate_version(version: &str) -> Result<(), Status> {
     validate_version_core(version).map_err(|e| Status::invalid_argument(e))
+}
+
+const CONNECTION_PROBE_MAX_UPLOAD_BYTES: u64 = 4 * 1024 * 1024;
+const CONNECTION_PROBE_MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
+const CONNECTION_PROBE_DEFAULT_DOWNLOAD_BYTES: usize = 256 * 1024;
+
+fn stack_apply_options_encoded_bytes(opts: &StackApplyOptions) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = opts.encode(&mut buf);
+    buf
+}
+
+/// If metadata carries a digest, it must match the encoded last-chunk options.
+fn verify_stack_apply_digest_matches(
+    meta: &tonic::metadata::MetadataMap,
+    opts: &Option<StackApplyOptions>,
+) -> Result<(), Status> {
+    let expected_hex = meta
+        .get(META_STACK_APPLY_SHA256)
+        .and_then(|v| v.to_str().ok());
+    match opts {
+        None => {
+            if expected_hex.is_some() {
+                return Err(Status::invalid_argument(
+                    "x-deploy-stack-apply-sha256 set but no apply_options on last chunk",
+                ));
+            }
+            Ok(())
+        }
+        Some(o) => {
+            let buf = stack_apply_options_encoded_bytes(o);
+            let digest = hex::encode(Sha256::digest(&buf));
+            match expected_hex {
+                None => Ok(()),
+                Some(h) if h.trim() == digest => Ok(()),
+                Some(_) => Err(Status::invalid_argument(
+                    "stack apply options digest mismatch metadata",
+                )),
+            }
+        }
+    }
+}
+
+fn bundle_has_ui_static(bundle_root: &Path) -> bool {
+    if bundle_root.join(".bundle-no-ui").exists() {
+        return false;
+    }
+    bundle_root.join("share/ui/dist/index.html").is_file()
+}
+
+fn validate_stack_apply_transition(
+    opts: &StackApplyOptions,
+    bundle_root: &Path,
+    host_dashboard: bool,
+) -> Result<(), Status> {
+    let mode = opts.mode;
+    let has_ui = bundle_has_ui_static(bundle_root);
+    match mode {
+        x if x == StackApplyMode::Unspecified as i32 || x == StackApplyMode::None as i32 => Ok(()),
+        x if x == StackApplyMode::EnableUi as i32 => {
+            if !has_ui {
+                return Err(Status::failed_precondition(
+                    "StackApplyMode ENABLE_UI requires bundle with share/ui/dist (no .bundle-no-ui)",
+                ));
+            }
+            if host_dashboard {
+                return Err(Status::failed_precondition(
+                    "host already has dashboard JWT; ENABLE_UI transition not applicable",
+                ));
+            }
+            Ok(())
+        }
+        x if x == StackApplyMode::DisableUi as i32 => {
+            if has_ui {
+                return Err(Status::failed_precondition(
+                    "StackApplyMode DISABLE_UI requires bundle without UI static (or .bundle-no-ui)",
+                ));
+            }
+            if !host_dashboard {
+                return Err(Status::failed_precondition(
+                    "host has no dashboard JWT; DISABLE_UI transition not applicable",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(Status::invalid_argument("unknown StackApplyMode")),
+    }
 }
 
 #[derive(Clone)]
@@ -70,6 +223,8 @@ pub struct DeployServiceImpl {
     pub host_net: Arc<std::sync::Mutex<Option<NetCounters>>>,
     /// Optional app log path for `log_tail` in host stats (`DEPLOY_HOST_STATS_LOG_TAIL`).
     pub log_tail_path: Option<PathBuf>,
+    pub session_hub: Arc<SessionAuditHub>,
+    pub proxy_metrics: Arc<ProxyTunnelMetrics>,
 }
 
 impl DeployServiceImpl {
@@ -85,6 +240,8 @@ impl DeployServiceImpl {
         auth: Option<Arc<ServerAuth>>,
         host_net: Arc<std::sync::Mutex<Option<NetCounters>>>,
         log_tail_path: Option<PathBuf>,
+        session_hub: Arc<SessionAuditHub>,
+        proxy_metrics: Arc<ProxyTunnelMetrics>,
     ) -> Self {
         Self {
             base_root,
@@ -98,6 +255,8 @@ impl DeployServiceImpl {
             auth,
             host_net,
             log_tail_path,
+            session_hub,
+            proxy_metrics,
         }
     }
 
@@ -271,9 +430,25 @@ impl DeployService for DeployServiceImpl {
         &self,
         request: Request<PairRequest>,
     ) -> Result<Response<PairResponse>, Status> {
-        let auth = self.auth.as_ref().ok_or_else(|| {
-            Status::failed_precondition("authentication disabled; pairing unavailable")
-        })?;
+        let peer_ip = peer_ip_from_request(&request);
+        let pubkey_slot = request
+            .extensions()
+            .get::<crate::session_audit::AuditedConnectInfo>()
+            .map(|c| c.pubkey_slot.clone());
+        let auth = match self.auth.as_ref() {
+            Some(a) => a,
+            None => {
+                self.session_hub.log_pair_outcome(
+                    false,
+                    &peer_ip,
+                    None,
+                    "authentication disabled; pairing unavailable",
+                );
+                return Err(Status::failed_precondition(
+                    "authentication disabled; pairing unavailable",
+                ));
+            }
+        };
         let _ = auth
             .reload_pairing_code()
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -282,22 +457,55 @@ impl DeployService for DeployServiceImpl {
             || r.nonce.is_empty()
             || r.client_signature_b64.is_empty()
         {
+            self.session_hub
+                .log_pair_outcome(false, &peer_ip, None, "missing pair fields");
             return Err(Status::invalid_argument("missing pair fields"));
         }
         let now = now_unix_ms();
         if (now - r.timestamp_ms).abs() > auth.config.max_clock_skew_ms {
+            self.session_hub.log_pair_outcome(
+                false,
+                &peer_ip,
+                Some(&r.client_public_key_b64),
+                "timestamp skew",
+            );
             return Err(Status::deadline_exceeded("timestamp skew"));
         }
-        auth.verify_pairing(&r.pairing_code)?;
-        verify_pair_signature(
+        if let Err(e) = auth.verify_pairing(&r.pairing_code) {
+            self.session_hub.log_pair_outcome(
+                false,
+                &peer_ip,
+                Some(&r.client_public_key_b64),
+                "invalid pairing code",
+            );
+            return Err(e);
+        }
+        if let Err(e) = verify_pair_signature(
             &r.client_public_key_b64,
             &auth.server_pubkey_b64,
             r.timestamp_ms,
             &r.nonce,
             &r.pairing_code,
             &r.client_signature_b64,
-        )?;
+        ) {
+            self.session_hub.log_pair_outcome(
+                false,
+                &peer_ip,
+                Some(&r.client_public_key_b64),
+                "bad pair signature",
+            );
+            return Err(e);
+        }
         auth.add_peer(&r.client_public_key_b64)?;
+        if let Some(slot) = pubkey_slot {
+            *slot.lock() = Some(r.client_public_key_b64.clone());
+        }
+        self.session_hub.log_pair_outcome(
+            true,
+            &peer_ip,
+            Some(&r.client_public_key_b64),
+            "paired",
+        );
         let server_sig = sign_pair_response(
             &auth.signing_key,
             &auth.server_pubkey_b64,
@@ -321,6 +529,7 @@ impl DeployService for DeployServiceImpl {
             let peers = auth.peers.read();
             verify_upload_metadata(&meta, &peers, &auth.config, &auth.nonce_tracker)
                 .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
         let expected_version = meta
             .get(META_VERSION)
@@ -543,10 +752,8 @@ impl DeployService for DeployServiceImpl {
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         let meta = request.metadata().clone();
-        let inner = request.into_inner();
-        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
-        let key = normalize_project_id(&inner.project_id);
-        let sign_payload = signing_payload("GetStatus", &inner.project_id, "");
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("GetStatus", &request.get_ref().project_id, "");
         if let Some(ref auth) = self.auth {
             let peers = auth.peers.read();
             verify_rpc_metadata(
@@ -558,7 +765,10 @@ impl DeployService for DeployServiceImpl {
                 &auth.nonce_tracker,
             )
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
+        let inner = request.into_inner();
+        let key = normalize_project_id(&inner.project_id);
         let root = project_deploy_root(&self.base_root, &inner.project_id);
         let mut map = self.states.lock().await;
         let st = map.entry(key.clone()).or_insert_with(AppState::default);
@@ -580,11 +790,9 @@ impl DeployService for DeployServiceImpl {
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
         let meta = request.metadata().clone();
-        let inner = request.into_inner();
-        let v = inner.version;
-        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
-        let key = normalize_project_id(&inner.project_id);
-        let sign_payload = signing_payload("Rollback", &inner.project_id, &v);
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let v = request.get_ref().version.clone();
+        let sign_payload = signing_payload("Rollback", &request.get_ref().project_id, &v);
         if let Some(ref auth) = self.auth {
             let peers = auth.peers.read();
             verify_rpc_metadata(
@@ -596,7 +804,10 @@ impl DeployService for DeployServiceImpl {
                 &auth.nonce_tracker,
             )
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
+        let inner = request.into_inner();
+        let key = normalize_project_id(&inner.project_id);
         validate_version(&v)?;
 
         let root = project_deploy_root(&self.base_root, &inner.project_id);
@@ -652,10 +863,8 @@ impl DeployService for DeployServiceImpl {
         request: Request<StopProcessRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         let meta = request.metadata().clone();
-        let inner = request.into_inner();
-        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
-        let key = normalize_project_id(&inner.project_id);
-        let sign_payload = signing_payload("StopProcess", &inner.project_id, "");
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("StopProcess", &request.get_ref().project_id, "");
         if let Some(ref auth) = self.auth {
             let peers = auth.peers.read();
             verify_rpc_metadata(
@@ -667,7 +876,10 @@ impl DeployService for DeployServiceImpl {
                 &auth.nonce_tracker,
             )
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
+        let inner = request.into_inner();
+        let key = normalize_project_id(&inner.project_id);
 
         let root = project_deploy_root(&self.base_root, &inner.project_id);
         let mut map = self.states.lock().await;
@@ -709,10 +921,8 @@ impl DeployService for DeployServiceImpl {
         request: Request<RestartProcessRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         let meta = request.metadata().clone();
-        let inner = request.into_inner();
-        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
-        let key = normalize_project_id(&inner.project_id);
-        let sign_payload = signing_payload("RestartProcess", &inner.project_id, "");
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("RestartProcess", &request.get_ref().project_id, "");
         if let Some(ref auth) = self.auth {
             let peers = auth.peers.read();
             verify_rpc_metadata(
@@ -724,7 +934,10 @@ impl DeployService for DeployServiceImpl {
                 &auth.nonce_tracker,
             )
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
+        let inner = request.into_inner();
+        let key = normalize_project_id(&inner.project_id);
 
         let root = project_deploy_root(&self.base_root, &inner.project_id);
         let bf = self.binary_fallback.clone();
@@ -787,9 +1000,8 @@ impl DeployService for DeployServiceImpl {
         request: Request<HostStatsRequest>,
     ) -> Result<Response<HostStatsResponse>, Status> {
         let meta = request.metadata().clone();
-        let inner = request.into_inner();
-        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
-        let sign_payload = signing_payload("GetHostStats", &inner.project_id, "");
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("GetHostStats", &request.get_ref().project_id, "");
         if let Some(ref auth) = self.auth {
             let peers = auth.peers.read();
             verify_rpc_metadata(
@@ -801,7 +1013,9 @@ impl DeployService for DeployServiceImpl {
                 &auth.nonce_tracker,
             )
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
+        let inner = request.into_inner();
 
         let root = project_deploy_root(&self.base_root, &inner.project_id);
         let host_net = self.host_net.clone();
@@ -825,9 +1039,8 @@ impl DeployService for DeployServiceImpl {
         request: Request<HostStatsDetailRequest>,
     ) -> Result<Response<HostStatsDetailResponse>, Status> {
         let meta = request.metadata().clone();
-        let inner = request.into_inner();
-        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
-        let sign_payload = signing_payload("GetHostStatsDetail", &inner.project_id, "");
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("GetHostStatsDetail", &request.get_ref().project_id, "");
         if let Some(ref auth) = self.auth {
             let peers = auth.peers.read();
             verify_rpc_metadata(
@@ -839,7 +1052,9 @@ impl DeployService for DeployServiceImpl {
                 &auth.nonce_tracker,
             )
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
+        let inner = request.into_inner();
 
         if inner.kind == HostStatsDetailKind::Unspecified as i32 {
             return Err(Status::invalid_argument("kind is required"));
@@ -907,6 +1122,7 @@ impl DeployService for DeployServiceImpl {
             let peers = auth.peers.read();
             verify_upload_server_stack_metadata(&meta, &peers, &auth.config, &auth.nonce_tracker)
                 .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
         let expected_version = meta
             .get(META_VERSION)
@@ -920,6 +1136,7 @@ impl DeployService for DeployServiceImpl {
         let mut expected_sha_hex: Option<String> = None;
         let mut temp_path: Option<PathBuf> = None;
         let mut file: Option<tokio::fs::File> = None;
+        let mut last_apply_options: Option<StackApplyOptions> = None;
 
         let staging_base = self.base_root.join(".stack-staging");
         tokio::fs::create_dir_all(&staging_base)
@@ -996,8 +1213,11 @@ impl DeployService for DeployServiceImpl {
                     ));
                 }
                 expected_sha_hex = Some(chunk.sha256_hex.clone());
+                last_apply_options = chunk.apply_options.clone();
             }
         }
+
+        verify_stack_apply_digest_matches(&meta, &last_apply_options)?;
 
         let version = version.ok_or_else(|| {
             if let Some(ref p) = temp_path {
@@ -1059,17 +1279,65 @@ impl DeployService for DeployServiceImpl {
             (None, None)
         };
 
+        let (host_dashboard, host_nginx) = read_host_stack_ui_flags();
+        let transition_apply = last_apply_options.as_ref().is_some_and(|o| {
+            o.mode == StackApplyMode::EnableUi as i32 || o.mode == StackApplyMode::DisableUi as i32
+        });
+        if transition_apply {
+            if let Some(ref o) = last_apply_options {
+                validate_stack_apply_transition(o, &bundle_root, host_dashboard)?;
+            }
+        }
+
+        let apply_json_path: Option<PathBuf> = if transition_apply {
+            let o = last_apply_options.as_ref().ok_or_else(|| {
+                Status::internal("internal: transition apply without options")
+            })?;
+            let mode_str = if o.mode == StackApplyMode::EnableUi as i32 {
+                "enable_ui"
+            } else {
+                "disable_ui"
+            };
+            let val = serde_json::json!({
+                "mode": mode_str,
+                "domain": o.domain,
+                "ui_admin_username": o.ui_admin_username,
+                "ui_admin_password": o.ui_admin_password,
+                "install_nginx": o.install_nginx,
+                "deploy_allow_server_stack_update": o.deploy_allow_server_stack_update,
+                "control_api_host_stats_series": o.control_api_host_stats_series,
+                "control_api_host_stats_stream": o.control_api_host_stats_stream,
+                "nginx_keep_api_proxy": o.nginx_keep_api_proxy,
+                "host_nginx_pirate_site": host_nginx,
+            });
+            let jp = staging_base.join(format!("apply_{}.json", version.replace(['/', '\\'], "_")));
+            tokio::fs::write(&jp, val.to_string())
+                .await
+                .map_err(|e| Status::internal(format!("write apply json: {e}")))?;
+            #[cfg(unix)]
+            tokio::fs::set_permissions(&jp, PermissionsExt::from_mode(0o600))
+                .await
+                .map_err(|e| Status::internal(format!("chmod apply json: {e}")))?;
+            Some(jp)
+        } else {
+            None
+        };
+
         let br = bundle_root.clone();
         let ver = version.clone();
-        let status = tokio::process::Command::new("sudo")
-            .arg("/usr/local/lib/pirate/pirate-apply-stack-bundle.sh")
+        let mut cmd = tokio::process::Command::new("sudo");
+        cmd.arg("/usr/local/lib/pirate/pirate-apply-stack-bundle.sh")
             .arg(&br)
-            .arg(&ver)
-            .status()
-            .await
-            .map_err(|e| format!("sudo apply stack: {e}"));
+            .arg(&ver);
+        if let Some(ref jp) = apply_json_path {
+            cmd.arg(jp);
+        }
+        let status = cmd.status().await.map_err(|e| format!("sudo apply stack: {e}"));
 
         let _ = tokio::fs::remove_file(&temp_path).await;
+        if let Some(ref jp) = apply_json_path {
+            let _ = tokio::fs::remove_file(jp).await;
+        }
         let _ = tokio::fs::remove_dir_all(&extract_dir).await;
 
         match status {
@@ -1107,6 +1375,7 @@ impl DeployService for DeployServiceImpl {
                 &auth.nonce_tracker,
             )
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
 
         let root = PathBuf::from(deploy_core::PIRATE_VAR_LIB);
@@ -1124,10 +1393,14 @@ impl DeployService for DeployServiceImpl {
 
         let deploy_server_binary_version = Some(env!("CARGO_PKG_VERSION").to_string());
 
+        let (host_dashboard_enabled, host_nginx_pirate_site) = read_host_stack_ui_flags();
+
         Ok(Response::new(ServerStackInfo {
             bundle_version,
             manifest_json,
             deploy_server_binary_version,
+            host_dashboard_enabled,
+            host_nginx_pirate_site,
         }))
     }
 
@@ -1151,6 +1424,7 @@ impl DeployService for DeployServiceImpl {
                 &auth.nonce_tracker,
             )
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
         }
 
         let mut inbound = request.into_inner();
@@ -1169,26 +1443,182 @@ impl DeployService for DeployServiceImpl {
             }
         };
 
-        let host = open.host.trim();
-        if host.is_empty() {
-            return Err(Status::invalid_argument("proxy host is empty"));
-        }
-        if open.port == 0 || open.port > 65535 {
-            return Err(Status::invalid_argument("invalid proxy port"));
-        }
-        proxy_allowlist_check(host)?;
+        // deploy_proto::ProxyWireMode: 0 = RAW_TCP_RELAY, 1 = VLESS, 2 = TROJAN, 3 = VMESS
+        let wire_mode = open.wire_mode.unwrap_or(0);
+        let wire_json = open.wire_config_json.clone().unwrap_or_default();
+        let is_raw_wire = wire_mode == 0;
 
-        let addr = format!("{}:{}", host, open.port);
+        let host = open.host.trim().to_string();
+        if is_raw_wire {
+            if host.is_empty() {
+                return Err(Status::invalid_argument("proxy host is empty"));
+            }
+            if open.port == 0 || open.port > 65535 {
+                return Err(Status::invalid_argument("invalid proxy port"));
+            }
+            proxy_allowlist_check(&host)?;
+        } else if wire_json.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "wire_config_json is required when wire_mode is not RAW_TCP_RELAY",
+            ));
+        }
+
+        let wire_params_parsed: Option<wire_protocol::WireParams> = if is_raw_wire {
+            None
+        } else {
+            Some(wire_protocol::WireParams::from_json(wire_json.trim()).map_err(|e| {
+                Status::invalid_argument(format!("wire_config_json: {e}"))
+            })?)
+        };
+
+        let client_pubkey_for_traffic = meta
+            .get(META_PUBKEY)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let db_opt = self.db.clone();
+        let metrics = self.proxy_metrics.clone();
+
+        let require_token = std::env::var("DEPLOY_PROXY_REQUIRE_SESSION_TOKEN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let token_s = open.session_token.trim();
+        let managed: Option<(GrpcProxySessionRow, crate::proxy_session::StoredPolicy)> =
+            if token_s.is_empty() {
+                if require_token {
+                    return Err(Status::failed_precondition(
+                        "DEPLOY_PROXY_REQUIRE_SESSION_TOKEN requires session token; use CreateConnection",
+                    ));
+                }
+                None
+            } else {
+                let db = self.db.as_ref().ok_or_else(|| {
+                    Status::failed_precondition("metadata database required for session token")
+                })?;
+                let pk = client_pubkey_for_traffic.as_deref().ok_or_else(|| {
+                    Status::unauthenticated("missing pubkey metadata for session token")
+                })?;
+                let hash = proxy_session::hash_session_token_hex(token_s);
+                let row = db
+                    .fetch_grpc_proxy_session_by_token_sha256(&hash)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let row = row.ok_or_else(|| Status::permission_denied("invalid session token"))?;
+                if row.revoked {
+                    return Err(Status::permission_denied("session revoked"));
+                }
+                if row.client_pubkey_b64 != pk {
+                    return Err(Status::permission_denied("session token not for this client key"));
+                }
+                let now = chrono::Utc::now();
+                if row.expires_at < now {
+                    return Err(Status::permission_denied("session expired"));
+                }
+                let policy = proxy_session::parse_policy_json(&row.policy_json)?;
+                if !proxy_session::is_schedule_allowed_stored(&policy, now)? {
+                    return Err(Status::permission_denied("outside access schedule"));
+                }
+                if proxy_session::max_duration_exceeded(&policy, row.first_open_at, now) {
+                    return Err(Status::permission_denied("session max duration exceeded"));
+                }
+                proxy_session::check_traffic_limits(
+                    &policy,
+                    row.bytes_in.max(0) as u64,
+                    row.bytes_out.max(0) as u64,
+                )?;
+                Some((row, policy))
+            };
+
+        let port = open.port;
+        let addr = format!("{host}:{port}");
+        let bytes_in = Arc::new(AtomicU64::new(0));
+        let bytes_out = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::channel::<Result<ProxyServerMsg, Status>>(64);
 
+        let managed_clone = managed.clone();
+        let stream_corr = open.stream_correlation_id.clone();
         tokio::spawn(async move {
+            metrics.tunnels_total.fetch_add(1, Ordering::Relaxed);
+            metrics.tunnels_open.fetch_add(1, Ordering::Relaxed);
+            struct OpenGuard<'a>(&'a Arc<ProxyTunnelMetrics>);
+            impl Drop for OpenGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.tunnels_open.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let _open_guard = OpenGuard(&metrics);
+
+            if !stream_corr.is_empty() {
+                tracing::info!(stream_correlation_id = %stream_corr, "ProxyTunnel");
+            }
+
+            if let Some(params) = wire_params_parsed {
+                match wire_mode {
+                    1 => {
+                        crate::wire_relay::run_vless_relay(
+                            inbound,
+                            tx,
+                            params,
+                            managed_clone,
+                            bytes_in,
+                            bytes_out,
+                            db_opt,
+                            client_pubkey_for_traffic,
+                            metrics.clone(),
+                        )
+                        .await;
+                    }
+                    2 => {
+                        crate::wire_relay::run_trojan_relay(
+                            inbound,
+                            tx,
+                            params,
+                            managed_clone,
+                            bytes_in,
+                            bytes_out,
+                            db_opt,
+                            client_pubkey_for_traffic,
+                            metrics.clone(),
+                        )
+                        .await;
+                    }
+                    3 => {
+                        crate::wire_relay::run_vmess_relay(
+                            inbound,
+                            tx,
+                            params,
+                            managed_clone,
+                            bytes_in,
+                            bytes_out,
+                            db_opt,
+                            client_pubkey_for_traffic,
+                            metrics.clone(),
+                        )
+                        .await;
+                    }
+                    _ => {
+                        metrics.tunnel_errors.fetch_add(1, Ordering::Relaxed);
+                        let _ = tx
+                            .send(Ok(ProxyServerMsg {
+                                body: Some(proxy_server_msg::Body::OpenResult(ProxyOpenResult {
+                                    ok: false,
+                                    error: "unknown wire_mode".into(),
+                                })),
+                            }))
+                            .await;
+                    }
+                }
+                return;
+            }
+
             let tcp = match tokio::time::timeout(
                 Duration::from_secs(30),
-                tokio::net::TcpStream::connect(addr),
+                tokio::net::TcpStream::connect(&addr),
             )
             .await
             {
                 Err(_) => {
+                    metrics.tunnel_errors.fetch_add(1, Ordering::Relaxed);
                     let _ = tx
                         .send(Ok(ProxyServerMsg {
                             body: Some(proxy_server_msg::Body::OpenResult(ProxyOpenResult {
@@ -1200,6 +1630,7 @@ impl DeployService for DeployServiceImpl {
                     return;
                 }
                 Ok(Err(e)) => {
+                    metrics.tunnel_errors.fetch_add(1, Ordering::Relaxed);
                     let _ = tx
                         .send(Ok(ProxyServerMsg {
                             body: Some(proxy_server_msg::Body::OpenResult(ProxyOpenResult {
@@ -1229,6 +1660,59 @@ impl DeployService for DeployServiceImpl {
             const MAX_PROXY_CHUNK: usize = 256 * 1024;
             let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
+            struct ActiveTracker {
+                last: Option<Instant>,
+                idle: Duration,
+                accum_ms: u64,
+            }
+            impl ActiveTracker {
+                fn new(idle_secs: u64) -> Self {
+                    Self {
+                        last: None,
+                        idle: Duration::from_secs(idle_secs.max(1)),
+                        accum_ms: 0,
+                    }
+                }
+                fn bump(&mut self) {
+                    let now = Instant::now();
+                    if let Some(prev) = self.last {
+                        let g = now.saturating_duration_since(prev);
+                        if g <= self.idle {
+                            self.accum_ms += g.as_millis() as u64;
+                        }
+                    }
+                    self.last = Some(now);
+                }
+            }
+
+            let idle_secs = managed_clone
+                .as_ref()
+                .map(|(_, p)| p.idle_timeout_sec())
+                .unwrap_or(60);
+            let active = Arc::new(StdMutex::new(ActiveTracker::new(idle_secs)));
+            let active_in = active.clone();
+            let active_out = active.clone();
+            let active_end = active;
+
+            let session_id_for_task = managed_clone
+                .as_ref()
+                .map(|(r, _)| r.session_id.clone());
+            let pk_for_task = managed_clone
+                .as_ref()
+                .map(|(r, _)| r.client_pubkey_b64.clone());
+            let policy_for_task = managed_clone.as_ref().map(|(_, p)| p.clone());
+            let policy_for_t_in = policy_for_task.clone();
+            let base_in = managed_clone
+                .as_ref()
+                .map(|(r, _)| r.bytes_in.max(0) as u64)
+                .unwrap_or(0);
+            let base_out = managed_clone
+                .as_ref()
+                .map(|(r, _)| r.bytes_out.max(0) as u64)
+                .unwrap_or(0);
+
+            let bin_count = bytes_in.clone();
+            let bytes_out_in = bytes_out.clone();
             let mut inbound = inbound;
             let t_in = tokio::spawn(async move {
                 while let Some(item) = inbound.next().await {
@@ -1249,6 +1733,20 @@ impl DeployService for DeployServiceImpl {
                                 let _ = tcp_write.shutdown().await;
                                 return Err(Status::invalid_argument("proxy chunk too large"));
                             }
+                            bin_count.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            if let Ok(mut a) = active_in.lock() {
+                                a.bump();
+                            }
+                            if let Some(ref pol) = policy_for_t_in {
+                                let bi = base_in + bin_count.load(Ordering::Relaxed);
+                                let bo = base_out + bytes_out_in.load(Ordering::Relaxed);
+                                if proxy_session::check_traffic_limits(pol, bi, bo).is_err() {
+                                    let _ = tcp_write.shutdown().await;
+                                    return Err(Status::resource_exhausted(
+                                        "proxy session traffic limit",
+                                    ));
+                                }
+                            }
                             if let Err(e) = tcp_write.write_all(&data).await {
                                 let _ = tcp_write.shutdown().await;
                                 return Err(Status::internal(e.to_string()));
@@ -1267,6 +1765,11 @@ impl DeployService for DeployServiceImpl {
 
             let mut buf = vec![0u8; MAX_PROXY_CHUNK];
             let tx_out = tx.clone();
+            let bout_count = bytes_out.clone();
+            let bytes_in_out = bytes_in.clone();
+            let policy_out = policy_for_task.clone();
+            let base_in_out = base_in;
+            let base_out_out = base_out;
             let t_out = tokio::spawn(async move {
                 loop {
                     match tcp_read.read(&mut buf).await {
@@ -1279,6 +1782,15 @@ impl DeployService for DeployServiceImpl {
                             break;
                         }
                         Ok(n) => {
+                            bout_count.fetch_add(n as u64, Ordering::Relaxed);
+                            if let Ok(mut a) = active_out.lock() {
+                                a.bump();
+                            }
+                            if let Some(ref pol) = policy_out {
+                                let bi = base_in_out + bytes_in_out.load(Ordering::Relaxed);
+                                let bo = base_out_out + bout_count.load(Ordering::Relaxed);
+                                let _ = proxy_session::check_traffic_limits(pol, bi, bo);
+                            }
                             let chunk = buf[..n].to_vec();
                             if tx_out
                                 .send(Ok(ProxyServerMsg {
@@ -1306,18 +1818,629 @@ impl DeployService for DeployServiceImpl {
             match r_in {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
+                    metrics.tunnel_errors.fetch_add(1, Ordering::Relaxed);
                     let _ = tx.send(Err(e)).await;
                 }
                 Err(e) => {
+                    metrics.tunnel_errors.fetch_add(1, Ordering::Relaxed);
                     let _ = tx
                         .send(Err(Status::internal(format!("proxy client task: {e}"))))
                         .await;
                 }
             }
+
+            let bi = bytes_in.load(Ordering::Relaxed);
+            let bo = bytes_out.load(Ordering::Relaxed);
+            metrics.bytes_in.fetch_add(bi, Ordering::Relaxed);
+            metrics.bytes_out.fetch_add(bo, Ordering::Relaxed);
+
+            let db_for_hourly = db_opt.clone();
+            if let (Some(db), Some(pk)) = (db_for_hourly, client_pubkey_for_traffic.clone()) {
+                if bi > 0 || bo > 0 {
+                    let hour = floor_to_utc_hour(chrono::Utc::now());
+                    let db2 = db.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = db2.add_grpc_proxy_traffic_hourly(&pk, hour, bi, bo).await {
+                            error!(%e, "grpc proxy traffic hourly");
+                        }
+                    });
+                }
+            }
+
+            if let (Some(db), Some(sid), Some(pk), Some(_pol)) = (
+                db_opt,
+                session_id_for_task,
+                pk_for_task,
+                policy_for_task,
+            ) {
+                let active_ms = active_end
+                    .lock()
+                    .map(|a| a.accum_ms as i64)
+                    .unwrap_or(0);
+                let now = chrono::Utc::now();
+                let _ = db
+                    .increment_grpc_proxy_session_traffic(
+                        &sid,
+                        &pk,
+                        bi,
+                        bo,
+                        active_ms,
+                        now,
+                        Some(now),
+                    )
+                    .await;
+            }
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))
             as Pin<Box<dyn Stream<Item = Result<ProxyServerMsg, Status>> + Send + 'static>>))
+    }
+
+    async fn update_connection_profile(
+        &self,
+        request: Request<UpdateConnectionProfileRequest>,
+    ) -> Result<Response<UpdateConnectionProfileResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner_ref = request.get_ref();
+        validate_project_id(&inner_ref.project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("UpdateConnectionProfile", &inner_ref.project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "UpdateConnectionProfile",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let pk = meta
+            .get(META_PUBKEY)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing client pubkey"))?;
+        let inner = request.into_inner();
+        db.upsert_grpc_peer_profile(
+            pk,
+            inner.connection_kind as i16,
+            inner.agent_version.trim(),
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(UpdateConnectionProfileResponse {
+            status: "ok".to_string(),
+        }))
+    }
+
+    async fn report_resource_usage(
+        &self,
+        request: Request<ReportResourceUsageRequest>,
+    ) -> Result<Response<ReportResourceUsageResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner_ref = request.get_ref();
+        validate_project_id(&inner_ref.project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("ReportResourceUsage", &inner_ref.project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "ReportResourceUsage",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let pk = meta
+            .get(META_PUBKEY)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing client pubkey"))?;
+        let inner = request.into_inner();
+        db.upsert_grpc_peer_resource_snapshot(
+            pk,
+            inner.cpu_percent,
+            inner.ram_percent,
+            inner.gpu_percent,
+            inner.ram_used_bytes.map(|v| v as i64),
+            inner.storage_used_bytes.map(|v| v as i64),
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ReportResourceUsageResponse {
+            status: "ok".to_string(),
+        }))
+    }
+
+    async fn connection_probe(
+        &self,
+        request: Request<Streaming<ConnectionProbeChunk>>,
+    ) -> Result<Response<ConnectionProbeResult>, Status> {
+        let extensions = request.extensions().clone();
+        let meta = request.metadata().clone();
+        let mut stream = request.into_inner();
+
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("empty stream"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        validate_project_id(&first.project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("ConnectionProbe", &first.project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "ConnectionProbe",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            let mut req_stub = Request::new(());
+            *req_stub.extensions_mut() = extensions;
+            register_authenticated_client(&req_stub, &meta);
+        }
+
+        let project_norm = normalize_project_id(&first.project_id);
+        let mut download_req = first.download_request_bytes as usize;
+        if download_req == 0 {
+            download_req = CONNECTION_PROBE_DEFAULT_DOWNLOAD_BYTES;
+        }
+        download_req = download_req.min(CONNECTION_PROBE_MAX_DOWNLOAD_BYTES);
+
+        let upload_start = std::time::Instant::now();
+        let mut total: u64 = first.data.len() as u64;
+        if total > CONNECTION_PROBE_MAX_UPLOAD_BYTES {
+            return Err(Status::invalid_argument("upload exceeds cap"));
+        }
+
+        while let Some(item) = stream.next().await {
+            let chunk = item.map_err(|e| Status::internal(e.to_string()))?;
+            if !chunk.project_id.is_empty()
+                && normalize_project_id(&chunk.project_id) != project_norm
+            {
+                return Err(Status::invalid_argument(
+                    "project_id must only be set on first chunk",
+                ));
+            }
+            let n = chunk.data.len() as u64;
+            total = total
+                .checked_add(n)
+                .ok_or_else(|| Status::invalid_argument("upload size overflow"))?;
+            if total > CONNECTION_PROBE_MAX_UPLOAD_BYTES {
+                return Err(Status::invalid_argument("upload exceeds cap"));
+            }
+        }
+
+        let upload_duration_ms = upload_start.elapsed().as_millis() as i64;
+
+        let mut download_payload = vec![0u8; download_req];
+        for (i, b) in download_payload.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(0x5a);
+        }
+
+        Ok(Response::new(ConnectionProbeResult {
+            upload_bytes: total,
+            upload_duration_ms,
+            download_payload,
+        }))
+    }
+
+    async fn create_connection(
+        &self,
+        request: Request<CreateConnectionRequest>,
+    ) -> Result<Response<CreateConnectionResponse>, Status> {
+        const NO_METADATA_DB: &str =
+            "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner = request.get_ref();
+        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("CreateConnection", &inner.project_id, "");
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            Status::failed_precondition("authentication disabled; CreateConnection unavailable")
+        })?;
+        {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "CreateConnection",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+
+        let pk = meta
+            .get(META_PUBKEY)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing pubkey"))?;
+
+        let pk_stored = if let Some(ref r) = inner.recipient_client_pubkey_b64 {
+            let t = r.trim();
+            if t.is_empty() {
+                pk.to_string()
+            } else {
+                let vk = parse_verifying_key_b64(t)
+                    .map_err(|e| Status::invalid_argument(format!("invalid recipient pubkey: {e}")))?;
+                raw_pubkey_b64_url(&vk.to_bytes())
+            }
+        } else {
+            pk.to_string()
+        };
+
+        let policy = inner.policy.clone().unwrap_or_default();
+        let now = chrono::Utc::now();
+        if !proxy_session::is_schedule_allowed(&policy, now)? {
+            return Err(Status::permission_denied("outside access schedule"));
+        }
+        let policy_json = proxy_session::policy_json_from_proto(&policy)?;
+        let expires_at = proxy_session::expires_at_from_policy(&policy, now);
+
+        let mut raw = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut raw);
+        let token = hex::encode(raw);
+        let token_hash = proxy_session::hash_session_token_hex(&token);
+
+        let session_id = db
+            .insert_grpc_proxy_session(
+                pk_stored.as_str(),
+                inner.board_label.as_str(),
+                &token_hash,
+                expires_at,
+                &policy_json,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(CreateConnectionResponse {
+            session_id,
+            session_token: token,
+            expires_at_unix_ms: expires_at.timestamp_millis(),
+            status: "ok".to_string(),
+        }))
+    }
+
+    async fn close_connection(
+        &self,
+        request: Request<CloseConnectionRequest>,
+    ) -> Result<Response<CloseConnectionResponse>, Status> {
+        const NO_METADATA_DB: &str =
+            "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner = request.get_ref();
+        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("CloseConnection", &inner.project_id, "");
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            Status::failed_precondition("authentication disabled; CloseConnection unavailable")
+        })?;
+        {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "CloseConnection",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+
+        let pk = meta
+            .get(META_PUBKEY)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing pubkey"))?;
+
+        let n = db
+            .revoke_grpc_proxy_session(&inner.session_id, pk)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if n == 0 {
+            return Err(Status::not_found("session not found or already revoked"));
+        }
+        Ok(Response::new(CloseConnectionResponse {
+            status: "ok".to_string(),
+        }))
+    }
+
+    async fn get_stats(
+        &self,
+        request: Request<GetStatsRequest>,
+    ) -> Result<Response<GetStatsResponse>, Status> {
+        const NO_METADATA_DB: &str =
+            "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner = request.get_ref();
+        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("GetStats", &inner.project_id, "");
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            Status::failed_precondition("authentication disabled; GetStats unavailable")
+        })?;
+        {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "GetStats",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+
+        let pk = meta
+            .get(META_PUBKEY)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing pubkey"))?;
+
+        if inner.session_id.is_empty() {
+            let agg = db
+                .aggregate_grpc_proxy_sessions_for_pubkey(pk)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            return Ok(Response::new(GetStatsResponse {
+                session_id: String::new(),
+                bytes_in: agg.bytes_in,
+                bytes_out: agg.bytes_out,
+                active_ms: agg.active_ms,
+                last_activity_unix_ms: agg
+                    .last_activity_at
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or(0),
+                revoked: false,
+                created_at_unix_ms: agg
+                    .created_at_max
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or(0),
+                expires_at_unix_ms: agg
+                    .expires_at_min
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or(0),
+            }));
+        }
+
+        let row = db
+            .fetch_grpc_proxy_session_by_id(&inner.session_id, pk)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let row = row.ok_or_else(|| Status::not_found("session not found"))?;
+        Ok(Response::new(GetStatsResponse {
+            session_id: row.session_id,
+            bytes_in: row.bytes_in.max(0) as u64,
+            bytes_out: row.bytes_out.max(0) as u64,
+            active_ms: row.active_ms.max(0) as u64,
+            last_activity_unix_ms: row
+                .last_activity_at
+                .map(|t| t.timestamp_millis())
+                .unwrap_or(0),
+            revoked: row.revoked,
+            created_at_unix_ms: row.created_at.timestamp_millis(),
+            expires_at_unix_ms: row.expires_at.timestamp_millis(),
+        }))
+    }
+
+    async fn update_settings(
+        &self,
+        request: Request<UpdateProxySettingsRequest>,
+    ) -> Result<Response<UpdateProxySettingsResponse>, Status> {
+        const NO_METADATA_DB: &str =
+            "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner = request.get_ref();
+        validate_project_id(&inner.project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("UpdateSettings", &inner.project_id, "");
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            Status::failed_precondition("authentication disabled; UpdateSettings unavailable")
+        })?;
+        {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "UpdateSettings",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+
+        let pk = meta
+            .get(META_PUBKEY)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing pubkey"))?;
+
+        let policy = inner.policy.clone().unwrap_or_default();
+        let now = chrono::Utc::now();
+        if !proxy_session::is_schedule_allowed(&policy, now)? {
+            return Err(Status::permission_denied("outside access schedule"));
+        }
+        let policy_json = proxy_session::policy_json_from_proto(&policy)?;
+        let expires_at = proxy_session::expires_at_from_policy(&policy, now);
+
+        let n = db
+            .update_grpc_proxy_session_policy(&inner.session_id, pk, &policy_json, expires_at)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if n == 0 {
+            return Err(Status::not_found("session not found or revoked"));
+        }
+        Ok(Response::new(UpdateProxySettingsResponse {
+            status: "ok".to_string(),
+            expires_at_unix_ms: expires_at.timestamp_millis(),
+        }))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: Request<ListSessionsRequest>,
+    ) -> Result<Response<ListSessionsResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("ListSessions", &request.get_ref().project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "ListSessions",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let _ = request.into_inner();
+
+        let agg = db
+            .fetch_grpc_session_peer_last_activity()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut agg_map: HashMap<String, deploy_db::GrpcSessionPeerAggregateRow> =
+            agg.into_iter()
+                .map(|r| (r.client_pubkey_b64.clone(), r))
+                .collect();
+
+        let dbr: &DbStore = db.as_ref();
+        let mut peers = Vec::new();
+        if let Some(ref auth) = self.auth {
+            let mut keys: Vec<String> = {
+                let peer_set = auth.peers.read();
+                peer_set.iter().map(raw_pubkey_b64_url).collect()
+            };
+            keys.sort();
+            for pk in keys {
+                let row = agg_map.remove(&pk);
+                let (last_seen_ms, last_peer_ip, last_grpc_method) = match row {
+                    Some(r) => (
+                        r.last_created_at.timestamp_millis(),
+                        r.last_peer_ip,
+                        r.last_grpc_method,
+                    ),
+                    None => (0_i64, String::new(), String::new()),
+                };
+                peers.push(
+                    session_peer_row_enriched(
+                        dbr,
+                        pk,
+                        last_seen_ms,
+                        last_peer_ip,
+                        last_grpc_method,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?,
+                );
+            }
+        } else {
+            let mut rest: Vec<_> = agg_map.into_values().collect();
+            rest.sort_by(|a, b| a.client_pubkey_b64.cmp(&b.client_pubkey_b64));
+            for r in rest {
+                peers.push(
+                    session_peer_row_enriched(
+                        dbr,
+                        r.client_pubkey_b64,
+                        r.last_created_at.timestamp_millis(),
+                        r.last_peer_ip,
+                        r.last_grpc_method,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?,
+                );
+            }
+        }
+
+        Ok(Response::new(ListSessionsResponse { peers }))
+    }
+
+    async fn query_session_logs(
+        &self,
+        request: Request<QuerySessionLogsRequest>,
+    ) -> Result<Response<QuerySessionLogsResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("QuerySessionLogs", &request.get_ref().project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "QuerySessionLogs",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let inner = request.into_inner();
+        let page = if inner.limit <= 0 {
+            50
+        } else {
+            inner.limit.min(500)
+        } as i64;
+        let fetch_n = page + 1;
+        let mut rows = db
+            .fetch_grpc_session_events_page(inner.before_id, fetch_n)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let has_more = rows.len() as i64 > page;
+        rows.truncate(page as usize);
+        let events = rows
+            .into_iter()
+            .map(|r| SessionLogEvent {
+                id: r.id,
+                created_at_ms: r.created_at.timestamp_millis(),
+                kind: r.kind,
+                client_public_key_b64: r.client_pubkey_b64.unwrap_or_default(),
+                peer_ip: r.peer_ip,
+                grpc_method: r.grpc_method,
+                status: r.status,
+                detail: r.detail,
+            })
+            .collect();
+        Ok(Response::new(QuerySessionLogsResponse { events, has_more }))
     }
 }
 
@@ -1345,15 +2468,17 @@ fn proxy_allowlist_check(host: &str) -> Result<(), Status> {
 }
 
 fn find_pirate_bundle_root(extracted: &Path) -> Result<PathBuf, Status> {
-    let d1 = extracted.join("pirate-linux-amd64");
-    if d1.join("bin/deploy-server").is_file() && d1.join("bin/control-api").is_file() {
-        return Ok(d1);
+    for name in ["pirate-linux-amd64", "pirate-linux-aarch64"] {
+        let d = extracted.join(name);
+        if d.join("bin/deploy-server").is_file() && d.join("bin/control-api").is_file() {
+            return Ok(d);
+        }
     }
     if extracted.join("bin/deploy-server").is_file() && extracted.join("bin/control-api").is_file() {
         return Ok(extracted.to_path_buf());
     }
     Err(Status::invalid_argument(
-        "expected bundle with bin/deploy-server and bin/control-api (e.g. pirate-linux-amd64/)",
+        "expected bundle with bin/deploy-server and bin/control-api (e.g. pirate-linux-amd64/ or pirate-linux-aarch64/)",
     ))
 }
 

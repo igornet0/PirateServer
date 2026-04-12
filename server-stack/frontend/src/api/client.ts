@@ -10,6 +10,7 @@ import type {
   DatabaseTablePreviewView,
   DatabaseTablesView,
   DiskDetail,
+  GrpcSessionsPageView,
   HistoryView,
   HostStatsDetailKind,
   HostStatsView,
@@ -138,6 +139,21 @@ async function deleteJson(path: string): Promise<void> {
 
 export async function fetchStatus(): Promise<StatusView> {
   return getJson<StatusView>(`/api/v1/status${projectQuery()}`);
+}
+
+export async function fetchGrpcSessions(
+  limit = 100,
+  opts?: { includeTcpAudit?: boolean; onlineSecs?: number },
+): Promise<GrpcSessionsPageView> {
+  const q = new URLSearchParams();
+  q.set("limit", String(Math.min(500, Math.max(1, limit))));
+  if (opts?.includeTcpAudit) {
+    q.set("include_tcp_audit", "true");
+  }
+  if (opts?.onlineSecs != null) {
+    q.set("online_secs", String(opts.onlineSecs));
+  }
+  return getJson<GrpcSessionsPageView>(`/api/v1/grpc-sessions?${q.toString()}`);
 }
 
 export async function fetchHostStats(): Promise<HostStatsView> {

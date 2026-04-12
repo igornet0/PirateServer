@@ -141,6 +141,43 @@ export const TRANSLATIONS = {
     "status.localClient.hint":
       "Paste into the desktop client. With full gRPC auth you get token, url, and pairing. The Docker test stack uses open gRPC — only url is shown (set DEPLOY_GRPC_PUBLIC_URL on the server if it should differ).",
     "status.localClient.copy": "Copy JSON",
+    "status.sessions.heading": "gRPC client connections (audit)",
+    "status.sessions.hint":
+      "Peer keys with last IP and presence; recent audit hides raw TCP open/close unless expanded.",
+    "status.sessions.summaryLine":
+      "Total events: {total} · TCP opens: {open} · TCP closes (logged disconnects): {closed} · Estimated open TCP: {estOpen}",
+    "status.sessions.summaryPeersLine":
+      "Peers tracked: {peerCount} · online (≤{onlineSecs}s): {onlineCount}",
+    "status.sessions.summaryBenchmark":
+      "Server benchmark scores (0–1000): CPU {cpu} · RAM {ram} · storage {storage} · GPU {gpu} · run {runAt}",
+    "status.sessions.peersHeading": "Registered gRPC clients",
+    "status.sessions.peersHint":
+      "One row per client public key (latest row in the audit DB). Presence is online when last activity was within the threshold.",
+    "status.sessions.auditHeading": "Recent gRPC audit events",
+    "status.sessions.auditHint":
+      "Pairings and RPC-level rows; tcp_open / tcp_close are omitted here unless you expand the raw TCP section below.",
+    "status.sessions.tcpAuditToggle": "Show raw TCP connection events (tcp_open / tcp_close)",
+    "status.sessions.tcpAuditHint":
+      "Loads the same recent window including low-level TCP audit rows (may be verbose).",
+    "status.sessions.tcpAuditLoading": "Loading…",
+    "status.sessions.colLastSeen": "Last seen",
+    "status.sessions.colConnKind": "Kind",
+    "status.sessions.colCpu": "CPU %",
+    "status.sessions.colRam": "RAM %",
+    "status.sessions.colGpu": "GPU %",
+    "status.sessions.colProxyIn": "Proxy in",
+    "status.sessions.colProxyOut": "Proxy out",
+    "status.sessions.colOnline": "Presence",
+    "status.sessions.online": "Online",
+    "status.sessions.offline": "Offline",
+    "status.sessions.unavailable": "Session audit is unavailable (metadata database not configured on control-api).",
+    "status.sessions.colTime": "Time",
+    "status.sessions.colKind": "Kind",
+    "status.sessions.colIp": "IP",
+    "status.sessions.colStatus": "Status",
+    "status.sessions.colMethod": "Method",
+    "status.sessions.colClient": "Client key",
+    "status.sessions.colDetail": "Detail",
     "status.hostServer.open": "Server information",
     "status.hostServer.title": "Server information",
     "status.hostServer.loadHint":
@@ -424,6 +461,44 @@ export const TRANSLATIONS = {
     "status.localClient.hint":
       "Вставьте в настольный клиент. При полной gRPC-аутентификации будут token, url и pairing. В Docker-тесте gRPC открыт — обычно только url (при необходимости задайте DEPLOY_GRPC_PUBLIC_URL на сервере).",
     "status.localClient.copy": "Копировать JSON",
+    "status.sessions.heading": "Подключения gRPC-клиентов (аудит)",
+    "status.sessions.hint":
+      "Ключи пиров с последним IP и статусом; недавний аудит без сырых tcp_open/tcp_close (ниже можно развернуть).",
+    "status.sessions.summaryLine":
+      "Всего событий: {total} · TCP открытий: {open} · TCP закрытий (в логе): {closed} · Оценка открытых TCP: {estOpen}",
+    "status.sessions.summaryPeersLine":
+      "Пиров в учёте: {peerCount} · онлайн (≤{onlineSecs} с): {onlineCount}",
+    "status.sessions.summaryBenchmark":
+      "Бенчмарк сервера (0–1000): CPU {cpu} · RAM {ram} · диск {storage} · GPU {gpu} · запуск {runAt}",
+    "status.sessions.peersHeading": "Зарегистрированные gRPC-клиенты",
+    "status.sessions.peersHint":
+      "По одному ряду на публичный ключ клиента (последняя запись в БД аудита). «Онлайн» — если последняя активность не старше порога.",
+    "status.sessions.auditHeading": "Недавние события аудита gRPC",
+    "status.sessions.auditHint":
+      "Паринги и события уровня RPC; tcp_open / tcp_close скрыты, пока не открыт сырой TCP-блок ниже.",
+    "status.sessions.tcpAuditToggle": "Показать сырые события TCP (tcp_open / tcp_close)",
+    "status.sessions.tcpAuditHint":
+      "Загружает тот же объём «недавних» строк, включая низкоуровневый TCP-аудит (может быть очень много).",
+    "status.sessions.tcpAuditLoading": "Загрузка…",
+    "status.sessions.colLastSeen": "Последняя активность",
+    "status.sessions.colConnKind": "Тип",
+    "status.sessions.colCpu": "CPU %",
+    "status.sessions.colRam": "RAM %",
+    "status.sessions.colGpu": "GPU %",
+    "status.sessions.colProxyIn": "Прокси вх.",
+    "status.sessions.colProxyOut": "Прокси исх.",
+    "status.sessions.colOnline": "Статус",
+    "status.sessions.online": "Онлайн",
+    "status.sessions.offline": "Офлайн",
+    "status.sessions.unavailable":
+      "Аудит сессий недоступен (на control-api не настроена БД метаданных).",
+    "status.sessions.colTime": "Время",
+    "status.sessions.colKind": "Тип",
+    "status.sessions.colIp": "IP",
+    "status.sessions.colStatus": "Статус",
+    "status.sessions.colMethod": "Метод",
+    "status.sessions.colClient": "Ключ клиента",
+    "status.sessions.colDetail": "Деталь",
     "status.hostServer.open": "Информация о сервере",
     "status.hostServer.title": "Информация о сервере",
     "status.hostServer.loadHint":

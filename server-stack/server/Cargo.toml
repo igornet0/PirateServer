@@ -1,6 +1,6 @@
 [package]
 name = "deploy-server"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,8 @@ deploy-core = { path = "../deploy-core" }
 deploy-control = { path = "../deploy-control" }
 deploy-db = { path = "../deploy-db" }
 deploy-proto = { path = "../../proto" }
+wire-protocol = { path = "../../wire-protocol" }
+prost = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "process", "sync", "net", "time"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["transport"] }
@@ -25,4 +27,10 @@ futures-util = "0.3"
 libc = "0.2"
 argon2 = "0.5"
 password-hash = "0.5"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+chrono = { version = "0.4", features = ["clock"] }
+chrono-tz = "0.9"
+sysinfo = "0.32"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }

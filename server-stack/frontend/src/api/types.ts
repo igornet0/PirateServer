@@ -14,6 +14,58 @@ export interface StatusView {
   local_client?: LocalClientConnect | null;
 }
 
+/** `GET /api/v1/grpc-sessions` — deploy-server gRPC audit (metadata DB). */
+export interface GrpcSessionsSummaryView {
+  total_events: number;
+  tcp_open_total: number;
+  tcp_close_total: number;
+  estimated_open_tcp: number;
+  closed_tcp_events: number;
+  by_kind: Record<string, number>;
+}
+
+export interface GrpcSessionEventView {
+  id: number;
+  created_at: string;
+  kind: string;
+  peer_ip: string;
+  status: string;
+  grpc_method: string;
+  client_public_key_b64?: string | null;
+  detail: string;
+}
+
+/** One row per known client key — last activity from the metadata DB. */
+export interface GrpcSessionPeerView {
+  client_public_key_b64: string;
+  last_seen_at: string;
+  last_peer_ip: string;
+  last_grpc_method: string;
+  online: boolean;
+  connection_kind: number;
+  last_cpu_percent?: number | null;
+  last_ram_percent?: number | null;
+  last_gpu_percent?: number | null;
+  proxy_bytes_in_total: number;
+  proxy_bytes_out_total: number;
+}
+
+/** Latest `deploy-server resource-benchmark` row (this host). */
+export interface ServerBenchmarkView {
+  run_at: string;
+  cpu_score: number;
+  ram_score: number;
+  storage_score: number;
+  gpu_score?: number | null;
+}
+
+export interface GrpcSessionsPageView {
+  summary: GrpcSessionsSummaryView;
+  peers: GrpcSessionPeerView[];
+  recent: GrpcSessionEventView[];
+  server_benchmark?: ServerBenchmarkView | null;
+}
+
 /** `GET /api/v1/database-info` — optional PostgreSQL explorer (password never returned). */
 export interface DatabaseInfoView {
   configured: boolean;
