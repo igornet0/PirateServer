@@ -4,7 +4,7 @@ use ipnet::IpNet;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BypassMatcher {
     exact: HashSet<String>,
     /// Lowercase suffixes including leading dot, e.g. `.google.com` for `*.google.com`.

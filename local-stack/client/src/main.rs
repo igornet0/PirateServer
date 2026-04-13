@@ -1,30 +1,31 @@
 //! CLI: pack `build/` as tar.gz, stream over gRPC (IPv6 endpoint); optional Ed25519 pairing.
 
-mod board;
 mod board_probe;
-mod bypass;
-mod config;
-mod connection_manager;
-mod metrics_collector;
-mod routing;
-mod settings;
+mod display_stream;
 mod stack_update_prompt;
 mod version_info;
+mod gui_probe;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use config::{
-    load_connection, load_or_create_identity, normalize_endpoint, save_connection, settings_path,
-    use_signed_requests, StoredConnection,
+use deploy_client::{
+    board,
+    bootstrap_apply,
+    config::{
+        identity_path, load_connection, load_or_create_identity, normalize_endpoint, save_connection,
+        settings_path, use_signed_requests, StoredConnection,
+    },
+    connection_manager::ConnectionManager,
+    settings,
 };
-use connection_manager::ConnectionManager;
 use deploy_auth::{
-    attach_auth_metadata, endpoints_equivalent_for_signing, pair_request_canonical, pubkey_b64_url,
-    verify_pair_response, ConnectionBundle, now_unix_ms,
+    attach_auth_metadata, endpoints_equivalent_for_signing, load_identity, pair_request_canonical,
+    pubkey_b64_url, verify_pair_response, ConnectionBundle, now_unix_ms,
 };
 use deploy_client::{
     default_version, deploy_directory, fetch_server_stack_info, inspect_bundle_path,
     read_or_pack_bundle, upload_server_stack_artifact_with_progress, validate_version_label,
 };
+use deploy_core::display_stream::DisplayStreamConfig;
 use deploy_proto::deploy::{
     ListSessionsRequest, PairRequest, QuerySessionLogsRequest, ReportResourceUsageRequest,
     RollbackRequest, UpdateConnectionProfileRequest,
@@ -71,6 +72,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Print this client's URL-safe Ed25519 public key (for proxy session `recipient_client_pubkey_b64`).
+    /// Fails if `identity.json` is missing (run `auth` first, or pass `--identity`).
+    ShowPubkey {
+        /// Path to `identity.json` (default: config dir / `identity.json`).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
     /// Pair with the server (install JSON), then call GetStatus and print RTT.
     ///
     /// `current_version` is the active **app** release (symlink `current` under the deploy root). Until the first `deploy`, the server may return `stack@…` (install bundle / binary lineage) or an empty string (shown as `(none)` on older servers).
@@ -90,6 +98,9 @@ enum Commands {
         /// Run gRPC reachability, bandwidth probe, and session summary (does not start the proxy).
         #[arg(long)]
         test_connect: bool,
+        /// With `--test-connect`, print one JSON line (GetStatus + ConnectionProbe only) to stdout for scripts.
+        #[arg(long)]
+        probe_json: bool,
         /// Upload size for `ConnectionProbe` (max 4 MiB).
         #[arg(long, default_value_t = 1024 * 1024)]
         probe_upload_bytes: u64,
@@ -106,6 +117,39 @@ enum Commands {
         #[arg(long)]
         settings: Option<PathBuf>,
     },
+    /// Test local HTTP CONNECT proxy: smoke GET, speed through proxy, and empirical max parallel requests (`pirate board` must be listening).
+    ///
+    /// Does not use gRPC `ConnectionProbe` (that measures gRPC bandwidth, not HTTP CONNECT to an upstream URL).
+    #[command(name = "test-proxy")]
+    TestProxy {
+        /// Only measure download speed through the proxy.
+        #[arg(long)]
+        speed: bool,
+        /// Only estimate max parallel successful HTTP requests through the proxy (synonym in docs: max_connect).
+        #[arg(long = "max-connect")]
+        max_connect: bool,
+        /// HTTP proxy URL (local `pirate board` listener).
+        #[arg(long, default_value = "http://127.0.0.1:3128")]
+        proxy: String,
+        /// Target URL via the proxy (default: env `PIRATE_PROXY_TEST_UPSTREAM` or `http://127.0.0.1:9000/size?bytes=262144`).
+        #[arg(long)]
+        upstream_url: Option<String>,
+        /// Hint for `?bytes=` when the upstream URL has no `bytes=` query (speed / max-connect trials).
+        #[arg(long, default_value_t = 262144)]
+        bytes: u64,
+        /// Per-request timeout (seconds).
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// Upper bound for parallel-connection search (`max_connect` estimate).
+        #[arg(long, default_value_t = 128)]
+        cap: u32,
+        /// Minimum success fraction for a parallel trial (0.0–1.0).
+        #[arg(long, default_value_t = 0.95)]
+        min_success_rate: f64,
+        /// Print one JSON line (smoke, speed, max_connect fields).
+        #[arg(long)]
+        json: bool,
+    },
     /// Register this machine's public key with the server (install JSON bundle) only; does not print GetStatus.
     ///
     /// Use `auth` for pair + status, or run `status` after pairing to see `current_version`.
@@ -113,6 +157,24 @@ enum Commands {
         /// JSON from server logs: {"token":"...","url":"...","pairing":"..."} or path to a file containing it.
         #[arg(long)]
         bundle: Option<String>,
+    },
+    /// Merge `pirate-bootstrap` or `pirate-proxy-session` JSON into `settings.json` (per-board gRPC URL + session token).
+    ///
+    /// Run `pirate auth` first so `connection.json` matches this server. Fetch JSON with `--url` (public pirate-bootstrap) or read `--file`. Session auth token is only in create response or full Inbounds export — pass `--session-token` if the JSON has `session_token: null`.
+    #[command(name = "bootstrap-apply")]
+    BootstrapApply {
+        /// Path to JSON file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// HTTPS/HTTP URL to fetch bootstrap JSON (`/api/v1/public/pirate-bootstrap/...`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Session token from the create-session dialog (if not present in JSON).
+        #[arg(long)]
+        session_token: Option<String>,
+        /// Path to `settings.json` (default: pirate-client config dir).
+        #[arg(long)]
+        settings: Option<PathBuf>,
     },
     /// Create tar.gz from a directory and upload in chunks.
     Deploy {
@@ -173,10 +235,64 @@ enum Commands {
     },
     /// Report local CPU/RAM (and optional GPU) usage to the server for RESOURCE clients.
     ResourceReport,
+    /// Desktop display stream: list monitors or run producer (POST JPEG to consumer ingest URL).
+    DisplayStream {
+        #[command(subcommand)]
+        cmd: DisplayStreamCmd,
+    },
+    /// Detect local GUI / desktop session (JSON). Run on the deploy host; use `--remote` with `auth` to read install snapshot from the server.
+    #[command(name = "gui-check")]
+    GuiCheck {
+        /// Include GetServerStackInfo fields `host_gui_*` from the server (requires prior `pirate auth`).
+        #[arg(long)]
+        remote: bool,
+        /// `json` (default) or `keyval` for scripts.
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// Display stream helpers: build producer config JSON for `display-stream run` (screen translation to ingest URL).
+    Gui {
+        #[command(subcommand)]
+        cmd: GuiCmd,
+    },
     /// Uninstall native server stack (Linux) or remove local CLI pairing state.
     Uninstall {
         #[command(subcommand)]
         target: UninstallTarget,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DisplayStreamCmd {
+    /// List monitors (index, name, width x height).
+    ListDisplays,
+    /// Run until Ctrl+C: capture and POST frames to `ingest_base_url` from config.
+    Run {
+        /// `data:application/json;base64,...`, raw JSON, or path to a `.json` file.
+        #[arg(long)]
+        config: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GuiCmd {
+    /// Build producer `DisplayStreamConfig` JSON for `pirate display-stream run --config` (synonym: screen streaming / «трансляция»).
+    Translate {
+        /// Producer ingest base URL (e.g. `http://127.0.0.1:39100/ingest`).
+        #[arg(long)]
+        ingest: Option<String>,
+        /// Write JSON to this file instead of stdout.
+        #[arg(long)]
+        write: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        display_index: u32,
+        #[arg(long, default_value_t = 10)]
+        fps: u8,
+        #[arg(long, default_value_t = 70)]
+        quality: u8,
+        /// Push monitor list to the server (`ReportDisplayTopology`; requires `pirate auth`).
+        #[arg(long)]
+        sync_topology: bool,
     },
 }
 
@@ -427,6 +543,119 @@ async fn run_profile_cmd(
         save_connection(&c)?;
     }
     println!("connection profile updated (kind={kind_i})");
+    Ok(())
+}
+
+fn load_display_stream_config(path_or_url: &str) -> Result<DisplayStreamConfig, String> {
+    let trimmed = path_or_url.trim();
+    let s = if Path::new(trimmed).is_file() {
+        std::fs::read_to_string(trimmed).map_err(|e| e.to_string())?
+    } else {
+        trimmed.to_string()
+    };
+    DisplayStreamConfig::from_data_url_or_json(&s)
+}
+
+async fn run_gui_check_cmd(
+    cli: &Cli,
+    remote: bool,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local = gui_probe::probe_local();
+    if !remote {
+        if format == "keyval" {
+            println!("gui_detected={}", local.gui_detected);
+            if let Some(n) = local.monitor_count {
+                println!("monitor_count={n}");
+            }
+            let r = local
+                .reasons
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("reasons={r}");
+        } else {
+            println!("{}", local.to_json_line()?);
+        }
+        return Ok(());
+    }
+
+    let endpoint = resolve_endpoint_normalized(cli);
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        eprintln!("endpoint must start with http:// or https://");
+        std::process::exit(2);
+    }
+    if !use_signed_requests(&endpoint) {
+        eprintln!("no paired connection for this URL. Run: pirate auth '<install-json>' first");
+        std::process::exit(2);
+    }
+    let sk = load_or_create_identity()?;
+    let info = fetch_server_stack_info(&endpoint, Some(&sk)).await?;
+    let remote_install = serde_json::json!({
+        "host_gui_detected_at_install": info.host_gui_detected_at_install,
+        "host_gui_install": info
+            .host_gui_install_json
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+    });
+    if format == "keyval" {
+        println!("local_gui_detected={}", local.gui_detected);
+        println!(
+            "remote_host_gui_detected_at_install={}",
+            info.host_gui_detected_at_install
+                .map(|b| if b { "true" } else { "false" })
+                .unwrap_or("unknown")
+        );
+    } else {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "local".to_string(),
+            serde_json::to_value(&local)?,
+        );
+        obj.insert("remote".to_string(), remote_install);
+        println!("{}", serde_json::Value::Object(obj));
+    }
+    Ok(())
+}
+
+async fn run_gui_translate_cmd(
+    cli: &Cli,
+    ingest: Option<String>,
+    write: Option<PathBuf>,
+    display_index: u32,
+    fps: u8,
+    quality: u8,
+    sync_topology: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ingest_url = ingest.as_deref().unwrap_or("http://127.0.0.1:39100/ingest");
+    let mut cfg = DisplayStreamConfig::example_producer(ingest_url);
+    cfg.display_index = display_index;
+    cfg.fps = fps;
+    cfg.quality = quality;
+    cfg.validate()?;
+    let json = cfg.to_json_string()?;
+    if let Some(ref p) = write {
+        std::fs::write(p, format!("{json}\n"))?;
+        eprintln!("wrote {}", p.display());
+    } else {
+        println!("{json}");
+    }
+    eprintln!("Run: pirate display-stream run --config <path-or-json>  (or pass JSON string directly)");
+    if sync_topology {
+        let endpoint = resolve_endpoint_normalized(cli);
+        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            eprintln!("endpoint must start with http:// or https://");
+            std::process::exit(2);
+        }
+        if !use_signed_requests(&endpoint) {
+            eprintln!("--sync-topology requires prior `pirate auth` for this endpoint");
+            std::process::exit(2);
+        }
+        let sk = load_or_create_identity()?;
+        display_stream::send_display_topology(&endpoint, &cli.project, &sk).await?;
+        eprintln!("ok: ReportDisplayTopology");
+    }
     Ok(())
 }
 
@@ -756,12 +985,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     if cli.version_all {
-        version_info::run_version_all(&cli).await?;
+        version_info::run_version_all(&cli.endpoint).await?;
         return Ok(());
     }
 
     if cli.version {
-        version_info::run_version(&cli).await?;
+        version_info::run_version(&cli.endpoint).await?;
         return Ok(());
     }
 
@@ -771,6 +1000,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match command {
+        Commands::ShowPubkey { identity } => {
+            let path = match identity {
+                Some(p) => p.clone(),
+                None => identity_path()
+                    .ok_or("no config directory; set XDG_CONFIG_HOME or use --identity")?,
+            };
+            let sk = load_identity(&path)?;
+            println!("{}", pubkey_b64_url(&sk));
+            return Ok(());
+        }
         Commands::Auth { bundle } => {
             run_auth(bundle.clone(), cli.project.clone()).await?;
             return Ok(());
@@ -778,6 +1017,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Board {
             listen,
             test_connect,
+            probe_json,
             probe_upload_bytes,
             probe_download_bytes,
             board,
@@ -795,6 +1035,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 std::process::exit(2);
             }
+            if *probe_json && !*test_connect {
+                eprintln!("--probe-json requires --test-connect");
+                std::process::exit(2);
+            }
             let sk = load_or_create_identity()?;
             if *test_connect {
                 board_probe::run_board_test_connect(
@@ -803,6 +1047,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &sk,
                     *probe_upload_bytes,
                     *probe_download_bytes,
+                    *probe_json,
                 )
                 .await?;
             } else {
@@ -825,9 +1070,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     snap,
                     pool,
                     session_token.as_deref(),
+                    None,
                 )
                 .await?;
             }
+            return Ok(());
+        }
+        Commands::TestProxy {
+            speed,
+            max_connect,
+            proxy,
+            upstream_url,
+            bytes,
+            timeout,
+            cap,
+            min_success_rate,
+            json,
+        } => {
+            use deploy_client::proxy_test::{self, TestProxyOptions};
+            let upstream = upstream_url
+                .clone()
+                .unwrap_or_else(proxy_test::default_upstream_url);
+            let opts = TestProxyOptions {
+                proxy_url: proxy.clone(),
+                upstream_url: upstream,
+                bytes: *bytes,
+                timeout_secs: *timeout,
+                max_connect_cap: *cap,
+                min_success_rate: *min_success_rate,
+                run_speed: *speed,
+                run_max_connect: *max_connect,
+                json: *json,
+            };
+            proxy_test::run_proxy_tests(opts).await?;
+            return Ok(());
+        }
+        Commands::BootstrapApply {
+            file,
+            url,
+            session_token,
+            settings,
+        } => {
+            use bootstrap_apply::{apply_bootstrap_json, load_json_from_file_or_url};
+            if file.is_none() && url.is_none() {
+                eprintln!("provide --file PATH or --url URL");
+                std::process::exit(2);
+            }
+            let json = load_json_from_file_or_url(file.as_deref(), url.as_deref()).await?;
+            let settings_path = settings
+                .clone()
+                .or_else(settings_path)
+                .unwrap_or_else(|| PathBuf::from("settings.json"));
+            apply_bootstrap_json(&json, session_token.as_deref(), &settings_path)?;
+            println!("Updated {}", settings_path.display());
             return Ok(());
         }
         Commands::Pair { bundle } => {
@@ -857,6 +1152,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::ResourceReport => {
             run_resource_report_cmd(&cli).await?;
+            return Ok(());
+        }
+        Commands::DisplayStream { cmd } => {
+            match cmd {
+                DisplayStreamCmd::ListDisplays => {
+                    display_stream::list_displays()?;
+                }
+                DisplayStreamCmd::Run { config } => {
+                    let cfg = load_display_stream_config(config)?;
+                    let endpoint = resolve_endpoint_normalized(&cli);
+                    let topo =
+                        if use_signed_requests(&endpoint)
+                            && (endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+                        {
+                            let sk = load_or_create_identity()?;
+                            Some((endpoint, cli.project.clone(), sk))
+                        } else {
+                            None
+                        };
+                    display_stream::run_producer(cfg, topo).await?;
+                }
+            }
+            return Ok(());
+        }
+        Commands::GuiCheck { remote, format } => {
+            run_gui_check_cmd(&cli, *remote, format.as_str()).await?;
+            return Ok(());
+        }
+        Commands::Gui { cmd } => {
+            match cmd {
+                GuiCmd::Translate {
+                    ingest,
+                    write,
+                    display_index,
+                    fps,
+                    quality,
+                    sync_topology,
+                } => {
+                    run_gui_translate_cmd(
+                        &cli,
+                        ingest.clone(),
+                        write.clone(),
+                        *display_index,
+                        *fps,
+                        *quality,
+                        *sync_topology,
+                    )
+                    .await?;
+                }
+            }
             return Ok(());
         }
         Commands::Deploy {

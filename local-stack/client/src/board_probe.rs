@@ -1,6 +1,6 @@
 //! One-shot gRPC probe: GetStatus RTT, ConnectionProbe throughput, ListSessions + audit tail.
 
-use crate::config::{load_connection, normalize_endpoint, use_signed_requests};
+use deploy_client::config::{load_connection, normalize_endpoint, use_signed_requests};
 use deploy_auth::attach_auth_metadata;
 use deploy_auth::endpoints_equivalent_for_signing;
 use deploy_auth::pubkey_b64_url;
@@ -9,15 +9,19 @@ use deploy_proto::deploy::{
 };
 use deploy_proto::DeployServiceClient;
 use ed25519_dalek::SigningKey;
+use serde::Serialize;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Endpoint;
 use tonic::Code;
 use tonic::Request;
 
 const PROBE_MAX_UPLOAD: u64 = 4 * 1024 * 1024;
 const PROBE_MAX_DOWNLOAD: u32 = 4 * 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
+/// Default tonic limit is ~4 MiB; `ConnectionProbeResult.download_payload` can be 4 MiB raw + protobuf overhead.
+const CONNECTION_PROBE_GRPC_MAX_MSG: usize = 12 * 1024 * 1024;
 
 fn display_current_version(v: &str) -> &str {
     if v.is_empty() {
@@ -73,13 +77,29 @@ fn mbps(bits: f64, ms: f64) -> f64 {
     (bits / 1_000_000.0) / (ms / 1000.0)
 }
 
+/// Machine-readable line for scripts (stdout only; human hints go to stderr).
+#[derive(Serialize)]
+pub struct ConnectionProbeJson {
+    pub transport: &'static str,
+    pub get_status_rtt_ms: f64,
+    pub connection_probe_upload_bytes: u64,
+    pub connection_probe_upload_ms: i64,
+    pub connection_probe_upload_mbps: f64,
+    pub connection_probe_download_bytes: usize,
+    pub connection_probe_client_roundtrip_ms: f64,
+    pub connection_probe_download_mbps_est: f64,
+}
+
 /// Run probe sequence; requires prior pair when signing is enabled for this URL.
+///
+/// When `probe_json` is true, prints a single JSON object to stdout (GetStatus + ConnectionProbe only) and returns.
 pub async fn run_board_test_connect(
     endpoint: &str,
     project_id: &str,
     sk: &SigningKey,
     probe_upload_bytes: u64,
     probe_download_bytes: u32,
+    probe_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !use_signed_requests(endpoint) {
         return Err(
@@ -91,7 +111,12 @@ pub async fn run_board_test_connect(
     let upload_total = (probe_upload_bytes.min(PROBE_MAX_UPLOAD)) as usize;
     let download_req = probe_download_bytes.min(PROBE_MAX_DOWNLOAD);
 
-    let mut client = DeployServiceClient::connect(endpoint.to_string()).await?;
+    let channel = Endpoint::from_shared(endpoint.to_string())?
+        .connect()
+        .await?;
+    let mut client = DeployServiceClient::new(channel)
+        .max_decoding_message_size(CONNECTION_PROBE_GRPC_MAX_MSG)
+        .max_encoding_message_size(CONNECTION_PROBE_GRPC_MAX_MSG);
 
     // --- GetStatus RTT ---
     let mut status_req = Request::new(StatusRequest {
@@ -108,16 +133,18 @@ pub async fn run_board_test_connect(
         })?
         .into_inner();
     let rtt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    println!(
-        "get_status rtt_ms={:.2} current_version={} state={}",
-        rtt_ms,
-        display_current_version(&status.current_version),
-        status.state
-    );
-    if no_deployed_app_release(&status.current_version) {
-        eprintln!(
-            "note: no app release yet or only stack metadata in current_version; see `pirate auth` help."
+    if !probe_json {
+        println!(
+            "get_status rtt_ms={:.2} current_version={} state={}",
+            rtt_ms,
+            display_current_version(&status.current_version),
+            status.state
         );
+        if no_deployed_app_release(&status.current_version) {
+            eprintln!(
+                "note: no app release yet or only stack metadata in current_version; see `pirate auth` help."
+            );
+        }
     }
 
     // --- ConnectionProbe ---
@@ -177,6 +204,21 @@ pub async fn run_board_test_connect(
     let dl_bits = dl_bytes * 8.0;
     let rest_ms = (client_elapsed_ms - up_ms).max(1.0);
     let dl_mbps = mbps(dl_bits, rest_ms);
+
+    if probe_json {
+        let out = ConnectionProbeJson {
+            transport: "grpc+h2c",
+            get_status_rtt_ms: rtt_ms,
+            connection_probe_upload_bytes: probe.upload_bytes,
+            connection_probe_upload_ms: probe.upload_duration_ms,
+            connection_probe_upload_mbps: up_mbps,
+            connection_probe_download_bytes: probe.download_payload.len(),
+            connection_probe_client_roundtrip_ms: client_elapsed_ms,
+            connection_probe_download_mbps_est: dl_mbps,
+        };
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
 
     println!(
         "connection_probe upload_bytes={} upload_ms={} upload_mbps≈{:.2}",

@@ -1,7 +1,6 @@
 //! `pirate --version` / `pirate --version-all` and optional server stack info via `GetServerStackInfo`.
 
-use crate::config::{load_or_create_identity, normalize_endpoint, use_signed_requests};
-use crate::Cli;
+use deploy_client::config::{load_or_create_identity, normalize_endpoint, use_signed_requests};
 use deploy_client::fetch_server_stack_info;
 use deploy_auth::CRATE_VERSION as AUTH_VERSION;
 use deploy_core::CRATE_VERSION as CORE_VERSION;
@@ -13,16 +12,16 @@ pub fn local_version() -> &'static str {
 }
 
 /// Remote info only when `--endpoint` / `--url` is set explicitly.
-fn explicit_endpoint(cli: &Cli) -> Option<String> {
-    cli.endpoint
+fn explicit_endpoint(endpoint: &Option<String>) -> Option<String> {
+    endpoint
         .as_ref()
         .map(|s| normalize_endpoint(s))
         .filter(|s| !s.is_empty())
 }
 
-pub async fn run_version(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_version(endpoint: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     println!("client={}", local_version());
-    if let Some(ep) = explicit_endpoint(cli) {
+    if let Some(ep) = explicit_endpoint(endpoint) {
         if !ep.starts_with("http://") && !ep.starts_with("https://") {
             return Err("endpoint must start with http:// or https://".into());
         }
@@ -31,12 +30,12 @@ pub async fn run_version(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub async fn run_version_all(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_version_all(endpoint: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     println!("deploy_client={}", local_version());
     println!("deploy_auth={}", AUTH_VERSION);
     println!("deploy_core={}", CORE_VERSION);
     println!("deploy_proto={}", PROTO_VERSION);
-    if let Some(ep) = explicit_endpoint(cli) {
+    if let Some(ep) = explicit_endpoint(endpoint) {
         if !ep.starts_with("http://") && !ep.starts_with("https://") {
             return Err("endpoint must start with http:// or https://".into());
         }
@@ -64,6 +63,9 @@ async fn print_remote_versions(endpoint: &str) -> Result<(), Box<dyn std::error:
     println!("host_dashboard_enabled={}", info.host_dashboard_enabled);
     if let Some(n) = info.host_nginx_pirate_site {
         println!("host_nginx_pirate_site={n}");
+    }
+    if let Some(g) = info.host_gui_detected_at_install {
+        println!("host_gui_detected_at_install={g}");
     }
 
     let Some(ref raw) = info.manifest_json else {
