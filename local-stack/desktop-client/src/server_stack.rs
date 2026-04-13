@@ -76,6 +76,8 @@ pub fn fetch_server_stack_info_json() -> Result<String, String> {
         "deployServerBinaryVersion": info.deploy_server_binary_version,
         "hostDashboardEnabled": info.host_dashboard_enabled,
         "hostNginxPirateSite": info.host_nginx_pirate_site,
+        "hostGuiDetectedAtInstall": info.host_gui_detected_at_install,
+        "hostGuiInstallJson": info.host_gui_install_json,
     })
     .to_string())
 }

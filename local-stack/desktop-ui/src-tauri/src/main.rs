@@ -234,6 +234,102 @@ fn monitoring_set_economy(enabled: bool) -> bool {
 }
 
 #[tauri::command]
+fn start_display_ingest(token: Option<String>) -> Result<u16, String> {
+    pirate_desktop::spawn_display_ingest_server(token).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn display_ingest_base() -> Option<String> {
+    pirate_desktop::display_ingest_api_base()
+}
+
+/// `data:application/json;base64,...` for consumer role (paste / share with producer host).
+#[tauri::command]
+fn display_ingest_export_consumer_config(token: Option<String>) -> Result<String, String> {
+    let base = pirate_desktop::display_ingest_api_base()
+        .ok_or_else(|| "start display ingest first".to_string())?;
+    let url = format!("{}/ingest", base.trim_end_matches('/'));
+    let mut cfg = deploy_core::display_stream::DisplayStreamConfig::example_consumer(&url);
+    if let Some(t) = token.filter(|s| !s.trim().is_empty()) {
+        cfg.token = t;
+    }
+    cfg.to_data_url().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_display_stream_prefs() -> [bool; 2] {
+    let (a, b) = pirate_desktop::get_display_stream_prefs();
+    [a, b]
+}
+
+#[tauri::command]
+fn set_display_stream_prefs(allow_receive: bool, allow_send: bool) -> Result<(), String> {
+    pirate_desktop::set_display_stream_prefs(allow_receive, allow_send)
+}
+
+#[tauri::command]
+fn internet_proxy_start(listen: Option<String>) -> Result<(), String> {
+    pirate_desktop::internet_proxy_start(listen)
+}
+
+#[tauri::command]
+fn internet_proxy_stop() -> Result<(), String> {
+    pirate_desktop::internet_proxy_stop()
+}
+
+#[tauri::command]
+fn internet_proxy_status() -> pirate_desktop::InternetProxyStatus {
+    pirate_desktop::internet_proxy_status()
+}
+
+#[tauri::command]
+fn internet_proxy_logs() -> Vec<pirate_desktop::ProxyTraceEntry> {
+    pirate_desktop::internet_proxy_logs()
+}
+
+#[tauri::command]
+fn internet_proxy_logs_clear() {
+    pirate_desktop::internet_proxy_logs_clear();
+}
+
+#[tauri::command]
+fn load_client_settings_json() -> Result<String, String> {
+    pirate_desktop::load_settings_json()
+}
+
+#[tauri::command]
+fn save_client_settings_json(text: String) -> Result<(), String> {
+    pirate_desktop::save_settings_json(&text)
+}
+
+#[tauri::command]
+fn apply_default_rules_preset_cmd(preset: String) -> Result<(), String> {
+    pirate_desktop::apply_default_rules_preset_to_disk(&preset)
+}
+
+#[tauri::command]
+fn load_default_rules_bundles_form() -> Result<pirate_desktop::DefaultRulesBundlesForm, String> {
+    pirate_desktop::load_default_rules_bundles_form()
+}
+
+#[tauri::command]
+fn save_default_rules_bundles_form(
+    form: pirate_desktop::DefaultRulesBundlesForm,
+) -> Result<(), String> {
+    pirate_desktop::save_default_rules_bundles_form(form)
+}
+
+#[tauri::command]
+fn load_board_rules_form() -> Result<pirate_desktop::BoardRulesForm, String> {
+    pirate_desktop::load_board_rules_form()
+}
+
+#[tauri::command]
+fn save_board_rules_form(form: pirate_desktop::BoardRulesForm) -> Result<(), String> {
+    pirate_desktop::save_board_rules_form(form)
+}
+
+#[tauri::command]
 fn pick_server_stack_tar_gz() -> Result<Option<String>, String> {
     Ok(rfd::FileDialog::new()
         .add_filter("Tarball", &["tar.gz", "tgz"])
@@ -301,6 +397,23 @@ fn main() {
             rename_server_bookmark,
             monitoring_api_base,
             monitoring_set_economy,
+            start_display_ingest,
+            display_ingest_base,
+            display_ingest_export_consumer_config,
+            get_display_stream_prefs,
+            set_display_stream_prefs,
+            internet_proxy_start,
+            internet_proxy_stop,
+            internet_proxy_status,
+            internet_proxy_logs,
+            internet_proxy_logs_clear,
+            load_client_settings_json,
+            save_client_settings_json,
+            apply_default_rules_preset_cmd,
+            load_default_rules_bundles_form,
+            save_default_rules_bundles_form,
+            load_board_rules_form,
+            save_board_rules_form,
             fetch_remote_host_stats,
             fetch_remote_host_stats_detail,
             fetch_remote_host_stats_series,

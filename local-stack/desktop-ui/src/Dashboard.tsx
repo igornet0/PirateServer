@@ -9,6 +9,12 @@
  * - `list_server_bookmarks` / `add_server_bookmark` / `delete_server_bookmark` / `activate_server_bookmark` / `rename_server_bookmark`
  * - `pick_deploy_directory` / `set_active_project` / `deploy_from_directory`
  * - `pick_server_stack_tar_gz` / `apply_server_stack_update` / `fetch_server_stack_info_cmd` (OTA host bundle)
+ * - `start_display_ingest` / `display_ingest_base` / `display_ingest_export_consumer_config` — display stream receive
+ * - `get_display_stream_prefs` / `set_display_stream_prefs` — local stream send/receive flags
+ * - `internet_proxy_start` / `internet_proxy_stop` / `internet_proxy_status` — локальный CONNECT-прокси
+ * - `load_client_settings_json` / `save_client_settings_json` / `apply_default_rules_preset_cmd` — settings.json и пресеты правил
+ *
+ * Вкладки: «Обзор», «Соединение», «Интернет» (прокси и правила как у `pirate board`).
  *
  * Примеры будущих расширений (закомментируйте и подключите при необходимости):
  * // await invoke("get_metrics");
@@ -24,7 +30,10 @@ import {
   Copy,
   FileArchive,
   FolderOpen,
+  LayoutDashboard,
+  Link2,
   Loader2,
+  Globe,
   Pencil,
   Plus,
   RefreshCw,
@@ -33,6 +42,8 @@ import {
   X,
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { DisplayStreamPanel } from "./DisplayStreamPanel";
+import { InternetTrafficPanel } from "./InternetTrafficPanel";
 import { HostMetricsPanel } from "./HostMetricsPanel";
 import {
   MOCK_HOST_STATS,
@@ -119,7 +130,11 @@ const btnBase =
 // Dashboard
 // -----------------------------------------------------------------------------
 
+type MainTab = "overview" | "connection" | "internet";
+
 export function Dashboard() {
+  const [mainTab, setMainTab] = useState<MainTab>("overview");
+
   const [endpoint, setEndpoint] = useState<string | null>(null);
   const [grpcLive, setGrpcLive] = useState<GrpcConnectResult | null>(null);
   const [grpcErr, setGrpcErr] = useState<string | null>(null);
@@ -518,13 +533,103 @@ export function Dashboard() {
   return (
     <div className="min-h-screen bg-gradient-to-b from-deep via-[#100408] to-deep pb-16 text-slate-100">
       <div className="mx-auto max-w-[1600px] px-4 pt-8 sm:px-6 sm:pt-10 lg:px-10">
-        <header className="mb-8 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+          <nav
+            className="inline-flex rounded-2xl border border-white/10 bg-black/25 p-1 shadow-inner"
+            aria-label="Разделы приложения"
+          >
+            <button
+              type="button"
+              onClick={() => setMainTab("overview")}
+              className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                mainTab === "overview"
+                  ? "bg-gradient-to-r from-red-800/90 to-red-950/90 text-white shadow-md"
+                  : "text-slate-400 hover:text-slate-100"
+              }`}
+            >
+              <LayoutDashboard className="h-4 w-4" aria-hidden />
+              Обзор
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainTab("connection")}
+              className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                mainTab === "connection"
+                  ? "bg-gradient-to-r from-red-800/90 to-red-950/90 text-white shadow-md"
+                  : "text-slate-400 hover:text-slate-100"
+              }`}
+            >
+              <Link2 className="h-4 w-4" aria-hidden />
+              Соединение
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainTab("internet")}
+              className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                mainTab === "internet"
+                  ? "bg-gradient-to-r from-red-800/90 to-red-950/90 text-white shadow-md"
+                  : "text-slate-400 hover:text-slate-100"
+              }`}
+            >
+              <Globe className="h-4 w-4" aria-hidden />
+              Интернет
+            </button>
+          </nav>
         </header>
 
         <div className="grid grid-cols-1 gap-6 xl:grid-cols-2 xl:gap-8 xl:items-start">
-          {/* Left column: server strip + metrics */}
+          {/* Слева: на «Обзоре» — краткий статус gRPC + метрики; на «Соединении» — полная панель deploy-server; «Интернет» — локальный прокси */}
           <div className="flex flex-col gap-6">
-            {/* 1. Server header */}
+            {mainTab === "internet" ? (
+              <InternetTrafficPanel />
+            ) : (
+              <>
+            {mainTab === "overview" ? (
+              <section
+                className="rounded-2xl border border-white/10 bg-surface/90 p-4 shadow-card backdrop-blur"
+                aria-labelledby="conn-summary-heading"
+              >
+                <h2
+                  id="conn-summary-heading"
+                  className="text-xs font-medium uppercase tracking-wide text-slate-500"
+                >
+                  Deploy-server (gRPC)
+                </h2>
+                <div className="mt-2 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0 flex-1">
+                    {endpoint ? (
+                      <code className="block truncate rounded-lg bg-black/40 px-2 py-1.5 text-sm text-amber-100/90">
+                        {endpoint}
+                      </code>
+                    ) : (
+                      <p className="text-sm text-slate-400">Не подключено к deploy-server.</p>
+                    )}
+                    <p className="mt-1 text-xs text-slate-500">
+                      Статус:{" "}
+                      <span className={isRunning ? "text-emerald-400" : "text-rose-300"}>
+                        {grpcLive?.state ?? "—"}
+                      </span>
+                      {grpcLive?.currentVersion ? (
+                        <span className="text-slate-500">
+                          {" "}
+                          · версия{" "}
+                          <span className="text-slate-300">{grpcLive.currentVersion}</span>
+                        </span>
+                      ) : null}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setMainTab("connection")}
+                    className={`${btnBase} shrink-0 border border-red-600/50 bg-red-950/40 text-red-100 hover:bg-red-950/60`}
+                  >
+                    Настройка соединения
+                  </button>
+                </div>
+              </section>
+            ) : null}
+            {/* 1. Полная панель gRPC — только вкладка «Соединение» */}
+            {mainTab === "connection" ? (
             <section
               className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card backdrop-blur transition hover:shadow-glow"
               aria-labelledby="server-heading"
@@ -680,8 +785,11 @@ export function Dashboard() {
                 </p>
               ) : null}
             </section>
+            ) : null}
 
-            {/* 2. Remote host metrics */}
+            {/* 2. Remote host metrics — только «Обзор» */}
+            {mainTab === "overview" ? (
+              <>
             <HostMetricsPanel
               metrics={metrics}
               metricsLoading={metricsLoading}
@@ -691,11 +799,19 @@ export function Dashboard() {
               endpoint={endpoint}
               seriesBaseUrl={controlApiInput.trim() || null}
             />
+
+            <DisplayStreamPanel />
+              </>
+            ) : null}
+              </>
+            )}
           </div>
 
-          {/* Right column: bookmarks + deploy */}
+          {/* Справа: на «Соединении» — закладки; на «Обзоре» — деплой и stack */}
+          {mainTab !== "internet" ? (
           <div className="flex flex-col gap-6">
-            {/* 3. Saved servers */}
+            {/* 3. Saved servers — только «Соединение» */}
+            {mainTab === "connection" ? (
             <section
               className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card"
               aria-labelledby="bookmarks-heading"
@@ -777,7 +893,10 @@ export function Dashboard() {
                 Add server
               </button>
             </section>
+            ) : null}
 
+            {mainTab === "overview" ? (
+            <>
             {/* 4. Deploy artifact */}
             <section
               className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card"
@@ -961,7 +1080,10 @@ export function Dashboard() {
                 <p className="mt-3 text-sm text-slate-400">{stackMsg}</p>
               ) : null}
             </section>
+            </>
+            ) : null}
           </div>
+        ) : null}
         </div>
       </div>
 

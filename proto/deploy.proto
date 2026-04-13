@@ -55,6 +55,9 @@ service DeployService {
   rpc CloseConnection(CloseConnectionRequest) returns (CloseConnectionResponse);
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
   rpc UpdateSettings(UpdateProxySettingsRequest) returns (UpdateProxySettingsResponse);
+
+  // Client-reported monitor list for dashboard display-stream UI (signed like GetStatus).
+  rpc ReportDisplayTopology(ReportDisplayTopologyRequest) returns (ReportDisplayTopologyResponse);
 }
 
 message PairRequest {
@@ -178,6 +181,8 @@ enum ProxyWireMode {
   PROXY_WIRE_MODE_VLESS = 1;
   PROXY_WIRE_MODE_TROJAN = 2;
   PROXY_WIRE_MODE_VMESS = 3;
+  PROXY_WIRE_MODE_SHADOWSOCKS = 4;
+  PROXY_WIRE_MODE_SOCKS5 = 5;
 }
 
 message ProxyOpen {
@@ -190,6 +195,10 @@ message ProxyOpen {
   // When set to non-RAW, `wire_config_json` carries protocol params; destination is taken from protocol handshake, not from host/port alone.
   optional ProxyWireMode wire_mode = 5;
   optional string wire_config_json = 6;
+  // Higher value = higher priority when server limits concurrent tunnels (`DEPLOY_PROXY_MAX_CONCURRENT_TUNNELS`).
+  optional int32 tunnel_priority = 7;
+  // When true (and server has QUIC data-plane), use QUIC for bytes instead of gRPC frames after OpenResult.
+  optional bool prefer_quic_data_plane = 8;
 }
 
 // --- Managed proxy sessions (control plane) ---
@@ -214,6 +223,12 @@ message ProxyConnectionPolicy {
   optional ProxyAccessSchedule access_schedule = 5;
   // Idle gap (seconds) after which active time stops accruing until next bytes.
   optional uint32 active_idle_timeout_sec = 6;
+  // When true, session expiry is effectively unbounded (stored as far-future timestamp server-side).
+  optional bool never_expires = 7;
+  // When true, max_session_duration_sec is enforced against cumulative active_ms (idle-aware), not wall-clock since first_open_at.
+  optional bool limit_duration_by_active_time = 8;
+  // Max concurrent tunnels/devices per session (gRPC + optional ingress); 0 = use server default from env.
+  optional uint32 max_concurrent_devices_per_session = 9;
 }
 
 message CreateConnectionRequest {
@@ -222,6 +237,18 @@ message CreateConnectionRequest {
   ProxyConnectionPolicy policy = 3;
   // If set, the session token is bound to this client public key (share with recipient).
   optional string recipient_client_pubkey_b64 = 4;
+  // Same values as ProxyWireMode (1=VLESS, 2=TROJAN, 3=VMESS). Omitted = not stored.
+  optional int32 wire_mode = 5;
+  // JSON per wire-protocol WireParams (uuid / password / flow).
+  optional string wire_config_json = 6;
+  // --- Full ingress (public listeners; sing-box metadata), separate from gRPC wire_mode ---
+  // 0 = none; 1=VLESS 2=VMess 3=Trojan 4=Shadowsocks 5=SOCKS 6=Hysteria2
+  optional int32 ingress_protocol = 7;
+  optional uint32 ingress_listen_port = 8;
+  optional uint32 ingress_listen_udp_port = 9;
+  optional string ingress_config_json = 10;
+  optional string ingress_tls_json = 11;
+  optional uint32 ingress_template_version = 12;
 }
 
 message CreateConnectionResponse {
@@ -229,6 +256,10 @@ message CreateConnectionResponse {
   string session_token = 2;
   int64 expires_at_unix_ms = 3;
   string status = 4;
+  // Opaque token for public subscription URL (Xray JSON); shown once.
+  optional string subscription_token = 5;
+  // Full subscription URL when server knows public base (control-api).
+  optional string subscription_url = 6;
 }
 
 message CloseConnectionRequest {
@@ -261,6 +292,14 @@ message UpdateProxySettingsRequest {
   string project_id = 1;
   string session_id = 2;
   ProxyConnectionPolicy policy = 3;
+  optional int32 wire_mode = 4;
+  optional string wire_config_json = 5;
+  optional int32 ingress_protocol = 6;
+  optional uint32 ingress_listen_port = 7;
+  optional uint32 ingress_listen_udp_port = 8;
+  optional string ingress_config_json = 9;
+  optional string ingress_tls_json = 10;
+  optional uint32 ingress_template_version = 11;
 }
 
 message UpdateProxySettingsResponse {
@@ -280,6 +319,14 @@ message ProxyClientMsg {
 message ProxyOpenResult {
   bool ok = 1;
   string error = 2;
+  // When true, proxied bytes use QUIC data-plane (UDP) instead of gRPC frames after this message.
+  bool quic_data_plane = 3;
+  // Hostname or IP for QUIC; empty means client should use gRPC endpoint host.
+  string quic_host = 4;
+  // UDP port for QUIC listener on the server (0 = client default, e.g. 7844).
+  uint32 quic_port = 5;
+  // Opaque short-lived ticket bound to this tunnel; required for first QUIC stream auth.
+  bytes data_plane_ticket = 6;
 }
 
 message ProxyServerMsg {
@@ -303,6 +350,10 @@ message ServerStackInfo {
   bool host_dashboard_enabled = 4;
   // True when /etc/nginx/sites-enabled/pirate exists; unset means unknown (could not stat).
   optional bool host_nginx_pirate_site = 5;
+  // Snapshot from /var/lib/pirate/host-gui-install.json at install time (Linux bundle); unset if missing.
+  optional bool host_gui_detected_at_install = 6;
+  // Raw JSON from host-gui-install.json (gui_detected, reasons, display_stream_consent, ts_unix, …).
+  optional string host_gui_install_json = 7;
 }
 
 // --- Host stats (control-plane parity with GET /api/v1/host-stats) ---
@@ -483,6 +534,13 @@ message ListSessionsRequest {
   string project_id = 1;
 }
 
+message DisplayTopologyDisplay {
+  uint32 index = 1;
+  string label = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
 message SessionPeerRow {
   string client_public_key_b64 = 1;
   int64 last_seen_ms = 2;
@@ -500,6 +558,18 @@ message SessionPeerRow {
   // Cumulative ProxyTunnel bytes attributed to this peer (sum of hourly buckets).
   uint64 proxy_bytes_in_total = 12;
   uint64 proxy_bytes_out_total = 13;
+  repeated DisplayTopologyDisplay display_topology = 14;
+  optional bool display_stream_capable = 15;
+}
+
+message ReportDisplayTopologyRequest {
+  string project_id = 1;
+  repeated DisplayTopologyDisplay displays = 2;
+  bool stream_capable = 3;
+}
+
+message ReportDisplayTopologyResponse {
+  string status = 1;
 }
 
 message ListSessionsResponse {

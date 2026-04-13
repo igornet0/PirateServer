@@ -61,7 +61,29 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
     )?;
     migrate_bookmarks(&c)?;
     migrate_connection_control_api(&c)?;
+    migrate_display_stream_prefs(&c)?;
     Ok(c)
+}
+
+fn migrate_display_stream_prefs(c: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt = c.prepare("PRAGMA table_info(connection)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !cols.iter().any(|n| n == "display_stream_allow_receive") {
+        c.execute(
+            "ALTER TABLE connection ADD COLUMN display_stream_allow_receive INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !cols.iter().any(|n| n == "display_stream_allow_send") {
+        c.execute(
+            "ALTER TABLE connection ADD COLUMN display_stream_allow_send INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_connection_control_api(c: &Connection) -> Result<(), rusqlite::Error> {

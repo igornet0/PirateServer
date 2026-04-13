@@ -1,6 +1,6 @@
 [package]
 name = "pirate-desktop"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Pirate Client desktop shared library (Tauri backend helpers)"
 autobins = false
@@ -13,6 +13,7 @@ path = "src/lib.rs"
 deploy-client = { path = "../client" }
 deploy-auth = { path = "../../server-stack/deploy-auth" }
 deploy-core = { path = "../../server-stack/deploy-core" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
