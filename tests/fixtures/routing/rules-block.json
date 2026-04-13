@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "last_updated": "2026-04-12",
+  "domains_block": ["test.block.local"],
+  "domain_patterns_block": [],
+  "ips_block": []
+}

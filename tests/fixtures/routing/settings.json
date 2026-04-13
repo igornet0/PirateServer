@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "global": {
+    "bypass": [],
+    "default_rules": {
+      "block_json": "rules-block.json",
+      "pass_json": "rules-pass.json"
+    }
+  },
+  "default_board": "default",
+  "boards": {
+    "default": {
+      "enabled": true,
+      "url": "http://deploy-server:50051"
+    }
+  }
+}

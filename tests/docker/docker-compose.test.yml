@@ -1,7 +1,7 @@
 # Full stack for integration / e2e: PostgreSQL, deploy-server, control-api, nginx (static + API proxy).
 # Usage:
-#   docker compose -f docker-compose.test.yml up -d --build
-#   docker compose -f docker-compose.test.yml run --rm e2e
+#   docker compose -f tests/docker/docker-compose.test.yml up -d --build
+#   docker compose -f tests/docker/docker-compose.test.yml run --rm e2e
 # Or: ./scripts/e2e-docker.sh (wraps the above)
 # Postgres data: named volume postgres-data. Reset: docker compose … down -v
 
@@ -25,7 +25,7 @@ services:
 
   deploy-server:
     build:
-      context: .
+      context: ../..
       target: runtime-base
     image: pirate-test-runtime
     ports:
@@ -49,6 +49,11 @@ services:
       DEPLOY_ALLOW_SERVER_STACK_UPDATE: "true"
       # Shown in dashboard “local client” JSON (host browser → published gRPC port).
       DEPLOY_GRPC_PUBLIC_URL: "http://127.0.0.1:${DOCKER_E2E_GRPC_PORT:-50051}"
+      # Optional tunnel registry + admission (add a `redis` service and set DEPLOY_REDIS_URL):
+      # DEPLOY_REDIS_URL: redis://redis:6379
+      # DEPLOY_PROXY_MAX_CONCURRENT_TUNNELS: "32"
+      # DEPLOY_PROXY_TUNNEL_WAIT_TIMEOUT_SEC: "600"
+      # DEPLOY_PROXY_TUNNEL_CHECKPOINT_SEC: "1800"
       # Optional dashboard seed (with CONTROL_API_JWT_SECRET on control-api):
       CONTROL_UI_ADMIN_USERNAME: admin
       CONTROL_UI_ADMIN_PASSWORD: testpass
@@ -82,6 +87,7 @@ services:
       CONTROL_API_HOST_STATS_SERIES: "1"  # Required for history charts in dashboard.
       CONTROL_API_HOST_STATS_STREAM: "1"  # Required for SSE stats chart in dashboard.
       CONTROL_API_CORS_ALLOW_ANY: "1"
+      CONTROL_API_JWT_SECRET: testpass
       # Omit CONTROL_API_JWT_SECRET here so e2e-docker.sh can curl /api/v1/status without Bearer.
       # Bearer/JWT flows: scripts/run-docker-e2e-bearer.sh with DOCKER_E2E_API_TOKEN + secret in env.
     depends_on:
@@ -96,7 +102,7 @@ services:
 
   nginx:
     build:
-      context: .
+      context: ../..
       target: nginx-with-ui
     image: pirate-test-nginx
     ports:
@@ -112,8 +118,8 @@ services:
     pull_policy: never
     command: ["bash", "-lc", "bash /e2e/e2e-docker.sh"]
     volumes:
-      - ./scripts/e2e-docker.sh:/e2e/e2e-docker.sh:ro
-      - ./tests/fixtures:/fixtures:ro
+      - ../../scripts/e2e-docker.sh:/e2e/e2e-docker.sh:ro
+      - ../../tests/fixtures:/fixtures:ro
     environment:
       - nginx_public=http://nginx:80
       - GRPC_ENDPOINT=http://deploy-server:50051

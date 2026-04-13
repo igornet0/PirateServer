@@ -19,6 +19,9 @@ debug
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Python 
+__pycache__/
+
 /target/
 **/node_modules/
 frontend/dist/
@@ -26,3 +29,10 @@ dist/
 
 .DS_Store
 PirateMarket/
+ClientsWeb/
+
+# Эфемерные данные локального стека (scripts/start-local-macos-stack.sh)
+tmp/
+
+# Proxy E2E JSON reports (keep artifacts/.gitkeep)
+artifacts/*.json

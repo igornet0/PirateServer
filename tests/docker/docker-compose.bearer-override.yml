@@ -1,8 +1,8 @@
 # Optional merge: require Bearer token on control-api /api/v1/* and /health is still open.
 # Usage from repo root:
 #   export DOCKER_E2E_API_TOKEN=your-secret
-#   docker compose -f docker-compose.test.yml -f docker-compose.bearer-override.yml up -d --build
-#   docker compose -f docker-compose.test.yml -f docker-compose.bearer-override.yml --profile e2e run --rm e2e
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.bearer-override.yml up -d --build
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.bearer-override.yml --profile e2e run --rm e2e
 
 services:
   control-api:

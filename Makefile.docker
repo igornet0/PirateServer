@@ -1,4 +1,5 @@
 # Docker Compose helpers (test stack + dev-frontend: UI из server-stack/frontend/dist)
+# Compose files live under tests/docker/ (paths in YAML relative to that directory).
 # Usage from repo root: make -f Makefile.docker <target>
 #
 # Примеры:
@@ -12,19 +13,26 @@
 #   make -f Makefile.docker grpc-client-e2e  # Pair + board (ProxyTunnel) + signed deploy в контейнере
 
 CARGO ?= cargo
+DOCKER_COMPOSE_DIR := tests/docker
+DC := $(DOCKER_COMPOSE_DIR)
 # Дашборд из server-stack/frontend/dist на хосте (без пересборки образа nginx при правках UI).
-COMPOSE := docker compose -f docker-compose.test.yml -f docker-compose.dev-frontend.yml
+COMPOSE := docker compose -f $(DC)/docker-compose.test.yml -f $(DC)/docker-compose.dev-frontend.yml
 # Отдельный project name — не пересоздаёт deploy-server стека из `make up` / `make e2e`.
-COMPOSE_GRPC_CLIENT := docker compose -p pirateserver-grpc -f docker-compose.test.yml -f docker-compose.dev-frontend.yml -f docker-compose.grpc-client-e2e.yml
-COMPOSE_NGINX := $(COMPOSE) -f docker-compose.nginx-e2e.yml
-COMPOSE_BEARER := docker compose -f docker-compose.test.yml -f docker-compose.bearer-override.yml -f docker-compose.dev-frontend.yml
+COMPOSE_GRPC_CLIENT := docker compose -p pirateserver-grpc -f $(DC)/docker-compose.test.yml -f $(DC)/docker-compose.dev-frontend.yml -f $(DC)/docker-compose.grpc-client-e2e.yml
+COMPOSE_NGINX := $(COMPOSE) -f $(DC)/docker-compose.nginx-e2e.yml
+COMPOSE_BEARER := docker compose -f $(DC)/docker-compose.test.yml -f $(DC)/docker-compose.bearer-override.yml -f $(DC)/docker-compose.dev-frontend.yml
+COMPOSE_INGRESS := docker compose -p pirateserver-ingress -f $(DC)/docker-compose.ingress.yml
 TAIL ?= 100
 
 .PHONY: help up down down-v build restart stop ps status logs logs-follow e2e e2e-bearer e2e-nginx grpc-client-e2e connection \
-	client-status client-deploy doctor
+	client-status client-deploy doctor \
+	wire-e2e routing-e2e redis-tunnel-tests proxy-connect-e2e \
+	proxy-test-basic proxy-test-network proxy-test-load proxy-test-all \
+	protocol-bench protocol-load protocol-fuzz protocol-soak protocol-abuse \
+	ingress-up ingress-down
 
 help:
-	@echo "Docker (docker-compose.test.yml + docker-compose.dev-frontend.yml):"
+	@echo "Docker (compose в $(DC)/):"
 	@echo "  up            — поднять стек в фоне (build + up -d); UI из server-stack/frontend/dist"
 	@echo "                  (один раз: cd server-stack/frontend && npm ci && npm run build; при разработке: npm run build:watch)"
 	@echo "  down          — остановить и убрать контейнеры"
@@ -42,6 +50,14 @@ help:
 	@echo "  e2e-bearer    — стек + bearer (нужен DOCKER_E2E_API_TOKEN в env)"
 	@echo "  e2e-nginx     — merge nginx-e2e + тест PUT /api/v1/nginx/config"
 	@echo "  grpc-client-e2e — отдельный compose project pirateserver-grpc: Pair, board→control-api, два signed deploy"
+	@echo "  wire-e2e      — VLESS/Trojan/VMess wire tunnel e2e (scripts/run-wire-tunnel-e2e.sh)"
+	@echo "  routing-e2e   — фильтрация CONNECT/HTTPS (scripts/run-routing-e2e.sh)"
+	@echo "  redis-tunnel-tests — Redis + ProxyTunnel smoke (scripts/run-redis-tunnel-docker-tests.sh)"
+	@echo "  proxy-connect-e2e — alias: PROXY_TEST_SUITE=basic (scripts/run-proxy-test-suite.sh)"
+	@echo "  proxy-test-basic|network|load|all — модульный proxy E2E + netem + отчёт (./artifacts/proxy-test-report.json)"
+	@echo "  protocol-bench — матрица пропускной способности (scripts/run-protocol-bench.sh)"
+	@echo "  protocol-load | protocol-fuzz | protocol-soak | protocol-abuse — см. scripts/run-protocol-*.sh"
+	@echo "  ingress-up / ingress-down — sing-box (отдельный project pirateserver-ingress); конфиг: sing-box-config.json в корне репо"
 	@echo ""
 	@echo "Переменные: TAIL=число  SERVICE=имя_сервиса  (для logs / logs-follow)"
 	@echo "  DOCKER_E2E_HOST (default 127.0.0.1)  DOCKER_E2E_GRPC_PORT (default 50051)"
@@ -116,3 +132,48 @@ e2e-nginx:
 # Стек с DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=0; тест поднимает зависимости и прогоняет scripts/grpc-client-docker-e2e.sh
 grpc-client-e2e:
 	$(COMPOSE_GRPC_CLIENT) --profile grpc-client run --rm --build grpc-client-e2e
+
+wire-e2e:
+	./scripts/run-wire-tunnel-e2e.sh
+
+routing-e2e:
+	./scripts/run-routing-e2e.sh
+
+redis-tunnel-tests:
+	./scripts/run-redis-tunnel-docker-tests.sh
+
+proxy-connect-e2e:
+	./scripts/run-proxy-connect-docker-e2e.sh
+
+proxy-test-basic:
+	PROXY_TEST_SUITE=basic ./scripts/run-proxy-test-suite.sh
+
+proxy-test-network:
+	PROXY_TEST_SUITE=network ./scripts/run-proxy-test-suite.sh
+
+proxy-test-load:
+	PROXY_TEST_SUITE=load ./scripts/run-proxy-test-suite.sh
+
+proxy-test-all:
+	PROXY_TEST_SUITE=full ./scripts/run-proxy-test-suite.sh
+
+protocol-bench:
+	./scripts/run-protocol-bench.sh
+
+protocol-load:
+	./scripts/run-protocol-load.sh
+
+protocol-fuzz:
+	./scripts/run-protocol-fuzz.sh
+
+protocol-soak:
+	./scripts/run-protocol-soak.sh
+
+protocol-abuse:
+	./scripts/run-protocol-abuse.sh
+
+ingress-up:
+	$(COMPOSE_INGRESS) up -d
+
+ingress-down:
+	$(COMPOSE_INGRESS) down

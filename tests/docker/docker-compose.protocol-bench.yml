@@ -1,0 +1,169 @@
+# Merge with tests/docker/docker-compose.test.yml — throughput + security matrix (gRPC ConnectionProbe, ProxyTunnel plain, VLESS/Trojan/VMess).
+#
+# Usage:
+#   ./scripts/run-protocol-bench.sh
+# Teardown:
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.protocol-bench.yml --profile protocol-bench down -v
+
+services:
+  deploy-server:
+    environment:
+      DEPLOY_GRPC_ALLOW_UNAUTHENTICATED: "0"
+      DEPLOY_GRPC_PUBLIC_URL: "http://deploy-server:50051"
+      DEPLOY_PROXY_REQUIRE_SESSION_TOKEN: "1"
+      # deny.target must NOT appear here (negative allowlist test).
+      DEPLOY_PROXY_ALLOWLIST: "bench-upstream,wire-upstream"
+
+  control-api:
+    command:
+      - control-api
+      - --deploy-root
+      - /data
+      - --bind
+      - "0.0.0.0"
+      - --listen-port
+      - "8080"
+      - --grpc-endpoint
+      - http://deploy-server:50051
+      - --database-url
+      - postgresql://deploy:deploy@postgres:5432/deploy
+      - --grpc-signing-key-path
+      - /data/.keys/control_api_ed25519.json
+    environment:
+      GRPC_SIGNING_KEY_PATH: /data/.keys/control_api_ed25519.json
+
+  bootstrap-grpc-keys:
+    profiles:
+      - protocol-bench
+    image: pirate-test-runtime
+    pull_policy: never
+    volumes:
+      - deploy-data:/data
+    environment:
+      DEPLOY_ROOT: /data
+    depends_on:
+      deploy-server:
+        condition: service_started
+    entrypoint: ["/usr/local/bin/entrypoint-deploy.sh"]
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        for i in $$(seq 1 90); do
+          if [ -f /data/.keys/server_ed25519.json ]; then break; fi
+          sleep 1
+        done
+        if [ ! -f /data/.keys/server_ed25519.json ]; then
+          echo "bootstrap-grpc-keys: timeout waiting for /data/.keys/server_ed25519.json" >&2
+          exit 1
+        fi
+        exec /usr/local/bin/control-api bootstrap-grpc-key
+
+  bench-upstream:
+    profiles:
+      - protocol-bench
+    image: python:3.12-slim-bookworm
+    volumes:
+      - ../../scripts/bench_http_upstream.py:/srv/bench_http_upstream.py:ro
+    command: ["python", "/srv/bench_http_upstream.py", "9000"]
+    networks:
+      default:
+        aliases:
+          - wire-upstream
+          # Routing e2e: bypass (*.local) hits same upstream via direct TCP.
+          - bench.local
+
+  deny-upstream:
+    profiles:
+      - protocol-bench
+    image: python:3.12-slim-bookworm
+    command:
+      - bash
+      - -c
+      - |
+        mkdir -p /srv && echo 'DENY_OK' > /srv/index.html
+        exec python -m http.server 9000 --bind 0.0.0.0 --directory /srv
+    networks:
+      default:
+        aliases:
+          - deny.target
+
+  protocol-bench:
+    profiles:
+      - protocol-bench
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime-bench
+    image: pirate-bench-runtime
+    pull_policy: never
+    volumes:
+      - deploy-data:/data
+      - ../../scripts/protocol-bench-docker.sh:/e2e/protocol-bench-docker.sh:ro
+      - ../../proto/deploy.proto:/proto/deploy.proto:ro
+    environment:
+      GRPC_ENDPOINT: http://deploy-server:50051
+      CONTROL_API_DIRECT: http://control-api:8080
+      XDG_CONFIG_HOME: /tmp/pirate-protocol-bench-config
+      BENCH_BYTES: ${BENCH_BYTES:-33554432}
+      BENCH_RUNS: ${BENCH_RUNS:-3}
+    depends_on:
+      control-api:
+        condition: service_healthy
+      deploy-server:
+        condition: service_started
+      bench-upstream:
+        condition: service_started
+      deny-upstream:
+        condition: service_started
+    command: ["bash", "-lc", "bash /e2e/protocol-bench-docker.sh"]
+
+  # Dedicated runner: root + NET_ADMIN for tc/netem; does not share entrypoint gosu deploy.
+  proxy-test:
+    profiles:
+      - protocol-bench
+    image: pirate-bench-runtime
+    pull_policy: never
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime-bench
+    user: "0:0"
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/bin/bash", "-lc"]
+    command: ["bash /e2e/proxy-test/proxy-test-suite-inner.sh"]
+    volumes:
+      - deploy-data:/data
+      - ../../scripts/proxy-test:/e2e/proxy-test:ro
+      - ../../artifacts:/artifacts
+    environment:
+      GRPC_ENDPOINT: http://deploy-server:50051
+      CONTROL_API_DIRECT: http://control-api:8080
+      XDG_CONFIG_HOME: /tmp/pirate-proxy-test-config
+      NETEM_DELAY_MS: ${NETEM_DELAY_MS:-0}
+      NETEM_LOSS_PERCENT: ${NETEM_LOSS_PERCENT:-0}
+      NETEM_BANDWIDTH: ${NETEM_BANDWIDTH:-}
+      TEST_MODE: ${TEST_MODE:-local}
+      REMOTE_SERVER_ADDR: ${REMOTE_SERVER_ADDR:-}
+      PROXY_TEST_SUITE: ${PROXY_TEST_SUITE:-basic}
+      PROXY_TEST_RUNS: ${PROXY_TEST_RUNS:-3}
+      PROXY_TEST_BW_BYTES: ${PROXY_TEST_BW_BYTES:-2097152}
+      STABILITY_SEC: ${STABILITY_SEC:-30}
+      CONCURRENCY_CONNECTIONS: ${CONCURRENCY_CONNECTIONS:-10}
+      MAX_CONCURRENCY_CONNECTIONS: ${MAX_CONCURRENCY_CONNECTIONS:-50}
+      MIN_SUCCESS_RATE: ${MIN_SUCCESS_RATE:-0.95}
+      MAX_CONNECTION_FAILURE_RATE: ${MAX_CONNECTION_FAILURE_RATE:-0.05}
+      RUN_FAILURE_TESTS: ${RUN_FAILURE_TESTS:-0}
+      CONTROL_API_LOGIN_USER: ${CONTROL_API_LOGIN_USER:-admin}
+      CONTROL_API_LOGIN_PASSWORD: ${CONTROL_API_LOGIN_PASSWORD:-testpass}
+    depends_on:
+      control-api:
+        condition: service_healthy
+      deploy-server:
+        condition: service_started
+      bench-upstream:
+        condition: service_started
+      deny-upstream:
+        condition: service_started

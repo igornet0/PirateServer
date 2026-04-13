@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "last_updated": "2026-04-12",
+  "domains_pass": ["test.pass.local"],
+  "domain_patterns_pass": [],
+  "ips_pass": []
+}

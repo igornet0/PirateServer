@@ -1,0 +1,99 @@
+# Merge with tests/docker/docker-compose.test.yml for VLESS / Trojan / VMess wire tunnel e2e (client `board`).
+#
+# deploy-server must run with gRPC auth (no DEPLOY_GRPC_ALLOW_UNAUTHENTICATED) so ProxyTunnel works.
+# After bootstrap-grpc-key, deploy-server must be restarted once so it reloads authorized_peers.json
+# (see scripts/run-wire-tunnel-e2e.sh).
+#
+# Usage:
+#   ./scripts/run-wire-tunnel-e2e.sh
+# Or manually:
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.wire-e2e.yml up -d postgres deploy-server
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.wire-e2e.yml run --rm bootstrap-grpc-keys
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.wire-e2e.yml restart deploy-server
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.wire-e2e.yml up -d control-api nginx wire-upstream
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.wire-e2e.yml --profile wire-e2e run --rm wire-e2e
+
+services:
+  deploy-server:
+    environment:
+      DEPLOY_GRPC_ALLOW_UNAUTHENTICATED: "0"
+      DEPLOY_GRPC_PUBLIC_URL: "http://deploy-server:50051"
+      DEPLOY_PROXY_REQUIRE_SESSION_TOKEN: "1"
+
+  control-api:
+    command:
+      - control-api
+      - --deploy-root
+      - /data
+      - --bind
+      - "0.0.0.0"
+      - --listen-port
+      - "8080"
+      - --grpc-endpoint
+      - http://deploy-server:50051
+      - --database-url
+      - postgresql://deploy:deploy@postgres:5432/deploy
+      - --grpc-signing-key-path
+      - /data/.keys/control_api_ed25519.json
+    environment:
+      GRPC_SIGNING_KEY_PATH: /data/.keys/control_api_ed25519.json
+
+  bootstrap-grpc-keys:
+    profiles:
+      - wire-e2e
+    image: pirate-test-runtime
+    pull_policy: never
+    volumes:
+      - deploy-data:/data
+    environment:
+      DEPLOY_ROOT: /data
+    depends_on:
+      deploy-server:
+        condition: service_started
+    entrypoint: ["/usr/local/bin/entrypoint-deploy.sh"]
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        for i in $$(seq 1 90); do
+          if [ -f /data/.keys/server_ed25519.json ]; then break; fi
+          sleep 1
+        done
+        if [ ! -f /data/.keys/server_ed25519.json ]; then
+          echo "bootstrap-grpc-keys: timeout waiting for /data/.keys/server_ed25519.json" >&2
+          exit 1
+        fi
+        exec /usr/local/bin/control-api bootstrap-grpc-key
+
+  wire-upstream:
+    profiles:
+      - wire-e2e
+    image: python:3.12-slim-bookworm
+    command:
+      - bash
+      - -c
+      - |
+        mkdir -p /srv && echo 'WIRE_UPSTREAM_OK' > /srv/index.html
+        exec python -m http.server 9000 --bind 0.0.0.0 --directory /srv
+
+  wire-e2e:
+    profiles:
+      - wire-e2e
+    image: pirate-test-runtime
+    pull_policy: never
+    volumes:
+      - deploy-data:/data
+      - ../../scripts/wire-tunnel-e2e.sh:/e2e/wire-tunnel-e2e.sh:ro
+    environment:
+      GRPC_ENDPOINT: http://deploy-server:50051
+      CONTROL_API_DIRECT: http://control-api:8080
+      XDG_CONFIG_HOME: /tmp/pirate-wire-e2e-config
+    depends_on:
+      control-api:
+        condition: service_healthy
+      deploy-server:
+        condition: service_started
+      wire-upstream:
+        condition: service_started
+    command: ["bash", "-lc", "bash /e2e/wire-tunnel-e2e.sh"]

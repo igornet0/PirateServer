@@ -1,13 +1,13 @@
-# Live dashboard from host: merge with docker-compose.test.yml so nginx reads
+# Live dashboard from host: merge with tests/docker/docker-compose.test.yml so nginx reads
 # server-stack/frontend/dist without rebuilding the nginx image.
 # Makefile.docker подключает этот файл по умолчанию (make -f Makefile.docker up).
 #
 #   cd server-stack/frontend && npm ci && npm run build
-#   docker compose -f docker-compose.test.yml -f docker-compose.dev-frontend.yml up -d
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.dev-frontend.yml up -d
 #
 # While developing: npm run build:watch — then refresh the browser (F5) to pick up new assets.
 
 services:
   nginx:
     volumes:
-      - ./server-stack/frontend/dist:/usr/share/nginx/html:ro
+      - ../../server-stack/frontend/dist:/usr/share/nginx/html:ro

@@ -1,0 +1,99 @@
+# Merge with tests/docker/docker-compose.test.yml + tests/docker/docker-compose.protocol-bench.yml.
+# Extended profiles: load/latency, fuzz, soak, abuse (optional metrics on deploy-server).
+#
+# Example:
+#   ./scripts/run-protocol-load.sh
+#   ./scripts/run-protocol-fuzz.sh
+
+services:
+  deploy-server:
+    environment:
+      DEPLOY_METRICS_BIND: "0.0.0.0:9090"
+
+  protocol-load:
+    profiles:
+      - protocol-load
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime-bench
+    image: pirate-bench-runtime
+    pull_policy: never
+    volumes:
+      - deploy-data:/data
+      - ../../scripts/protocol-load-docker.sh:/e2e/protocol-load-docker.sh:ro
+    environment:
+      GRPC_ENDPOINT: http://deploy-server:50051
+      CONTROL_API_DIRECT: http://control-api:8080
+      XDG_CONFIG_HOME: /tmp/pirate-protocol-load-config
+      LATENCY_SAMPLES: ${LATENCY_SAMPLES:-200}
+      LOAD_RPS_DURATION_SEC: ${LOAD_RPS_DURATION_SEC:-5}
+      LOAD_PARALLEL: ${LOAD_PARALLEL:-8}
+    depends_on:
+      control-api:
+        condition: service_healthy
+      deploy-server:
+        condition: service_started
+    command: ["bash", "-lc", "bash /e2e/protocol-load-docker.sh"]
+
+  protocol-fuzz:
+    profiles:
+      - protocol-fuzz
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime-bench
+    image: pirate-bench-runtime
+    pull_policy: never
+    volumes:
+      - ../../scripts/protocol-fuzz-docker.sh:/e2e/protocol-fuzz-docker.sh:ro
+      - ../../proto/deploy.proto:/proto/deploy.proto:ro
+    environment:
+      FUZZ_ITERATIONS: ${FUZZ_ITERATIONS:-40}
+    depends_on:
+      deploy-server:
+        condition: service_started
+    command: ["bash", "-lc", "bash /e2e/protocol-fuzz-docker.sh"]
+
+  protocol-soak:
+    profiles:
+      - protocol-soak
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime-bench
+    image: pirate-bench-runtime
+    pull_policy: never
+    volumes:
+      - deploy-data:/data
+      - ../../scripts/protocol-soak-docker.sh:/e2e/protocol-soak-docker.sh:ro
+    environment:
+      GRPC_ENDPOINT: http://deploy-server:50051
+      CONTROL_API_DIRECT: http://control-api:8080
+      XDG_CONFIG_HOME: /tmp/pirate-protocol-soak-config
+      SOAK_DURATION_SEC: ${SOAK_DURATION_SEC:-300}
+      SOAK_INTERVAL_SEC: ${SOAK_INTERVAL_SEC:-10}
+    depends_on:
+      control-api:
+        condition: service_healthy
+      deploy-server:
+        condition: service_started
+    command: ["bash", "-lc", "bash /e2e/protocol-soak-docker.sh"]
+
+  protocol-abuse:
+    profiles:
+      - protocol-abuse
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime-bench
+    image: pirate-bench-runtime
+    pull_policy: never
+    volumes:
+      - ../../scripts/protocol-abuse-docker.sh:/e2e/protocol-abuse-docker.sh:ro
+    environment:
+      ABUSE_TCP_HALF_OPEN: ${ABUSE_TCP_HALF_OPEN:-5}
+    depends_on:
+      deploy-server:
+        condition: service_started
+    command: ["bash", "-lc", "bash /e2e/protocol-abuse-docker.sh"]

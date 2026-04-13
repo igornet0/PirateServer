@@ -1,0 +1,55 @@
+# Merge with tests/docker/docker-compose.test.yml — проверка правил фильтрации (block / pass) через HTTP CONNECT + HTTPS.
+#
+# Переопределяет deploy-server: в docker-compose.test.yml по умолчанию DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1,
+# из-за чего отключены pairing и `client auth` (ошибка «authentication disabled; pairing unavailable»).
+# Здесь включаем обычную gRPC-аутентификацию, как в docker-compose.grpc-client-e2e.yml / wire-e2e.
+#
+# Upstream: nginx с TLS и DNS-алиасами test.{block,pass,tunnel}.local в одной сети с e2e-раннером.
+# Клиент: `client board` с settings.json + JSON правил (см. tests/fixtures/routing).
+#
+# Запуск:
+#   ./scripts/run-routing-e2e.sh
+# Или:
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.routing-e2e.yml --profile routing-e2e run --rm routing-e2e
+
+services:
+  deploy-server:
+    environment:
+      DEPLOY_GRPC_ALLOW_UNAUTHENTICATED: "0"
+      DEPLOY_GRPC_PUBLIC_URL: "http://deploy-server:50051"
+
+  routing-target:
+    image: nginx:alpine
+    volumes:
+      - ../../tests/fixtures/routing/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../../tests/fixtures/routing/certs:/etc/nginx/certs:ro
+    networks:
+      default:
+        aliases:
+          - test.pass.local
+          - test.block.local
+          - test.tunnel.local
+
+  routing-e2e:
+    profiles:
+      - routing-e2e
+    image: pirate-test-runtime
+    pull_policy: never
+    entrypoint: ["/usr/local/bin/entrypoint-deploy.sh"]
+    command: ["bash", "-lc", "bash /e2e/routing-e2e-docker.sh"]
+    volumes:
+      - ../../scripts/routing-e2e-docker.sh:/e2e/routing-e2e-docker.sh:ro
+      - ../../tests/fixtures:/fixtures:ro
+      - deploy-data:/mnt/rodata:ro
+    environment:
+      - GRPC_ENDPOINT=http://deploy-server:50051
+      - CONTROL_API_DIRECT=http://control-api:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      deploy-server:
+        condition: service_started
+      control-api:
+        condition: service_healthy
+      routing-target:
+        condition: service_started

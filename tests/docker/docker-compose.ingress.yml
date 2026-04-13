@@ -1,0 +1,17 @@
+# Optional stack: sing-box reads a JSON file produced by `ingress-manager` (see server-stack/ingress-config).
+# Generate config on the host (or a sidecar) with DATABASE_URL pointing at the same DB as deploy-server.
+#
+# Example:
+#   DATABASE_URL=postgres://... INGRESS_RELOAD_CMD="docker kill -s HUP sing-box" \
+#     cargo run -p ingress-config --bin ingress-manager -- --output ./sing-box-config.json
+#   docker compose -f tests/docker/docker-compose.ingress.yml up -d
+
+services:
+  sing-box:
+    image: ghcr.io/sagernet/sing-box:v1.10.0
+    container_name: pirate-sing-box
+    restart: unless-stopped
+    volumes:
+      - ../../sing-box-config.json:/etc/sing-box/config.json:ro
+    network_mode: host
+    command: ["run", "-c", "/etc/sing-box/config.json"]

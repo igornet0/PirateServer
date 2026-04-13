@@ -1,10 +1,10 @@
-# Merge with docker-compose.test.yml (+ optional dev-frontend) for gRPC Pair + ProxyTunnel + signed deploy.
+# Merge with tests/docker/docker-compose.test.yml (+ optional dev-frontend) for gRPC Pair + ProxyTunnel + signed deploy.
 # Install bundle URL must be reachable from inside Docker (not 127.0.0.1 on the host).
 #
 # Makefile uses `docker compose -p pirateserver-grpc …` so this stack does not replace the default
 # `pirateserver` project or bind host ports (see ports: !override []).
 #
-# Teardown: docker compose -p pirateserver-grpc -f docker-compose.test.yml -f docker-compose.dev-frontend.yml -f docker-compose.grpc-client-e2e.yml down -v
+# Teardown: docker compose -p pirateserver-grpc -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.dev-frontend.yml -f tests/docker/docker-compose.grpc-client-e2e.yml down -v
 #
 # grpc-client-e2e mounts deploy-data read-only at /mnt/rodata (not /data) so entrypoint-deploy.sh
 # does not try chown on a read-only mount.
@@ -30,8 +30,8 @@ services:
     pull_policy: never
     command: ["bash", "-lc", "bash /e2e/grpc-client-docker-e2e.sh"]
     volumes:
-      - ./scripts/grpc-client-docker-e2e.sh:/e2e/grpc-client-docker-e2e.sh:ro
-      - ./tests/fixtures:/fixtures:ro
+      - ../../scripts/grpc-client-docker-e2e.sh:/e2e/grpc-client-docker-e2e.sh:ro
+      - ../../tests/fixtures:/fixtures:ro
       - deploy-data:/mnt/rodata:ro
     environment:
       - GRPC_ENDPOINT=http://deploy-server:50051

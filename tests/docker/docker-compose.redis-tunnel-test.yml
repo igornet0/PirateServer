@@ -1,0 +1,115 @@
+# Merge with tests/docker/docker-compose.test.yml — Redis for tunnel registry + metrics on deploy-server + HTTP upstream for ProxyTunnel smoke.
+#
+# ProxyTunnel requires gRPC auth (same as docker-compose.wire-e2e.yml): bootstrap-grpc-keys + restart deploy-server.
+#
+# Usage:
+#   ./scripts/run-redis-tunnel-docker-tests.sh
+# Teardown:
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.redis-tunnel-test.yml down -v
+
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    ports:
+      - "${DOCKER_E2E_REDIS_PORT:-16379}:6379"
+
+  bench-upstream:
+    image: python:3.12-slim-bookworm
+    volumes:
+      - ../../scripts/bench_http_upstream.py:/srv/bench_http_upstream.py:ro
+    command: ["python", "/srv/bench_http_upstream.py", "9000"]
+    networks:
+      default:
+        aliases:
+          - bench-upstream
+
+  deploy-server:
+    environment:
+      DEPLOY_REDIS_URL: redis://redis:6379
+      DEPLOY_METRICS_BIND: 0.0.0.0:9090
+      # Overrides docker-compose.test.yml open gRPC — Pair + ProxyTunnel need ServerAuth.
+      DEPLOY_GRPC_ALLOW_UNAUTHENTICATED: "0"
+      DEPLOY_GRPC_PUBLIC_URL: "http://deploy-server:50051"
+      DEPLOY_PROXY_REQUIRE_SESSION_TOKEN: "1"
+    ports:
+      - "${DOCKER_E2E_METRICS_PORT:-19090}:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  control-api:
+    command:
+      - control-api
+      - --deploy-root
+      - /data
+      - --bind
+      - "0.0.0.0"
+      - --listen-port
+      - "8080"
+      - --grpc-endpoint
+      - http://deploy-server:50051
+      - --database-url
+      - postgresql://deploy:deploy@postgres:5432/deploy
+      - --grpc-signing-key-path
+      - /data/.keys/control_api_ed25519.json
+    environment:
+      GRPC_SIGNING_KEY_PATH: /data/.keys/control_api_ed25519.json
+
+  bootstrap-grpc-keys:
+    profiles:
+      - redis-tunnel-test
+    image: pirate-test-runtime
+    pull_policy: never
+    volumes:
+      - deploy-data:/data
+    environment:
+      DEPLOY_ROOT: /data
+    depends_on:
+      deploy-server:
+        condition: service_started
+    entrypoint: ["/usr/local/bin/entrypoint-deploy.sh"]
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        for i in $$(seq 1 90); do
+          if [ -f /data/.keys/server_ed25519.json ]; then break; fi
+          sleep 1
+        done
+        if [ ! -f /data/.keys/server_ed25519.json ]; then
+          echo "bootstrap-grpc-keys: timeout waiting for /data/.keys/server_ed25519.json" >&2
+          exit 1
+        fi
+        exec /usr/local/bin/control-api bootstrap-grpc-key
+
+  redis-tunnel-runner:
+    profiles:
+      - redis-tunnel-test
+    image: pirate-test-runtime
+    pull_policy: never
+    volumes:
+      - ../../scripts/redis-tunnel-docker-tests-inner.sh:/run.sh:ro
+    environment:
+      CONTROL_API_DIRECT: http://control-api:8080
+      GRPC_ENDPOINT: http://deploy-server:50051
+    # Keep entrypoint-deploy.sh so gosu deploy runs the test (same as other runtime services).
+    entrypoint: ["/usr/local/bin/entrypoint-deploy.sh"]
+    command: ["/bin/bash", "/run.sh"]
+    depends_on:
+      deploy-server:
+        condition: service_started
+      control-api:
+        condition: service_healthy
+      bench-upstream:
+        condition: service_started
+      redis:
+        condition: service_healthy
