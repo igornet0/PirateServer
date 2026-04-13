@@ -1,6 +1,6 @@
 [package]
 name = "deploy-server"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 
 [dependencies]
@@ -34,3 +34,9 @@ chrono-tz = "0.9"
 sysinfo = "0.32"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
+redis = { version = "0.27", features = ["tokio-comp"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+rcgen = "0.13"
+rustls-pemfile = "2"

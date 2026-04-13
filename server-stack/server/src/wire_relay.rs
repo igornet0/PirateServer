@@ -1,7 +1,8 @@
-//! Wire protocol (VLESS / Trojan / VMess) over gRPC `ProxyTunnel` after handshake; post-handshake = raw TCP bytes.
+//! Wire protocol (VLESS / Trojan / VMess / Shadowsocks / SOCKS5) over gRPC `ProxyTunnel` after handshake; post-handshake = raw TCP bytes.
 
 use crate::metrics_http::ProxyTunnelMetrics;
 use crate::proxy_session;
+use crate::tunnel_flush::{flush_managed_tunnel_end, spawn_managed_checkpoint, ManagedTunnelCheckpoint};
 use deploy_db::GrpcProxySessionRow;
 use deploy_proto::deploy::{proxy_client_msg, proxy_server_msg, ProxyClientMsg, ProxyServerMsg};
 use futures_util::StreamExt;
@@ -13,12 +14,27 @@ use tokio::sync::mpsc;
 use tonic::Status;
 use tracing::error;
 use wire_protocol::{
-    trojan_server_handshake, TrojanHandshakeResult, vless_parse_request, vmess_check_replay,
+    socks5_server_parse, ss_tcp_server_handshake, trojan_server_handshake, SsTcpHandshakeResult,
+    Socks5ServerHandshake, TrojanHandshakeResult, vless_parse_request, vmess_check_replay,
     vmess_open_header_byte_len, vmess_server_open_header, VlessParseResult, VmessReplayCache,
     WireParams,
 };
 
 const MAX_PROXY_CHUNK: usize = 256 * 1024;
+
+use deploy_proto::deploy::ProxyOpenResult;
+
+#[inline]
+fn proxy_open_result(ok: bool, err: impl AsRef<str>) -> ProxyOpenResult {
+    ProxyOpenResult {
+        ok,
+        error: err.as_ref().to_string(),
+        quic_data_plane: false,
+        quic_host: String::new(),
+        quic_port: 0,
+        data_plane_ticket: Vec::new(),
+    }
+}
 
 fn allowlist(host: &str) -> Result<(), Status> {
     let Ok(list) = std::env::var("DEPLOY_PROXY_ALLOWLIST") else {
@@ -43,20 +59,25 @@ fn allowlist(host: &str) -> Result<(), Status> {
     ))
 }
 
-struct ActiveTracker {
+pub(crate) struct ActiveTracker {
     last: Option<Instant>,
     idle: Duration,
     accum_ms: u64,
 }
 
 impl ActiveTracker {
-    fn new(idle_secs: u64) -> Self {
+    pub(crate) fn new(idle_secs: u64) -> Self {
         Self {
             last: None,
             idle: Duration::from_secs(idle_secs.max(1)),
             accum_ms: 0,
         }
     }
+
+    pub(crate) fn accum_ms(&self) -> u64 {
+        self.accum_ms
+    }
+
     fn bump(&mut self) {
         let now = Instant::now();
         if let Some(prev) = self.last {
@@ -80,6 +101,7 @@ pub async fn run_vless_relay(
     db_opt: Option<Arc<deploy_db::DbStore>>,
     client_pubkey_for_traffic: Option<String>,
     metrics: Arc<ProxyTunnelMetrics>,
+    managed_checkpoint: Option<ManagedTunnelCheckpoint>,
 ) {
     let uuid_str = match params.uuid.as_deref() {
         Some(s) if !s.trim().is_empty() => s.trim(),
@@ -87,10 +109,7 @@ pub async fn run_vless_relay(
             let _ = tx
                 .send(Ok(ProxyServerMsg {
                     body: Some(proxy_server_msg::Body::OpenResult(
-                        deploy_proto::deploy::ProxyOpenResult {
-                            ok: false,
-                            error: "vless: missing uuid in wire_config_json".into(),
-                        },
+                        proxy_open_result(false, "vless: missing uuid in wire_config_json"),
                     )),
                 }))
                 .await;
@@ -102,12 +121,10 @@ pub async fn run_vless_relay(
         Err(e) => {
             let _ = tx
                 .send(Ok(ProxyServerMsg {
-                    body: Some(proxy_server_msg::Body::OpenResult(
-                        deploy_proto::deploy::ProxyOpenResult {
-                            ok: false,
-                            error: format!("vless: bad uuid: {e}"),
-                        },
-                    )),
+                    body: Some(proxy_server_msg::Body::OpenResult(proxy_open_result(
+                        false,
+                        format!("vless: bad uuid: {e}"),
+                    ))),
                 }))
                 .await;
             return;
@@ -121,10 +138,7 @@ pub async fn run_vless_relay(
                 let _ = tx
                     .send(Ok(ProxyServerMsg {
                         body: Some(proxy_server_msg::Body::OpenResult(
-                            deploy_proto::deploy::ProxyOpenResult {
-                                ok: false,
-                                error: "vless: stream ended before header".into(),
-                            },
+                            proxy_open_result(false, "vless: stream ended before header"),
                         )),
                     }))
                     .await;
@@ -139,10 +153,7 @@ pub async fn run_vless_relay(
                     let _ = tx
                         .send(Ok(ProxyServerMsg {
                             body: Some(proxy_server_msg::Body::OpenResult(
-                                deploy_proto::deploy::ProxyOpenResult {
-                                    ok: false,
-                                    error: "duplicate Open".into(),
-                                },
+                                proxy_open_result(false, "duplicate Open"),
                             )),
                         }))
                         .await;
@@ -153,10 +164,7 @@ pub async fn run_vless_relay(
                         let _ = tx
                             .send(Ok(ProxyServerMsg {
                                 body: Some(proxy_server_msg::Body::OpenResult(
-                                    deploy_proto::deploy::ProxyOpenResult {
-                                        ok: false,
-                                        error: "proxy chunk too large".into(),
-                                    },
+                                    proxy_open_result(false, "proxy chunk too large"),
                                 )),
                             }))
                             .await;
@@ -169,10 +177,7 @@ pub async fn run_vless_relay(
                             let _ = tx
                                 .send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: false,
-                                            error: "invalid vless header".into(),
-                                        },
+                                        proxy_open_result(false, "invalid vless header"),
                                     )),
                                 }))
                                 .await;
@@ -189,10 +194,7 @@ pub async fn run_vless_relay(
                                 let _ = tx
                                     .send(Ok(ProxyServerMsg {
                                         body: Some(proxy_server_msg::Body::OpenResult(
-                                            deploy_proto::deploy::ProxyOpenResult {
-                                                ok: false,
-                                                error: "vless: uuid mismatch".into(),
-                                            },
+                                            proxy_open_result(false, "vless: uuid mismatch"),
                                         )),
                                     }))
                                     .await;
@@ -202,10 +204,7 @@ pub async fn run_vless_relay(
                             if let Err(e) = allowlist(&host) {
                                 let _ = tx.send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: false,
-                                            error: e.message().to_string(),
-                                        },
+                                        proxy_open_result(false, e.message().to_string()),
                                     )),
                                 })).await;
                                 return;
@@ -222,10 +221,7 @@ pub async fn run_vless_relay(
                                     let _ = tx
                                         .send(Ok(ProxyServerMsg {
                                             body: Some(proxy_server_msg::Body::OpenResult(
-                                                deploy_proto::deploy::ProxyOpenResult {
-                                                    ok: false,
-                                                    error: e.to_string(),
-                                                },
+                                                proxy_open_result(false, e.to_string()),
                                             )),
                                         }))
                                         .await;
@@ -235,10 +231,7 @@ pub async fn run_vless_relay(
                                     let _ = tx
                                         .send(Ok(ProxyServerMsg {
                                             body: Some(proxy_server_msg::Body::OpenResult(
-                                                deploy_proto::deploy::ProxyOpenResult {
-                                                    ok: false,
-                                                    error: "connect timeout".into(),
-                                                },
+                                                proxy_open_result(false, "connect timeout"),
                                             )),
                                         }))
                                         .await;
@@ -248,10 +241,7 @@ pub async fn run_vless_relay(
                             if tx
                                 .send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: true,
-                                            error: String::new(),
-                                        },
+                                        proxy_open_result(true, String::new()),
                                     )),
                                 }))
                                 .await
@@ -279,6 +269,7 @@ pub async fn run_vless_relay(
                                 db_opt,
                                 client_pubkey_for_traffic,
                                 metrics,
+                                managed_checkpoint,
                             )
                             .await;
                             return;
@@ -289,10 +280,7 @@ pub async fn run_vless_relay(
                     let _ = tx
                         .send(Ok(ProxyServerMsg {
                             body: Some(proxy_server_msg::Body::OpenResult(
-                                deploy_proto::deploy::ProxyOpenResult {
-                                    ok: false,
-                                    error: "vless: fin before header".into(),
-                                },
+                                proxy_open_result(false, "vless: fin before header"),
                             )),
                         }))
                         .await;
@@ -314,6 +302,7 @@ pub async fn run_trojan_relay(
     db_opt: Option<Arc<deploy_db::DbStore>>,
     client_pubkey_for_traffic: Option<String>,
     metrics: Arc<ProxyTunnelMetrics>,
+    managed_checkpoint: Option<ManagedTunnelCheckpoint>,
 ) {
     let password = match params.password.as_deref() {
         Some(s) if !s.is_empty() => s,
@@ -321,10 +310,7 @@ pub async fn run_trojan_relay(
             let _ = tx
                 .send(Ok(ProxyServerMsg {
                     body: Some(proxy_server_msg::Body::OpenResult(
-                        deploy_proto::deploy::ProxyOpenResult {
-                            ok: false,
-                            error: "trojan: missing password".into(),
-                        },
+                        proxy_open_result(false, "trojan: missing password"),
                     )),
                 }))
                 .await;
@@ -338,10 +324,7 @@ pub async fn run_trojan_relay(
                 let _ = tx
                     .send(Ok(ProxyServerMsg {
                         body: Some(proxy_server_msg::Body::OpenResult(
-                            deploy_proto::deploy::ProxyOpenResult {
-                                ok: false,
-                                error: "trojan: stream ended before handshake".into(),
-                            },
+                            proxy_open_result(false, "trojan: stream ended before handshake"),
                         )),
                     }))
                     .await;
@@ -356,10 +339,7 @@ pub async fn run_trojan_relay(
                     let _ = tx
                         .send(Ok(ProxyServerMsg {
                             body: Some(proxy_server_msg::Body::OpenResult(
-                                deploy_proto::deploy::ProxyOpenResult {
-                                    ok: false,
-                                    error: "duplicate Open".into(),
-                                },
+                                proxy_open_result(false, "duplicate Open"),
                             )),
                         }))
                         .await;
@@ -373,10 +353,7 @@ pub async fn run_trojan_relay(
                             let _ = tx
                                 .send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: false,
-                                            error: "trojan: auth failed".into(),
-                                        },
+                                        proxy_open_result(false, "trojan: auth failed"),
                                     )),
                                 }))
                                 .await;
@@ -390,10 +367,7 @@ pub async fn run_trojan_relay(
                             if let Err(e) = allowlist(&host) {
                                 let _ = tx.send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: false,
-                                            error: e.message().to_string(),
-                                        },
+                                        proxy_open_result(false, e.message().to_string()),
                                     )),
                                 })).await;
                                 return;
@@ -410,10 +384,7 @@ pub async fn run_trojan_relay(
                                     let _ = tx
                                         .send(Ok(ProxyServerMsg {
                                             body: Some(proxy_server_msg::Body::OpenResult(
-                                                deploy_proto::deploy::ProxyOpenResult {
-                                                    ok: false,
-                                                    error: e.to_string(),
-                                                },
+                                                proxy_open_result(false, e.to_string()),
                                             )),
                                         }))
                                         .await;
@@ -423,10 +394,7 @@ pub async fn run_trojan_relay(
                                     let _ = tx
                                         .send(Ok(ProxyServerMsg {
                                             body: Some(proxy_server_msg::Body::OpenResult(
-                                                deploy_proto::deploy::ProxyOpenResult {
-                                                    ok: false,
-                                                    error: "connect timeout".into(),
-                                                },
+                                                proxy_open_result(false, "connect timeout"),
                                             )),
                                         }))
                                         .await;
@@ -436,10 +404,7 @@ pub async fn run_trojan_relay(
                             if tx
                                 .send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: true,
-                                            error: String::new(),
-                                        },
+                                        proxy_open_result(true, String::new()),
                                     )),
                                 }))
                                 .await
@@ -461,6 +426,7 @@ pub async fn run_trojan_relay(
                                 db_opt,
                                 client_pubkey_for_traffic,
                                 metrics,
+                                managed_checkpoint,
                             )
                             .await;
                             return;
@@ -490,6 +456,7 @@ pub async fn run_vmess_relay(
     db_opt: Option<Arc<deploy_db::DbStore>>,
     client_pubkey_for_traffic: Option<String>,
     metrics: Arc<ProxyTunnelMetrics>,
+    managed_checkpoint: Option<ManagedTunnelCheckpoint>,
 ) {
     let uuid_str = match params.uuid.as_deref() {
         Some(s) if !s.trim().is_empty() => s.trim(),
@@ -497,10 +464,7 @@ pub async fn run_vmess_relay(
             let _ = tx
                 .send(Ok(ProxyServerMsg {
                     body: Some(proxy_server_msg::Body::OpenResult(
-                        deploy_proto::deploy::ProxyOpenResult {
-                            ok: false,
-                            error: "vmess: missing uuid".into(),
-                        },
+                        proxy_open_result(false, "vmess: missing uuid"),
                     )),
                 }))
                 .await;
@@ -512,12 +476,10 @@ pub async fn run_vmess_relay(
         Err(e) => {
             let _ = tx
                 .send(Ok(ProxyServerMsg {
-                    body: Some(proxy_server_msg::Body::OpenResult(
-                        deploy_proto::deploy::ProxyOpenResult {
-                            ok: false,
-                            error: format!("vmess: bad uuid: {e}"),
-                        },
-                    )),
+                    body: Some(proxy_server_msg::Body::OpenResult(proxy_open_result(
+                        false,
+                        format!("vmess: bad uuid: {e}"),
+                    ))),
                 }))
                 .await;
             return;
@@ -556,10 +518,7 @@ pub async fn run_vmess_relay(
                         let _ = tx
                             .send(Ok(ProxyServerMsg {
                                 body: Some(proxy_server_msg::Body::OpenResult(
-                                    deploy_proto::deploy::ProxyOpenResult {
-                                        ok: false,
-                                        error: "vmess: replay".into(),
-                                    },
+                                    proxy_open_result(false, "vmess: replay"),
                                 )),
                             }))
                             .await;
@@ -572,10 +531,7 @@ pub async fn run_vmess_relay(
                             let _ = tx
                                 .send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: false,
-                                            error: e.to_string(),
-                                        },
+                                        proxy_open_result(false, e.to_string()),
                                     )),
                                 }))
                                 .await;
@@ -586,10 +542,7 @@ pub async fn run_vmess_relay(
                     if let Err(e) = allowlist(&host) {
                         let _ = tx.send(Ok(ProxyServerMsg {
                             body: Some(proxy_server_msg::Body::OpenResult(
-                                deploy_proto::deploy::ProxyOpenResult {
-                                    ok: false,
-                                    error: e.message().to_string(),
-                                },
+                                proxy_open_result(false, e.message().to_string()),
                             )),
                         })).await;
                         return;
@@ -606,10 +559,7 @@ pub async fn run_vmess_relay(
                             let _ = tx
                                 .send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: false,
-                                            error: e.to_string(),
-                                        },
+                                        proxy_open_result(false, e.to_string()),
                                     )),
                                 }))
                                 .await;
@@ -619,10 +569,7 @@ pub async fn run_vmess_relay(
                             let _ = tx
                                 .send(Ok(ProxyServerMsg {
                                     body: Some(proxy_server_msg::Body::OpenResult(
-                                        deploy_proto::deploy::ProxyOpenResult {
-                                            ok: false,
-                                            error: "connect timeout".into(),
-                                        },
+                                        proxy_open_result(false, "connect timeout"),
                                     )),
                                 }))
                                 .await;
@@ -632,10 +579,7 @@ pub async fn run_vmess_relay(
                     if tx
                         .send(Ok(ProxyServerMsg {
                             body: Some(proxy_server_msg::Body::OpenResult(
-                                deploy_proto::deploy::ProxyOpenResult {
-                                    ok: true,
-                                    error: String::new(),
-                                },
+                                proxy_open_result(true, String::new()),
                             )),
                         }))
                         .await
@@ -657,9 +601,328 @@ pub async fn run_vmess_relay(
                         db_opt,
                         client_pubkey_for_traffic,
                         metrics,
+                        managed_checkpoint,
                     )
                     .await;
                     return;
+                }
+                Some(proxy_client_msg::Body::Fin(_)) => return,
+                None => {}
+            },
+        }
+    }
+}
+
+pub async fn run_socks5_relay(
+    mut inbound: tonic::Streaming<ProxyClientMsg>,
+    tx: mpsc::Sender<Result<ProxyServerMsg, Status>>,
+    params: WireParams,
+    managed: Option<(GrpcProxySessionRow, proxy_session::StoredPolicy)>,
+    bytes_in: Arc<AtomicU64>,
+    bytes_out: Arc<AtomicU64>,
+    db_opt: Option<Arc<deploy_db::DbStore>>,
+    client_pubkey_for_traffic: Option<String>,
+    metrics: Arc<ProxyTunnelMetrics>,
+    managed_checkpoint: Option<ManagedTunnelCheckpoint>,
+) {
+    let auth = params.username.is_some() && params.password.is_some();
+    let user = params.username.as_deref();
+    let pass = params.password.as_deref();
+    let mut buf = Vec::<u8>::new();
+    loop {
+        match inbound.next().await {
+            None => {
+                let _ = tx
+                    .send(Ok(ProxyServerMsg {
+                        body: Some(proxy_server_msg::Body::OpenResult(
+                            proxy_open_result(false, "socks5: stream ended before handshake"),
+                        )),
+                    }))
+                    .await;
+                return;
+            }
+            Some(Err(e)) => {
+                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                return;
+            }
+            Some(Ok(msg)) => match msg.body {
+                Some(proxy_client_msg::Body::Open(_)) => {
+                    let _ = tx
+                        .send(Ok(ProxyServerMsg {
+                            body: Some(proxy_server_msg::Body::OpenResult(
+                                proxy_open_result(false, "duplicate Open"),
+                            )),
+                        }))
+                        .await;
+                    return;
+                }
+                Some(proxy_client_msg::Body::Data(d)) => {
+                    if d.len() > MAX_PROXY_CHUNK {
+                        let _ = tx
+                            .send(Ok(ProxyServerMsg {
+                                body: Some(proxy_server_msg::Body::OpenResult(
+                                    proxy_open_result(false, "proxy chunk too large"),
+                                )),
+                            }))
+                            .await;
+                        return;
+                    }
+                    buf.extend_from_slice(&d);
+                    match socks5_server_parse(&buf, auth, user, pass) {
+                        Socks5ServerHandshake::NeedMore(_) => continue,
+                        Socks5ServerHandshake::Invalid(m) => {
+                            let _ = tx
+                                .send(Ok(ProxyServerMsg {
+                                    body: Some(proxy_server_msg::Body::OpenResult(
+                                        proxy_open_result(false, m),
+                                    )),
+                                }))
+                                .await;
+                            return;
+                        }
+                        Socks5ServerHandshake::Ready { target, consumed } => {
+                            let host = target.host.clone();
+                            if let Err(e) = allowlist(&host) {
+                                let _ = tx.send(Ok(ProxyServerMsg {
+                                    body: Some(proxy_server_msg::Body::OpenResult(
+                                        proxy_open_result(false, e.message().to_string()),
+                                    )),
+                                })).await;
+                                return;
+                            }
+                            let upstream = format!("{}:{}", target.host, target.port);
+                            let tcp = match tokio::time::timeout(
+                                Duration::from_secs(30),
+                                tokio::net::TcpStream::connect(&upstream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(s)) => s,
+                                Ok(Err(e)) => {
+                                    let _ = tx
+                                        .send(Ok(ProxyServerMsg {
+                                            body: Some(proxy_server_msg::Body::OpenResult(
+                                                proxy_open_result(false, e.to_string()),
+                                            )),
+                                        }))
+                                        .await;
+                                    return;
+                                }
+                                Err(_) => {
+                                    let _ = tx
+                                        .send(Ok(ProxyServerMsg {
+                                            body: Some(proxy_server_msg::Body::OpenResult(
+                                                proxy_open_result(false, "connect timeout"),
+                                            )),
+                                        }))
+                                        .await;
+                                    return;
+                                }
+                            };
+                            if tx
+                                .send(Ok(ProxyServerMsg {
+                                    body: Some(proxy_server_msg::Body::OpenResult(
+                                        proxy_open_result(true, String::new()),
+                                    )),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let tail = buf[consumed..].to_vec();
+                            let (tcp_read, tcp_write) = tcp.into_split();
+                            run_raw_bridge(
+                                inbound,
+                                tx,
+                                tcp_read,
+                                tcp_write,
+                                tail,
+                                managed,
+                                bytes_in,
+                                bytes_out,
+                                db_opt,
+                                client_pubkey_for_traffic,
+                                metrics,
+                                managed_checkpoint,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                Some(proxy_client_msg::Body::Fin(_)) => return,
+                None => {}
+            },
+        }
+    }
+}
+
+pub async fn run_shadowsocks_relay(
+    mut inbound: tonic::Streaming<ProxyClientMsg>,
+    tx: mpsc::Sender<Result<ProxyServerMsg, Status>>,
+    params: WireParams,
+    managed: Option<(GrpcProxySessionRow, proxy_session::StoredPolicy)>,
+    bytes_in: Arc<AtomicU64>,
+    bytes_out: Arc<AtomicU64>,
+    db_opt: Option<Arc<deploy_db::DbStore>>,
+    client_pubkey_for_traffic: Option<String>,
+    metrics: Arc<ProxyTunnelMetrics>,
+    managed_checkpoint: Option<ManagedTunnelCheckpoint>,
+) {
+    let password = match params.password.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            let _ = tx
+                .send(Ok(ProxyServerMsg {
+                    body: Some(proxy_server_msg::Body::OpenResult(
+                        proxy_open_result(false, "shadowsocks: missing password"),
+                    )),
+                }))
+                .await;
+            return;
+        }
+    };
+    let method = match params.method.as_deref() {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => {
+            let _ = tx
+                .send(Ok(ProxyServerMsg {
+                    body: Some(proxy_server_msg::Body::OpenResult(
+                        proxy_open_result(false, "shadowsocks: missing method"),
+                    )),
+                }))
+                .await;
+            return;
+        }
+    };
+    let mut buf = Vec::<u8>::new();
+    loop {
+        match inbound.next().await {
+            None => {
+                let _ = tx
+                    .send(Ok(ProxyServerMsg {
+                        body: Some(proxy_server_msg::Body::OpenResult(
+                            proxy_open_result(false, "shadowsocks: stream ended before handshake"),
+                        )),
+                    }))
+                    .await;
+                return;
+            }
+            Some(Err(e)) => {
+                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                return;
+            }
+            Some(Ok(msg)) => match msg.body {
+                Some(proxy_client_msg::Body::Open(_)) => {
+                    let _ = tx
+                        .send(Ok(ProxyServerMsg {
+                            body: Some(proxy_server_msg::Body::OpenResult(
+                                proxy_open_result(false, "duplicate Open"),
+                            )),
+                        }))
+                        .await;
+                    return;
+                }
+                Some(proxy_client_msg::Body::Data(d)) => {
+                    if d.len() > MAX_PROXY_CHUNK {
+                        let _ = tx
+                            .send(Ok(ProxyServerMsg {
+                                body: Some(proxy_server_msg::Body::OpenResult(
+                                    proxy_open_result(false, "proxy chunk too large"),
+                                )),
+                            }))
+                            .await;
+                        return;
+                    }
+                    buf.extend_from_slice(&d);
+                    match ss_tcp_server_handshake(&buf, method, password) {
+                        SsTcpHandshakeResult::NeedMore(_) => continue,
+                        SsTcpHandshakeResult::Invalid(m) => {
+                            let _ = tx
+                                .send(Ok(ProxyServerMsg {
+                                    body: Some(proxy_server_msg::Body::OpenResult(
+                                        proxy_open_result(false, format!("shadowsocks: {m}")),
+                                    )),
+                                }))
+                                .await;
+                            return;
+                        }
+                        SsTcpHandshakeResult::Ready {
+                            addr,
+                            consumed,
+                            tail_after_addr,
+                        } => {
+                            let host = addr.host.clone();
+                            if let Err(e) = allowlist(&host) {
+                                let _ = tx.send(Ok(ProxyServerMsg {
+                                    body: Some(proxy_server_msg::Body::OpenResult(
+                                        proxy_open_result(false, e.message().to_string()),
+                                    )),
+                                })).await;
+                                return;
+                            }
+                            let upstream = format!("{}:{}", addr.host, addr.port);
+                            let tcp = match tokio::time::timeout(
+                                Duration::from_secs(30),
+                                tokio::net::TcpStream::connect(&upstream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(s)) => s,
+                                Ok(Err(e)) => {
+                                    let _ = tx
+                                        .send(Ok(ProxyServerMsg {
+                                            body: Some(proxy_server_msg::Body::OpenResult(
+                                                proxy_open_result(false, e.to_string()),
+                                            )),
+                                        }))
+                                        .await;
+                                    return;
+                                }
+                                Err(_) => {
+                                    let _ = tx
+                                        .send(Ok(ProxyServerMsg {
+                                            body: Some(proxy_server_msg::Body::OpenResult(
+                                                proxy_open_result(false, "connect timeout"),
+                                            )),
+                                        }))
+                                        .await;
+                                    return;
+                                }
+                            };
+                            if tx
+                                .send(Ok(ProxyServerMsg {
+                                    body: Some(proxy_server_msg::Body::OpenResult(
+                                        proxy_open_result(true, String::new()),
+                                    )),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let mut pending = tail_after_addr;
+                            pending.extend_from_slice(&buf[consumed..]);
+                            let (tcp_read, tcp_write) = tcp.into_split();
+                            run_raw_bridge(
+                                inbound,
+                                tx,
+                                tcp_read,
+                                tcp_write,
+                                pending,
+                                managed,
+                                bytes_in,
+                                bytes_out,
+                                db_opt,
+                                client_pubkey_for_traffic,
+                                metrics,
+                                managed_checkpoint,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
                 }
                 Some(proxy_client_msg::Body::Fin(_)) => return,
                 None => {}
@@ -689,6 +952,7 @@ async fn run_raw_bridge(
     db_opt: Option<Arc<deploy_db::DbStore>>,
     client_pubkey_for_traffic: Option<String>,
     metrics: Arc<ProxyTunnelMetrics>,
+    managed_checkpoint: Option<ManagedTunnelCheckpoint>,
 ) {
     let managed_clone = managed.clone();
     let session_id_for_task = managed_clone
@@ -707,6 +971,10 @@ async fn run_raw_bridge(
         .as_ref()
         .map(|(r, _)| r.bytes_out.max(0) as u64)
         .unwrap_or(0);
+    let base_active_ms = managed_clone
+        .as_ref()
+        .map(|(r, _)| r.active_ms.max(0) as u64)
+        .unwrap_or(0);
     let bin_count = bytes_in.clone();
     let bytes_out_in = bytes_out.clone();
     let idle_secs = managed_clone
@@ -717,6 +985,22 @@ async fn run_raw_bridge(
     let active_in = active.clone();
     let active_out = active.clone();
     let active_end = active;
+
+    let mut checkpoint_jh: Option<tokio::task::JoinHandle<()>> = None;
+    let mut checkpoint_shut: Option<tokio::sync::watch::Sender<bool>> = None;
+    if let Some(ref cp) = managed_checkpoint {
+        let (jh, tx) = spawn_managed_checkpoint(
+            cp.clone(),
+            bytes_in.clone(),
+            bytes_out.clone(),
+            {
+                let active_c = active_end.clone();
+                move || active_c.lock().map(|a| a.accum_ms()).unwrap_or(0)
+            },
+        );
+        checkpoint_jh = Some(jh);
+        checkpoint_shut = Some(tx);
+    }
 
     if !pending.is_empty() {
         bytes_in.fetch_add(pending.len() as u64, Ordering::Relaxed);
@@ -746,16 +1030,33 @@ async fn run_raw_bridge(
                         return Err(Status::invalid_argument("proxy chunk too large"));
                     }
                     bin_count.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    let mut traffic_exceeded = false;
+                    let mut budget_exceeded = false;
                     if let Ok(mut a) = active_in.lock() {
                         a.bump();
-                    }
-                    if let Some(ref pol) = policy_for_t_in {
-                        let bi = base_in + bin_count.load(Ordering::Relaxed);
-                        let bo = base_out + bytes_out_in.load(Ordering::Relaxed);
-                        if proxy_session::check_traffic_limits(pol, bi, bo).is_err() {
-                            let _ = tcp_write.shutdown().await;
-                            return Err(Status::resource_exhausted("proxy session traffic limit"));
+                        if let Some(ref pol) = policy_for_t_in {
+                            let bi = base_in + bin_count.load(Ordering::Relaxed);
+                            let bo = base_out + bytes_out_in.load(Ordering::Relaxed);
+                            traffic_exceeded =
+                                proxy_session::check_traffic_limits(pol, bi, bo).is_err();
+                            if !traffic_exceeded {
+                                budget_exceeded = proxy_session::active_time_budget_exceeded(
+                                    pol,
+                                    base_active_ms,
+                                    a.accum_ms,
+                                );
+                            }
                         }
+                    }
+                    if traffic_exceeded {
+                        let _ = tcp_write.shutdown().await;
+                        return Err(Status::resource_exhausted("proxy session traffic limit"));
+                    }
+                    if budget_exceeded {
+                        let _ = tcp_write.shutdown().await;
+                        return Err(Status::resource_exhausted(
+                            "proxy session active time budget exhausted",
+                        ));
                     }
                     if tcp_write.write_all(&data).await.is_err() {
                         let _ = tcp_write.shutdown().await;
@@ -793,13 +1094,29 @@ async fn run_raw_bridge(
                 }
                 Ok(n) => {
                     bout_count.fetch_add(n as u64, Ordering::Relaxed);
+                    let mut budget_exceeded = false;
                     if let Ok(mut a) = active_out.lock() {
                         a.bump();
+                        if let Some(ref pol) = policy_out {
+                            let bi = base_in_out + bytes_in_out.load(Ordering::Relaxed);
+                            let bo = base_out_out + bout_count.load(Ordering::Relaxed);
+                            let _ = proxy_session::check_traffic_limits(pol, bi, bo);
+                            budget_exceeded = proxy_session::active_time_budget_exceeded(
+                                pol,
+                                base_active_ms,
+                                a.accum_ms,
+                            );
+                        }
                     }
-                    if let Some(ref pol) = policy_out {
-                        let bi = base_in_out + bytes_in_out.load(Ordering::Relaxed);
-                        let bo = base_out_out + bout_count.load(Ordering::Relaxed);
-                        let _ = proxy_session::check_traffic_limits(pol, bi, bo);
+                    if budget_exceeded {
+                        let _ = tx_out
+                            .send(Ok(ProxyServerMsg {
+                                body: Some(proxy_server_msg::Body::Error(
+                                    "proxy session active time budget exhausted".into(),
+                                )),
+                            }))
+                            .await;
+                        break;
                     }
                     let chunk = buf[..n].to_vec();
                     if tx_out
@@ -827,20 +1144,29 @@ async fn run_raw_bridge(
     let _ = t_in.await;
     let _ = t_out.await;
 
+    if let Some(tx) = checkpoint_shut {
+        let _ = tx.send(true);
+    }
+    if let Some(jh) = checkpoint_jh {
+        jh.abort();
+    }
+
     let bi = bytes_in.load(Ordering::Relaxed);
     let bo = bytes_out.load(Ordering::Relaxed);
 
     let db_opt_for_hourly = db_opt.clone();
-    if let (Some(db), Some(sid), Some(pk), Some(_pol)) = (
+    let active_ms_u64 = active_end.lock().map(|a| a.accum_ms()).unwrap_or(0);
+
+    if let Some(ref cp) = managed_checkpoint {
+        if let Err(e) = flush_managed_tunnel_end(cp, bi, bo, active_ms_u64).await {
+            error!(%e, "grpc proxy session final flush (wire bridge)");
+        }
+    } else if let (Some(db), Some(sid), Some(pk), Some(_pol)) = (
         db_opt,
         session_id_for_task,
         pk_for_task,
         policy_for_task,
     ) {
-        let active_ms = active_end
-            .lock()
-            .map(|a| a.accum_ms as i64)
-            .unwrap_or(0);
         let now = chrono::Utc::now();
         let _ = db
             .increment_grpc_proxy_session_traffic(
@@ -848,7 +1174,7 @@ async fn run_raw_bridge(
                 &pk,
                 bi,
                 bo,
-                active_ms,
+                active_ms_u64 as i64,
                 now,
                 Some(now),
             )

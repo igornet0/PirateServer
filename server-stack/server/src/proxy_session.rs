@@ -33,6 +33,15 @@ pub struct StoredPolicy {
     pub traffic_bytes_out_limit: Option<u64>,
     pub active_idle_timeout_sec: Option<u32>,
     pub access_schedule: Option<StoredAccessSchedule>,
+    /// When true, session row uses far-future `expires_at`; UI may show as unlimited (-1).
+    #[serde(default)]
+    pub never_expires: bool,
+    /// When true, `max_session_duration_sec` is enforced against cumulative `active_ms`, not wall-clock since `first_open_at`.
+    #[serde(default)]
+    pub limit_duration_by_active_time: bool,
+    /// Max concurrent tunnels per session; `None` = use `DEPLOY_DEFAULT_MAX_DEVICES_PER_SESSION` on server.
+    #[serde(default)]
+    pub max_concurrent_devices_per_session: Option<u32>,
 }
 
 impl StoredPolicy {
@@ -55,7 +64,38 @@ impl StoredPolicy {
                     })
                     .collect(),
             }),
+            never_expires: p.never_expires.unwrap_or(false),
+            limit_duration_by_active_time: p.limit_duration_by_active_time.unwrap_or(false),
+            max_concurrent_devices_per_session: p.max_concurrent_devices_per_session,
         }
+    }
+
+    /// Default when policy omits the field (`DEPLOY_DEFAULT_MAX_DEVICES_PER_SESSION`, default 10).
+    #[must_use]
+    pub fn default_max_devices_per_session_from_env() -> u32 {
+        std::env::var("DEPLOY_DEFAULT_MAX_DEVICES_PER_SESSION")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(10)
+    }
+
+    /// Effective cap for Redis per-session tunnel limit. `0` = unlimited (no SCARD check).
+    #[must_use]
+    pub fn effective_max_concurrent_devices_per_session(&self) -> u32 {
+        let mut v = match self.max_concurrent_devices_per_session {
+            None => Self::default_max_devices_per_session_from_env(),
+            Some(0) => 0,
+            Some(n) => n,
+        };
+        if let Ok(cap_s) = std::env::var("DEPLOY_MAX_DEVICES_PER_SESSION_CAP") {
+            if let Ok(cap) = cap_s.parse::<u32>() {
+                if cap > 0 {
+                    v = v.min(cap);
+                }
+            }
+        }
+        v
     }
 
     pub fn idle_timeout_sec(&self) -> u64 {
@@ -113,12 +153,24 @@ pub fn expires_at_from_policy(
     policy: &ProxyConnectionPolicy,
     now: DateTime<Utc>,
 ) -> DateTime<Utc> {
-    let max_dur = policy.max_session_duration_sec.unwrap_or(0);
-    if max_dur > 0 {
-        now + Duration::seconds(max_dur as i64)
-    } else {
-        now + Duration::days(365)
+    if policy.never_expires.unwrap_or(false) {
+        return now + Duration::days(36500);
     }
+    match policy.max_session_duration_sec {
+        None | Some(0) => now + Duration::days(36500),
+        Some(sec) => now + Duration::seconds(sec as i64),
+    }
+}
+
+/// `-1` in API responses when the invitation has no calendar cap (`-1` / omitted max duration) or explicit `never_expires`.
+pub fn client_expires_at_unix_ms(policy: &ProxyConnectionPolicy, expires_at: DateTime<Utc>) -> i64 {
+    if policy.never_expires.unwrap_or(false) {
+        return -1;
+    }
+    if policy.max_session_duration_sec.is_none() {
+        return -1;
+    }
+    expires_at.timestamp_millis()
 }
 
 pub fn is_schedule_allowed(
@@ -217,6 +269,9 @@ pub fn max_duration_exceeded(
     first_open_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> bool {
+    if policy.limit_duration_by_active_time {
+        return false;
+    }
     let Some(sec) = policy.max_session_duration_sec.filter(|s| *s > 0) else {
         return false;
     };
@@ -224,4 +279,183 @@ pub fn max_duration_exceeded(
         return false;
     };
     (now - t0).num_seconds() > sec as i64
+}
+
+/// Upper bound in milliseconds for cumulative active time when [`StoredPolicy::limit_duration_by_active_time`] is set and duration is positive.
+pub fn active_time_budget_ms_max(policy: &StoredPolicy) -> Option<u64> {
+    if !policy.limit_duration_by_active_time {
+        return None;
+    }
+    let sec = policy.max_session_duration_sec.filter(|s| *s > 0)?;
+    Some(sec.saturating_mul(1000))
+}
+
+/// Whether cumulative active time (persisted + in-flight) meets or exceeds the budget.
+pub fn active_time_budget_exceeded(
+    policy: &StoredPolicy,
+    active_ms_total: u64,
+    inflight_ms: u64,
+) -> bool {
+    let Some(budget) = active_time_budget_ms_max(policy) else {
+        return false;
+    };
+    active_ms_total.saturating_add(inflight_ms) >= budget
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    /// Same idle-aware rule as `ActiveTracker` in deploy_service / wire_relay: each gap between
+    /// consecutive bumps adds only if `gap_ms <= idle_ms`.
+    fn accum_ms_from_bump_gaps_ms(idle_ms: u64, gaps_between_bumps_ms: &[u64]) -> u64 {
+        let mut acc = 0u64;
+        for &g in gaps_between_bumps_ms {
+            if g <= idle_ms {
+                acc = acc.saturating_add(g);
+            }
+        }
+        acc
+    }
+
+    fn policy_duration_10s_wall_clock() -> StoredPolicy {
+        StoredPolicy {
+            max_session_duration_sec: Some(10),
+            traffic_total_bytes: None,
+            traffic_bytes_in_limit: None,
+            traffic_bytes_out_limit: None,
+            active_idle_timeout_sec: Some(60),
+            access_schedule: None,
+            never_expires: false,
+            limit_duration_by_active_time: false,
+            max_concurrent_devices_per_session: None,
+        }
+    }
+
+    fn policy_duration_10s_active_only() -> StoredPolicy {
+        StoredPolicy {
+            max_session_duration_sec: Some(10),
+            traffic_total_bytes: None,
+            traffic_bytes_in_limit: None,
+            traffic_bytes_out_limit: None,
+            active_idle_timeout_sec: Some(60),
+            access_schedule: None,
+            never_expires: false,
+            limit_duration_by_active_time: true,
+            max_concurrent_devices_per_session: None,
+        }
+    }
+
+    #[test]
+    fn wall_clock_10s_exceeded_after_11s_since_first_open() {
+        let p = policy_duration_10s_wall_clock();
+        let now = Utc::now();
+        let first_open = now - Duration::seconds(11);
+        assert!(
+            max_duration_exceeded(&p, Some(first_open), now),
+            "without limit_duration_by_active_time, duration is wall-clock since first_open_at"
+        );
+    }
+
+    #[test]
+    fn wall_clock_10s_not_exceeded_after_5s_since_first_open() {
+        let p = policy_duration_10s_wall_clock();
+        let now = Utc::now();
+        let first_open = now - Duration::seconds(5);
+        assert!(!max_duration_exceeded(&p, Some(first_open), now));
+    }
+
+    #[test]
+    fn wall_clock_exceeded_long_after_first_open_regardless_of_active_ms() {
+        let p = policy_duration_10s_wall_clock();
+        let now = Utc::now();
+        let first_open = now - Duration::seconds(100);
+        // Wall-clock cap: not using limit_duration_by_active_time
+        assert!(max_duration_exceeded(&p, Some(first_open), now));
+    }
+
+    #[test]
+    fn active_time_flag_disables_wall_clock_check() {
+        let p = policy_duration_10s_active_only();
+        let now = Utc::now();
+        let first_open = now - Duration::hours(24);
+        assert!(
+            !max_duration_exceeded(&p, Some(first_open), now),
+            "with limit_duration_by_active_time, wall-clock max_duration_exceeded is not used"
+        );
+    }
+
+    #[test]
+    fn active_budget_10s_exceeded_when_persisted_plus_inflight_ge_10000ms() {
+        let p = policy_duration_10s_active_only();
+        assert!(!active_time_budget_exceeded(&p, 9000, 999));
+        assert!(active_time_budget_exceeded(&p, 9000, 1000));
+        assert!(active_time_budget_exceeded(&p, 10000, 0));
+    }
+
+    #[test]
+    fn traffic_inbound_limit_blocks() {
+        let mut p = policy_duration_10s_wall_clock();
+        p.traffic_bytes_in_limit = Some(1000);
+        assert!(check_traffic_limits(&p, 1001, 0).is_err());
+        assert!(check_traffic_limits(&p, 1000, 0).is_ok());
+    }
+
+    #[test]
+    fn traffic_outbound_limit_blocks() {
+        let mut p = policy_duration_10s_wall_clock();
+        p.traffic_bytes_out_limit = Some(500);
+        assert!(check_traffic_limits(&p, 0, 501).is_err());
+        assert!(check_traffic_limits(&p, 0, 500).is_ok());
+    }
+
+    #[test]
+    fn traffic_total_limit_blocks() {
+        let mut p = policy_duration_10s_wall_clock();
+        p.traffic_total_bytes = Some(2000);
+        assert!(check_traffic_limits(&p, 1000, 1001).is_err());
+        assert!(check_traffic_limits(&p, 1000, 1000).is_ok());
+    }
+
+    /// Simulate: 4s activity (bumps 4s apart within idle window), disconnect (no bumps 10s — does not add),
+    /// reconnect: another 5s of in-tunnel gaps → persisted 4s + inflight 5s = 9s < 10s budget.
+    #[test]
+    fn active_mode_disconnect_pause_does_not_add_idle_wall_time() {
+        let idle_ms = 60_000u64;
+        let tunnel1_gaps_ms = &[4000u64];
+        let ms_tunnel1 = accum_ms_from_bump_gaps_ms(idle_ms, tunnel1_gaps_ms);
+        assert_eq!(ms_tunnel1, 4000, "single 4s interval between bumps counts");
+
+        let persisted = ms_tunnel1;
+        // No proxy traffic while disconnected — nothing added here.
+
+        let tunnel2_gaps_ms = &[5000u64];
+        let inflight = accum_ms_from_bump_gaps_ms(idle_ms, tunnel2_gaps_ms);
+        assert_eq!(inflight, 5000);
+
+        let p = policy_duration_10s_active_only();
+        assert!(
+            !active_time_budget_exceeded(&p, persisted, inflight),
+            "9s total active < 10s budget"
+        );
+        assert!(active_time_budget_exceeded(&p, persisted, inflight + 1000));
+    }
+
+    /// Within one tunnel, gap between bumps ≤ idle counts (idle-aware "active" meter).
+    #[test]
+    fn active_mode_idle_gap_under_idle_timeout_counts_between_bumps() {
+        let idle_ms = 60_000;
+        let gaps = &[3000u64, 10_000];
+        let acc = accum_ms_from_bump_gaps_ms(idle_ms, gaps);
+        assert_eq!(acc, 13_000, "10s pause between bytes still counts when <= idle window");
+    }
+
+    #[test]
+    fn active_mode_gap_over_idle_does_not_add() {
+        let idle_ms = 5_000;
+        let gaps = &[6_000];
+        let acc = accum_ms_from_bump_gaps_ms(idle_ms, gaps);
+        assert_eq!(acc, 0, "gap longer than idle adds nothing (same as server ActiveTracker)");
+    }
 }

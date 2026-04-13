@@ -4,9 +4,13 @@ mod admin_seed;
 mod auth;
 mod benchmark;
 mod deploy_service;
+mod tunnel_admission;
+mod tunnel_flush;
+mod tunnel_registry;
 mod wire_relay;
 mod metrics_http;
 mod proxy_session;
+mod quic;
 mod session_audit;
 
 use clap::{Parser, Subcommand};
@@ -16,6 +20,8 @@ use deploy_db::DbStore;
 use deploy_proto::deploy::deploy_service_server::DeployServiceServer;
 use deploy_service::DeployServiceImpl;
 use metrics_http::{serve_metrics_loop, ProxyTunnelMetrics};
+use tunnel_admission::TunnelAdmission;
+use tunnel_registry::redis_optional_from_env;
 use futures_util::stream::TryStreamExt;
 use session_audit::{AuditedTcpStream, SessionAuditHub};
 use std::collections::HashMap;
@@ -84,7 +90,7 @@ struct Args {
     #[arg(long, env = "DEPLOY_MAX_SERVER_STACK_BYTES", default_value_t = 512 * 1024 * 1024)]
     max_server_stack_bytes: u64,
 
-    /// Allow `UploadServerStack` (requires `/usr/local/lib/pirate/pirate-apply-stack-bundle.sh` + sudoers).
+    /// Allow `UploadServerStack` (requires apply helper: `pirate-apply-stack-bundle.sh` + sudo on Unix, or `pirate-apply-stack-bundle.ps1` on Windows).
     ///
     /// Do **not** wire `DEPLOY_ALLOW_SERVER_STACK_UPDATE` through clap's `env = …`: clap only accepts `true`/`false`
     /// for bool flags, while `/etc/pirate-deploy.env` commonly uses `1`/`0`. The server reads that variable in `main`
@@ -120,6 +126,18 @@ struct Args {
     /// Optional `host:port` for Prometheus text metrics (`GET /metrics`). Env: `DEPLOY_METRICS_BIND`.
     #[arg(long, env = "DEPLOY_METRICS_BIND")]
     metrics_bind: Option<String>,
+
+    /// UDP bind for QUIC proxy data-plane. Env: `DEPLOY_QUIC_BIND`. Default `0.0.0.0:7844`; empty string disables.
+    #[arg(long, env = "DEPLOY_QUIC_BIND")]
+    quic_bind: Option<String>,
+
+    /// PEM certificate path for QUIC TLS (optional; ephemeral self-signed if omitted).
+    #[arg(long, env = "DEPLOY_QUIC_TLS_CERT")]
+    quic_tls_cert: Option<PathBuf>,
+
+    /// PEM private key path for QUIC TLS (optional).
+    #[arg(long, env = "DEPLOY_QUIC_TLS_KEY")]
+    quic_tls_key: Option<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -193,6 +211,34 @@ fn validate_dashboard_username(name: &str) -> Result<(), String> {
         return Err("username: only ASCII letters, digits, . _ -".into());
     }
     Ok(())
+}
+
+fn grpc_host_from_public_url(url: &str) -> String {
+    let u = url.trim();
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .unwrap_or(u);
+    let end = rest
+        .find(|c| c == ':' || c == '/')
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return "127.0.0.1".to_string();
+    }
+    rest[..end].to_string()
+}
+
+fn resolve_quic_bind(args: &Args) -> Option<SocketAddr> {
+    let bind_str = args
+        .quic_bind
+        .clone()
+        .or_else(|| std::env::var("DEPLOY_QUIC_BIND").ok())
+        .unwrap_or_else(|| "0.0.0.0:7844".to_string());
+    let s = bind_str.trim();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse().ok()
 }
 
 fn metadata_database_url(args: &Args) -> Option<String> {
@@ -336,6 +382,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from);
     let session_hub = SessionAuditHub::new(db.clone());
     let proxy_metrics = Arc::new(ProxyTunnelMetrics::default());
+    let tunnel_admission =
+        TunnelAdmission::new(tunnel_admission::max_concurrent_from_env(), proxy_metrics.clone());
+    let tunnel_redis = redis_optional_from_env();
+
+    let quic_dataplane: Option<crate::quic::QuicDataplaneState> =
+        if crate::quic::dataplane_enabled() {
+            if let Some(addr) = resolve_quic_bind(&args) {
+                match crate::quic::start_quic_listener(
+                    addr,
+                    args.quic_tls_cert.as_deref(),
+                    args.quic_tls_key.as_deref(),
+                ) {
+                    Ok((endpoint, store)) => {
+                        let host = grpc_host_from_public_url(&public_url);
+                        let port = std::env::var("DEPLOY_QUIC_PUBLIC_PORT")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(7844u16);
+                        let st = crate::quic::QuicDataplaneState {
+                            ticket_store: store.clone(),
+                            public_host: host,
+                            public_port: port,
+                        };
+                        tokio::spawn(crate::quic::run_quic_accept_loop(endpoint, store));
+                        info!(%addr, quic_public = %format!("{}:{}", st.public_host, st.public_port), "QUIC data-plane listening");
+                        Some(st)
+                    }
+                    Err(e) => {
+                        info!(error = %e, "QUIC data-plane listener not started");
+                        None
+                    }
+                }
+            } else {
+                info!("QUIC data-plane disabled (empty DEPLOY_QUIC_BIND)");
+                None
+            }
+        } else {
+            None
+        };
+
     if let Some(s) = args.metrics_bind.as_ref().map(|x| x.trim()).filter(|s| !s.is_empty()) {
         if let Ok(sock) = s.parse::<SocketAddr>() {
             let m = proxy_metrics.clone();
@@ -358,6 +444,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_tail_path,
         session_hub.clone(),
         proxy_metrics,
+        tunnel_admission,
+        tunnel_redis,
+        quic_dataplane,
     ));
 
     let listener = TcpListener::bind(addr).await?;

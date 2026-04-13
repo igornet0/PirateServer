@@ -2,6 +2,11 @@
 
 use crate::metrics_http::ProxyTunnelMetrics;
 use crate::proxy_session;
+use crate::tunnel_admission::{self, TunnelAdmission};
+use crate::tunnel_flush::{
+    flush_managed_tunnel_end, spawn_managed_checkpoint, ManagedTunnelCheckpoint, TunnelFlushCounters,
+};
+use crate::tunnel_registry::{redis_fields_snapshot, RedisTunnelDropGuard, TunnelRedis};
 use deploy_core::{
     normalize_project_id, project_deploy_root, read_current_version_from_symlink,
     read_host_stack_ui_flags, read_server_stack_bundle_version_from_var_lib, refresh_process_state,
@@ -36,6 +41,7 @@ use deploy_proto::deploy::{
     MemoryDetailProto, MemoryOverviewProto, NetworkDetailProto, PairRequest, PairResponse,
     ProcessCpuProto, ProcessDiskProto, ProcessMemProto, ProcessRowProto, ProcessesDetailProto,
     ProxyClientMsg, ProxyOpenResult, ProxyServerMsg,
+    DisplayTopologyDisplay, ReportDisplayTopologyRequest, ReportDisplayTopologyResponse,
     ReportResourceUsageRequest, ReportResourceUsageResponse,
     RestartProcessRequest, RollbackRequest, RollbackResponse, SeriesHintProto, StackApplyMode,
     StackApplyOptions, ServerStackChunk, ServerStackInfo, ServerStackInfoRequest, ServerStackResponse,
@@ -62,13 +68,14 @@ use std::time::Duration;
 use crate::auth::{sign_pair_response, verify_pair_signature};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+use uuid::Uuid;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use rand::RngCore as _;
 use tracing::{error, info, warn};
 
-fn floor_to_utc_hour(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+pub(crate) fn floor_to_utc_hour(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
     let ts = dt.timestamp();
     let hour_floor = ts - (ts.rem_euclid(3600));
     chrono::DateTime::from_timestamp(hour_floor, 0)
@@ -89,6 +96,30 @@ async fn session_peer_row_enriched(
         .unwrap_or(0) as i32;
     let snap = db.fetch_grpc_peer_resource_snapshot(&pk).await?;
     let (proxy_in, proxy_out) = db.sum_grpc_proxy_traffic_totals(&pk).await?;
+    let (display_topology, display_stream_capable) =
+        match db.fetch_peer_display_topology(&pk).await? {
+            None => (vec![], None),
+            Some((_ts, cap, json)) => {
+                #[derive(serde::Deserialize)]
+                struct Dj {
+                    index: u32,
+                    label: String,
+                    width: u32,
+                    height: u32,
+                }
+                let rows: Vec<Dj> = serde_json::from_str(&json).unwrap_or_default();
+                let dt: Vec<DisplayTopologyDisplay> = rows
+                    .into_iter()
+                    .map(|r| DisplayTopologyDisplay {
+                        index: r.index,
+                        label: r.label,
+                        width: r.width,
+                        height: r.height,
+                    })
+                    .collect();
+                (dt, Some(cap))
+            }
+        };
     Ok(SessionPeerRow {
         client_public_key_b64: pk,
         last_seen_ms,
@@ -112,6 +143,8 @@ async fn session_peer_row_enriched(
             .map(|v| v.max(0) as u64),
         proxy_bytes_in_total: proxy_in,
         proxy_bytes_out_total: proxy_out,
+        display_topology,
+        display_stream_capable,
     })
 }
 
@@ -206,6 +239,334 @@ fn validate_stack_apply_transition(
     }
 }
 
+/// For managed proxy sessions, wire secrets (VLESS/VMess UUID, Trojan password) must come from the
+/// session row in the database, not only from `Open.wire_config_json`, so a valid session token
+/// cannot be paired with a spoofed wire secret in the open payload.
+fn apply_managed_wire_secrets(
+    mut params: Option<wire_protocol::WireParams>,
+    wire_mode: i32,
+    managed: &Option<(GrpcProxySessionRow, crate::proxy_session::StoredPolicy)>,
+) -> Option<wire_protocol::WireParams> {
+    let Some(p) = params.as_mut() else {
+        return params;
+    };
+    let Some((row, _)) = managed else {
+        return params;
+    };
+    let Some(ref json) = row.wire_config_json else {
+        return params;
+    };
+    let s = json.trim();
+    if s.is_empty() {
+        return params;
+    }
+    let Ok(session) = wire_protocol::WireParams::from_json(s) else {
+        return params;
+    };
+    match wire_mode {
+        1 => {
+            if let Some(u) = session.uuid {
+                let u = u.trim();
+                if !u.is_empty() {
+                    p.uuid = Some(u.to_string());
+                }
+            }
+        }
+        2 => {
+            if let Some(pw) = session.password {
+                if !pw.is_empty() {
+                    p.password = Some(pw);
+                }
+            }
+        }
+        3 => {
+            if let Some(u) = session.uuid {
+                let u = u.trim();
+                if !u.is_empty() {
+                    p.uuid = Some(u.to_string());
+                }
+            }
+        }
+        4 => {
+            if let Some(pw) = session.password {
+                if !pw.is_empty() {
+                    p.password = Some(pw);
+                }
+            }
+            if let Some(m) = session.method {
+                let m = m.trim();
+                if !m.is_empty() {
+                    p.method = Some(m.to_string());
+                }
+            }
+        }
+        5 => {
+            if let Some(u) = session.username {
+                let u = u.trim();
+                if !u.is_empty() {
+                    p.username = Some(u.to_string());
+                }
+            }
+            if let Some(pw) = session.password {
+                if !pw.is_empty() {
+                    p.password = Some(pw);
+                }
+            }
+        }
+        _ => {}
+    }
+    params
+}
+
+fn validate_inbound_wire(
+    wire_mode: Option<i32>,
+    wire_config_json: Option<&str>,
+) -> Result<(Option<i32>, Option<String>), Status> {
+    use wire_protocol::WireParams;
+    match (wire_mode, wire_config_json) {
+        (None, None) => Ok((None, None)),
+        (Some(m), Some(j)) => {
+            let j = j.trim();
+            if j.is_empty() {
+                return Err(Status::invalid_argument("wire_config_json is empty"));
+            }
+            if m != 1 && m != 2 && m != 3 && m != 4 && m != 5 {
+                return Err(Status::invalid_argument(
+                    "wire_mode must be 1 (VLESS), 2 (Trojan), 3 (VMess), 4 (Shadowsocks), or 5 (SOCKS5)",
+                ));
+            }
+            let p = WireParams::from_json(j)
+                .map_err(|e| Status::invalid_argument(format!("wire_config_json: {e}")))?;
+            match m {
+                1 | 3 => {
+                    if p.uuid.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                        return Err(Status::invalid_argument(
+                            "uuid is required in wire_config_json for VLESS and VMess",
+                        ));
+                    }
+                }
+                2 => {
+                    if p.password.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                        return Err(Status::invalid_argument(
+                            "password is required in wire_config_json for Trojan",
+                        ));
+                    }
+                }
+                4 => {
+                    if p.password.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                        return Err(Status::invalid_argument(
+                            "password is required in wire_config_json for Shadowsocks",
+                        ));
+                    }
+                    if p.method.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                        return Err(Status::invalid_argument(
+                            "method is required in wire_config_json for Shadowsocks",
+                        ));
+                    }
+                }
+                5 => {}
+                _ => {}
+            }
+            Ok((Some(m), Some(j.to_string())))
+        }
+        _ => Err(Status::invalid_argument(
+            "wire_mode and wire_config_json must both be set or both omitted",
+        )),
+    }
+}
+
+#[derive(Clone)]
+struct IngressDb {
+    protocol: Option<i16>,
+    listen_tcp: Option<i32>,
+    listen_udp: Option<i32>,
+    config_json: Option<String>,
+    tls_json: Option<String>,
+    template_version: i32,
+}
+
+impl IngressDb {
+    fn disabled() -> Self {
+        Self {
+            protocol: None,
+            listen_tcp: None,
+            listen_udp: None,
+            config_json: None,
+            tls_json: None,
+            template_version: 1,
+        }
+    }
+}
+
+fn validate_ingress_create(inner: &CreateConnectionRequest) -> Result<IngressDb, Status> {
+    let has_any = inner.ingress_protocol.is_some()
+        || inner.ingress_listen_port.is_some()
+        || inner.ingress_listen_udp_port.is_some()
+        || inner
+            .ingress_config_json
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        || inner
+            .ingress_tls_json
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        || inner.ingress_template_version.is_some();
+    let proto = inner.ingress_protocol.unwrap_or(0);
+    if !has_any && proto == 0 {
+        return Ok(IngressDb::disabled());
+    }
+    if proto < 1 || proto > 6 {
+        return Err(Status::invalid_argument(
+            "ingress_protocol must be 0 (disabled) or 1=VLESS .. 6=Hysteria2",
+        ));
+    }
+    let port = inner.ingress_listen_port.ok_or_else(|| {
+        Status::invalid_argument("ingress_listen_port is required when ingress is enabled")
+    })? as i32;
+    if port <= 0 || port > 65535 {
+        return Err(Status::invalid_argument("invalid ingress_listen_port"));
+    }
+    let cfg = inner
+        .ingress_config_json
+        .as_deref()
+        .unwrap_or("")
+        .trim();
+    if cfg.is_empty() {
+        return Err(Status::invalid_argument(
+            "ingress_config_json is required when ingress is enabled",
+        ));
+    }
+    serde_json::from_str::<serde_json::Value>(cfg).map_err(|e| {
+        Status::invalid_argument(format!("ingress_config_json is not valid JSON: {e}"))
+    })?;
+    let tls_s = match inner.ingress_tls_json.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(t) => {
+            serde_json::from_str::<serde_json::Value>(t).map_err(|e| {
+                Status::invalid_argument(format!("ingress_tls_json is not valid JSON: {e}"))
+            })?;
+            Some(t.to_string())
+        }
+    };
+    let udp = match inner.ingress_listen_udp_port {
+        None | Some(0) => None,
+        Some(p) => {
+            let p = p as i32;
+            if p <= 0 || p > 65535 {
+                return Err(Status::invalid_argument("invalid ingress_listen_udp_port"));
+            }
+            Some(p)
+        }
+    };
+    let ver = inner
+        .ingress_template_version
+        .unwrap_or(1)
+        .max(1) as i32;
+    Ok(IngressDb {
+        protocol: Some(proto as i16),
+        listen_tcp: Some(port),
+        listen_udp: udp,
+        config_json: Some(cfg.to_string()),
+        tls_json: tls_s,
+        template_version: ver,
+    })
+}
+
+fn should_update_ingress(inner: &UpdateProxySettingsRequest) -> bool {
+    inner.ingress_protocol.is_some()
+        || inner.ingress_listen_port.is_some()
+        || inner.ingress_listen_udp_port.is_some()
+        || inner
+            .ingress_config_json
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        || inner
+            .ingress_tls_json
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        || inner.ingress_template_version.is_some()
+}
+
+fn validate_ingress_update(inner: &UpdateProxySettingsRequest) -> Result<IngressDb, Status> {
+    let proto = inner.ingress_protocol.unwrap_or(0);
+    if proto == 0 {
+        return Ok(IngressDb::disabled());
+    }
+    if proto < 1 || proto > 6 {
+        return Err(Status::invalid_argument(
+            "ingress_protocol must be 0 (clear) or 1..6",
+        ));
+    }
+    let port = inner.ingress_listen_port.ok_or_else(|| {
+        Status::invalid_argument("ingress_listen_port is required when updating ingress")
+    })? as i32;
+    if port <= 0 || port > 65535 {
+        return Err(Status::invalid_argument("invalid ingress_listen_port"));
+    }
+    let cfg = inner
+        .ingress_config_json
+        .as_deref()
+        .ok_or_else(|| {
+            Status::invalid_argument("ingress_config_json is required when updating ingress")
+        })?
+        .trim();
+    if cfg.is_empty() {
+        return Err(Status::invalid_argument(
+            "ingress_config_json is required when updating ingress",
+        ));
+    }
+    serde_json::from_str::<serde_json::Value>(cfg).map_err(|e| {
+        Status::invalid_argument(format!("ingress_config_json is not valid JSON: {e}"))
+    })?;
+    let tls_s = match inner.ingress_tls_json.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(t) => {
+            serde_json::from_str::<serde_json::Value>(t).map_err(|e| {
+                Status::invalid_argument(format!("ingress_tls_json is not valid JSON: {e}"))
+            })?;
+            Some(t.to_string())
+        }
+    };
+    let udp = match inner.ingress_listen_udp_port {
+        None | Some(0) => None,
+        Some(p) => {
+            let p = p as i32;
+            if p <= 0 || p > 65535 {
+                return Err(Status::invalid_argument("invalid ingress_listen_udp_port"));
+            }
+            Some(p)
+        }
+    };
+    let ver = inner
+        .ingress_template_version
+        .unwrap_or(1)
+        .max(1) as i32;
+    Ok(IngressDb {
+        protocol: Some(proto as i16),
+        listen_tcp: Some(port),
+        listen_udp: udp,
+        config_json: Some(cfg.to_string()),
+        tls_json: tls_s,
+        template_version: ver,
+    })
+}
+
+fn expires_ms_from_policy_json(
+    policy_json: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> i64 {
+    if let Ok(p) = proxy_session::parse_policy_json(policy_json) {
+        if p.never_expires || p.max_session_duration_sec.is_none() {
+            return -1;
+        }
+    }
+    expires_at.timestamp_millis()
+}
+
 #[derive(Clone)]
 pub struct DeployServiceImpl {
     /// Base path; each project uses [`project_deploy_root`] under this path.
@@ -225,6 +586,10 @@ pub struct DeployServiceImpl {
     pub log_tail_path: Option<PathBuf>,
     pub session_hub: Arc<SessionAuditHub>,
     pub proxy_metrics: Arc<ProxyTunnelMetrics>,
+    pub tunnel_admission: Arc<TunnelAdmission>,
+    pub tunnel_redis: Option<Arc<TunnelRedis>>,
+    /// QUIC UDP data-plane (optional; tickets issued from raw `ProxyTunnel` when enabled).
+    pub quic_dataplane: Option<crate::quic::QuicDataplaneState>,
 }
 
 impl DeployServiceImpl {
@@ -242,6 +607,9 @@ impl DeployServiceImpl {
         log_tail_path: Option<PathBuf>,
         session_hub: Arc<SessionAuditHub>,
         proxy_metrics: Arc<ProxyTunnelMetrics>,
+        tunnel_admission: Arc<TunnelAdmission>,
+        tunnel_redis: Option<Arc<TunnelRedis>>,
+        quic_dataplane: Option<crate::quic::QuicDataplaneState>,
     ) -> Self {
         Self {
             base_root,
@@ -257,6 +625,9 @@ impl DeployServiceImpl {
             log_tail_path,
             session_hub,
             proxy_metrics,
+            tunnel_admission,
+            tunnel_redis,
+            quic_dataplane,
         }
     }
 
@@ -1325,14 +1696,7 @@ impl DeployService for DeployServiceImpl {
 
         let br = bundle_root.clone();
         let ver = version.clone();
-        let mut cmd = tokio::process::Command::new("sudo");
-        cmd.arg("/usr/local/lib/pirate/pirate-apply-stack-bundle.sh")
-            .arg(&br)
-            .arg(&ver);
-        if let Some(ref jp) = apply_json_path {
-            cmd.arg(jp);
-        }
-        let status = cmd.status().await.map_err(|e| format!("sudo apply stack: {e}"));
+        let status = apply_stack_bundle_command(&br, &ver, apply_json_path.as_ref()).await;
 
         let _ = tokio::fs::remove_file(&temp_path).await;
         if let Some(ref jp) = apply_json_path {
@@ -1351,7 +1715,7 @@ impl DeployService for DeployServiceImpl {
                 }))
             }
             Ok(s) => Err(Status::internal(format!(
-                "pirate-apply-stack-bundle.sh exited with {}",
+                "pirate-apply-stack-bundle exited with {}",
                 s.code().unwrap_or(-1)
             ))),
             Err(e) => Err(Status::internal(e)),
@@ -1395,12 +1759,28 @@ impl DeployService for DeployServiceImpl {
 
         let (host_dashboard_enabled, host_nginx_pirate_site) = read_host_stack_ui_flags();
 
+        let gui_path = root.join(deploy_core::HOST_GUI_INSTALL_JSON);
+        let (host_gui_detected_at_install, host_gui_install_json) =
+            if gui_path.is_file() {
+                match tokio::fs::read_to_string(&gui_path).await {
+                    Ok(raw) => {
+                        let det = deploy_core::host_gui_detected_from_install_json(&raw);
+                        (det, Some(raw))
+                    }
+                    Err(_) => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
         Ok(Response::new(ServerStackInfo {
             bundle_version,
             manifest_json,
             deploy_server_binary_version,
             host_dashboard_enabled,
             host_nginx_pirate_site,
+            host_gui_detected_at_install,
+            host_gui_install_json,
         }))
     }
 
@@ -1518,6 +1898,15 @@ impl DeployService for DeployServiceImpl {
                 if !proxy_session::is_schedule_allowed_stored(&policy, now)? {
                     return Err(Status::permission_denied("outside access schedule"));
                 }
+                if proxy_session::active_time_budget_exceeded(
+                    &policy,
+                    row.active_ms.max(0) as u64,
+                    0,
+                ) {
+                    return Err(Status::permission_denied(
+                        "session active time budget exhausted",
+                    ));
+                }
                 if proxy_session::max_duration_exceeded(&policy, row.first_open_at, now) {
                     return Err(Status::permission_denied("session max duration exceeded"));
                 }
@@ -1529,6 +1918,78 @@ impl DeployService for DeployServiceImpl {
                 Some((row, policy))
             };
 
+        let wire_params_parsed =
+            apply_managed_wire_secrets(wire_params_parsed, wire_mode, &managed);
+
+        let tunnel_id = Uuid::new_v4();
+        let priority = open.tunnel_priority.unwrap_or(0);
+        let stream_correlation_id = open.stream_correlation_id.clone();
+
+        let admission_guard = self
+            .tunnel_admission
+            .clone()
+            .acquire(
+                priority,
+                tunnel_id,
+                self.tunnel_redis.as_deref(),
+                tunnel_admission::wait_timeout_from_env(),
+            )
+            .await?;
+
+        let checkpoint_interval = tunnel_admission::checkpoint_interval_from_env();
+        let managed_checkpoint: Option<ManagedTunnelCheckpoint> = match (
+            db_opt.as_ref(),
+            managed.as_ref(),
+        ) {
+            (Some(db), Some((row, _))) => Some(ManagedTunnelCheckpoint {
+                db: db.clone(),
+                session_id: row.session_id.clone(),
+                client_pubkey: row.client_pubkey_b64.clone(),
+                counters: Arc::new(TokioMutex::new(TunnelFlushCounters::default())),
+                interval: checkpoint_interval,
+                redis: self.tunnel_redis.as_ref().map(|r| (r.clone(), tunnel_id)),
+                tunnel_id,
+                wire_mode: wire_mode as i32,
+                priority,
+                stream_correlation_id: stream_correlation_id.clone(),
+            }),
+            _ => None,
+        };
+
+        if let Some(ref red) = self.tunnel_redis {
+            let session_max = managed
+                .as_ref()
+                .map(|(_, p)| p.effective_max_concurrent_devices_per_session())
+                .unwrap_or(0);
+            let fields = redis_fields_snapshot(
+                &tunnel_id,
+                managed.as_ref().map(|(r, _)| r.session_id.as_str()),
+                client_pubkey_for_traffic.as_deref(),
+                &stream_correlation_id,
+                wire_mode as i32,
+                priority,
+                0,
+                0,
+                0,
+                0,
+            );
+            let refs: Vec<(&str, &str)> = fields
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            match red.register_online(&tunnel_id, &refs, session_max).await {
+                Ok(()) => {}
+                Err(crate::tunnel_registry::RegisterOnlineError::SessionDeviceLimit) => {
+                    return Err(Status::resource_exhausted(
+                        "max concurrent proxy tunnels per session (device limit)",
+                    ));
+                }
+                Err(crate::tunnel_registry::RegisterOnlineError::Redis(e)) => {
+                    tracing::warn!(error = %e, "redis register_online");
+                }
+            }
+        }
+
         let port = open.port;
         let addr = format!("{host}:{port}");
         let bytes_in = Arc::new(AtomicU64::new(0));
@@ -1537,7 +1998,16 @@ impl DeployService for DeployServiceImpl {
 
         let managed_clone = managed.clone();
         let stream_corr = open.stream_correlation_id.clone();
+        let tunnel_redis_cleanup = self.tunnel_redis.clone();
+        let managed_checkpoint_wire = managed_checkpoint.clone();
+        let managed_checkpoint_raw = managed_checkpoint.clone();
+        let prefer_quic_open = open.prefer_quic_data_plane.unwrap_or(false);
+        let quic_dp = self.quic_dataplane.clone();
         tokio::spawn(async move {
+            let _redis_drop = RedisTunnelDropGuard {
+                redis: tunnel_redis_cleanup.clone(),
+                id: tunnel_id,
+            };
             metrics.tunnels_total.fetch_add(1, Ordering::Relaxed);
             metrics.tunnels_open.fetch_add(1, Ordering::Relaxed);
             struct OpenGuard<'a>(&'a Arc<ProxyTunnelMetrics>);
@@ -1553,6 +2023,7 @@ impl DeployService for DeployServiceImpl {
             }
 
             if let Some(params) = wire_params_parsed {
+                let _admission_guard = admission_guard;
                 match wire_mode {
                     1 => {
                         crate::wire_relay::run_vless_relay(
@@ -1565,6 +2036,7 @@ impl DeployService for DeployServiceImpl {
                             db_opt,
                             client_pubkey_for_traffic,
                             metrics.clone(),
+                            managed_checkpoint_wire.clone(),
                         )
                         .await;
                     }
@@ -1579,6 +2051,7 @@ impl DeployService for DeployServiceImpl {
                             db_opt,
                             client_pubkey_for_traffic,
                             metrics.clone(),
+                            managed_checkpoint_wire.clone(),
                         )
                         .await;
                     }
@@ -1593,6 +2066,37 @@ impl DeployService for DeployServiceImpl {
                             db_opt,
                             client_pubkey_for_traffic,
                             metrics.clone(),
+                            managed_checkpoint_wire.clone(),
+                        )
+                        .await;
+                    }
+                    4 => {
+                        crate::wire_relay::run_shadowsocks_relay(
+                            inbound,
+                            tx,
+                            params,
+                            managed_clone,
+                            bytes_in,
+                            bytes_out,
+                            db_opt,
+                            client_pubkey_for_traffic,
+                            metrics.clone(),
+                            managed_checkpoint_wire.clone(),
+                        )
+                        .await;
+                    }
+                    5 => {
+                        crate::wire_relay::run_socks5_relay(
+                            inbound,
+                            tx,
+                            params,
+                            managed_clone,
+                            bytes_in,
+                            bytes_out,
+                            db_opt,
+                            client_pubkey_for_traffic,
+                            metrics.clone(),
+                            managed_checkpoint_wire.clone(),
                         )
                         .await;
                     }
@@ -1603,6 +2107,10 @@ impl DeployService for DeployServiceImpl {
                                 body: Some(proxy_server_msg::Body::OpenResult(ProxyOpenResult {
                                     ok: false,
                                     error: "unknown wire_mode".into(),
+                                    quic_data_plane: false,
+                                    quic_host: String::new(),
+                                    quic_port: 0,
+                                    data_plane_ticket: Vec::new(),
                                 })),
                             }))
                             .await;
@@ -1610,6 +2118,119 @@ impl DeployService for DeployServiceImpl {
                 }
                 return;
             }
+
+            let use_quic = crate::quic::dataplane_enabled()
+                && quic_dp.is_some()
+                && prefer_quic_open;
+            if use_quic {
+                let Some(qdp) = quic_dp else {
+                    return;
+                };
+                let mut ticket_bin = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut ticket_bin);
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                let idle_secs = managed_clone
+                    .as_ref()
+                    .map(|(_, p)| p.idle_timeout_sec())
+                    .unwrap_or(60);
+                let active = Arc::new(StdMutex::new(crate::quic::context::ActiveTracker::new(
+                    idle_secs,
+                )));
+                let session_id_for_task_q = managed_clone
+                    .as_ref()
+                    .map(|(r, _)| r.session_id.clone());
+                let pk_for_task_q = managed_clone
+                    .as_ref()
+                    .map(|(r, _)| r.client_pubkey_b64.clone());
+                let policy_for_task_q = managed_clone.as_ref().map(|(_, p)| p.clone());
+                let base_in_q = managed_clone
+                    .as_ref()
+                    .map(|(r, _)| r.bytes_in.max(0) as u64)
+                    .unwrap_or(0);
+                let base_out_q = managed_clone
+                    .as_ref()
+                    .map(|(r, _)| r.bytes_out.max(0) as u64)
+                    .unwrap_or(0);
+                let base_active_ms_q = managed_clone
+                    .as_ref()
+                    .map(|(r, _)| r.active_ms.max(0) as u64)
+                    .unwrap_or(0);
+
+                let ctx = crate::quic::context::QuicRawContext {
+                    expected_host: host.clone(),
+                    expected_port: port as u16,
+                    tunnel_id,
+                    admission_guard,
+                    managed_checkpoint: managed_checkpoint_raw.clone(),
+                    bytes_in: bytes_in.clone(),
+                    bytes_out: bytes_out.clone(),
+                    metrics: metrics.clone(),
+                    db_opt: db_opt.clone(),
+                    client_pubkey_for_traffic: client_pubkey_for_traffic.clone(),
+                    stream_correlation_id: stream_corr.clone(),
+                    session_id_for_task: session_id_for_task_q,
+                    pk_for_task: pk_for_task_q,
+                    policy_for_task: policy_for_task_q,
+                    base_in: base_in_q,
+                    base_out: base_out_q,
+                    base_active_ms: base_active_ms_q,
+                    active,
+                    completion: completion_tx,
+                };
+                qdp.ticket_store.insert(ticket_bin, ctx).await;
+                let qh = qdp.public_host.clone();
+                let qp = if qdp.public_port > 0 {
+                    qdp.public_port
+                } else {
+                    7844
+                };
+                if tx
+                    .send(Ok(ProxyServerMsg {
+                        body: Some(proxy_server_msg::Body::OpenResult(ProxyOpenResult {
+                            ok: true,
+                            error: String::new(),
+                            quic_data_plane: true,
+                            quic_host: qh,
+                            quic_port: qp as u32,
+                            data_plane_ticket: ticket_bin.to_vec(),
+                        })),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                let mut inbound_drain = inbound;
+                let drain_jh = tokio::spawn(async move {
+                    while let Some(item) = inbound_drain.next().await {
+                        let msg = match item {
+                            Ok(m) => m,
+                            Err(_) => break,
+                        };
+                        match msg.body {
+                            Some(proxy_client_msg::Body::Open(_)) => break,
+                            Some(proxy_client_msg::Body::Fin(_)) | None => break,
+                            Some(proxy_client_msg::Body::Data(_)) => {}
+                        }
+                    }
+                });
+
+                match tokio::time::timeout(Duration::from_secs(120), completion_rx).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        metrics.tunnel_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        metrics.tunnel_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                drain_jh.abort();
+                let _ = drain_jh.await;
+                return;
+            }
+
+            let _admission_guard = admission_guard;
 
             let tcp = match tokio::time::timeout(
                 Duration::from_secs(30),
@@ -1624,6 +2245,10 @@ impl DeployService for DeployServiceImpl {
                             body: Some(proxy_server_msg::Body::OpenResult(ProxyOpenResult {
                                 ok: false,
                                 error: "connect timeout".to_string(),
+                                quic_data_plane: false,
+                                quic_host: String::new(),
+                                quic_port: 0,
+                                data_plane_ticket: Vec::new(),
                             })),
                         }))
                         .await;
@@ -1636,6 +2261,10 @@ impl DeployService for DeployServiceImpl {
                             body: Some(proxy_server_msg::Body::OpenResult(ProxyOpenResult {
                                 ok: false,
                                 error: e.to_string(),
+                                quic_data_plane: false,
+                                quic_host: String::new(),
+                                quic_port: 0,
+                                data_plane_ticket: Vec::new(),
                             })),
                         }))
                         .await;
@@ -1649,6 +2278,10 @@ impl DeployService for DeployServiceImpl {
                     body: Some(proxy_server_msg::Body::OpenResult(ProxyOpenResult {
                         ok: true,
                         error: String::new(),
+                        quic_data_plane: false,
+                        quic_host: String::new(),
+                        quic_port: 0,
+                        data_plane_ticket: Vec::new(),
                     })),
                 }))
                 .await
@@ -1694,6 +2327,22 @@ impl DeployService for DeployServiceImpl {
             let active_out = active.clone();
             let active_end = active;
 
+            let mut checkpoint_jh: Option<tokio::task::JoinHandle<()>> = None;
+            let mut checkpoint_shut: Option<tokio::sync::watch::Sender<bool>> = None;
+            if let Some(ref cp) = managed_checkpoint_raw {
+                let (jh, tx) = spawn_managed_checkpoint(
+                    cp.clone(),
+                    bytes_in.clone(),
+                    bytes_out.clone(),
+                    {
+                        let active_c = active_end.clone();
+                        move || active_c.lock().map(|a| a.accum_ms).unwrap_or(0)
+                    },
+                );
+                checkpoint_jh = Some(jh);
+                checkpoint_shut = Some(tx);
+            }
+
             let session_id_for_task = managed_clone
                 .as_ref()
                 .map(|(r, _)| r.session_id.clone());
@@ -1709,6 +2358,10 @@ impl DeployService for DeployServiceImpl {
             let base_out = managed_clone
                 .as_ref()
                 .map(|(r, _)| r.bytes_out.max(0) as u64)
+                .unwrap_or(0);
+            let base_active_ms = managed_clone
+                .as_ref()
+                .map(|(r, _)| r.active_ms.max(0) as u64)
                 .unwrap_or(0);
 
             let bin_count = bytes_in.clone();
@@ -1734,18 +2387,35 @@ impl DeployService for DeployServiceImpl {
                                 return Err(Status::invalid_argument("proxy chunk too large"));
                             }
                             bin_count.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            let mut traffic_exceeded = false;
+                            let mut budget_exceeded = false;
                             if let Ok(mut a) = active_in.lock() {
                                 a.bump();
-                            }
-                            if let Some(ref pol) = policy_for_t_in {
-                                let bi = base_in + bin_count.load(Ordering::Relaxed);
-                                let bo = base_out + bytes_out_in.load(Ordering::Relaxed);
-                                if proxy_session::check_traffic_limits(pol, bi, bo).is_err() {
-                                    let _ = tcp_write.shutdown().await;
-                                    return Err(Status::resource_exhausted(
-                                        "proxy session traffic limit",
-                                    ));
+                                if let Some(ref pol) = policy_for_t_in {
+                                    let bi = base_in + bin_count.load(Ordering::Relaxed);
+                                    let bo = base_out + bytes_out_in.load(Ordering::Relaxed);
+                                    traffic_exceeded =
+                                        proxy_session::check_traffic_limits(pol, bi, bo).is_err();
+                                    if !traffic_exceeded {
+                                        budget_exceeded = proxy_session::active_time_budget_exceeded(
+                                            pol,
+                                            base_active_ms,
+                                            a.accum_ms,
+                                        );
+                                    }
                                 }
+                            }
+                            if traffic_exceeded {
+                                let _ = tcp_write.shutdown().await;
+                                return Err(Status::resource_exhausted(
+                                    "proxy session traffic limit",
+                                ));
+                            }
+                            if budget_exceeded {
+                                let _ = tcp_write.shutdown().await;
+                                return Err(Status::resource_exhausted(
+                                    "proxy session active time budget exhausted",
+                                ));
                             }
                             if let Err(e) = tcp_write.write_all(&data).await {
                                 let _ = tcp_write.shutdown().await;
@@ -1783,13 +2453,29 @@ impl DeployService for DeployServiceImpl {
                         }
                         Ok(n) => {
                             bout_count.fetch_add(n as u64, Ordering::Relaxed);
+                            let mut budget_exceeded = false;
                             if let Ok(mut a) = active_out.lock() {
                                 a.bump();
+                                if let Some(ref pol) = policy_out {
+                                    let bi = base_in_out + bytes_in_out.load(Ordering::Relaxed);
+                                    let bo = base_out_out + bout_count.load(Ordering::Relaxed);
+                                    let _ = proxy_session::check_traffic_limits(pol, bi, bo);
+                                    budget_exceeded = proxy_session::active_time_budget_exceeded(
+                                        pol,
+                                        base_active_ms,
+                                        a.accum_ms,
+                                    );
+                                }
                             }
-                            if let Some(ref pol) = policy_out {
-                                let bi = base_in_out + bytes_in_out.load(Ordering::Relaxed);
-                                let bo = base_out_out + bout_count.load(Ordering::Relaxed);
-                                let _ = proxy_session::check_traffic_limits(pol, bi, bo);
+                            if budget_exceeded {
+                                let _ = tx_out
+                                    .send(Ok(ProxyServerMsg {
+                                        body: Some(proxy_server_msg::Body::Error(
+                                            "proxy session active time budget exhausted".into(),
+                                        )),
+                                    }))
+                                    .await;
+                                break;
                             }
                             let chunk = buf[..n].to_vec();
                             if tx_out
@@ -1829,8 +2515,44 @@ impl DeployService for DeployServiceImpl {
                 }
             }
 
+            if let Some(tx) = checkpoint_shut {
+                let _ = tx.send(true);
+            }
+            if let Some(jh) = checkpoint_jh {
+                jh.abort();
+            }
+
             let bi = bytes_in.load(Ordering::Relaxed);
             let bo = bytes_out.load(Ordering::Relaxed);
+            let active_ms_u64 = active_end
+                .lock()
+                .map(|a| a.accum_ms)
+                .unwrap_or(0);
+
+            if let Some(ref cp) = managed_checkpoint_raw {
+                if let Err(e) = flush_managed_tunnel_end(cp, bi, bo, active_ms_u64).await {
+                    error!(%e, "grpc proxy session final flush (raw tunnel)");
+                }
+            } else if let (Some(db), Some(sid), Some(pk), Some(_pol)) = (
+                db_opt.clone(),
+                session_id_for_task,
+                pk_for_task,
+                policy_for_task,
+            ) {
+                let now = chrono::Utc::now();
+                let _ = db
+                    .increment_grpc_proxy_session_traffic(
+                        &sid,
+                        &pk,
+                        bi,
+                        bo,
+                        active_ms_u64 as i64,
+                        now,
+                        Some(now),
+                    )
+                    .await;
+            }
+
             metrics.bytes_in.fetch_add(bi, Ordering::Relaxed);
             metrics.bytes_out.fetch_add(bo, Ordering::Relaxed);
 
@@ -1845,30 +2567,6 @@ impl DeployService for DeployServiceImpl {
                         }
                     });
                 }
-            }
-
-            if let (Some(db), Some(sid), Some(pk), Some(_pol)) = (
-                db_opt,
-                session_id_for_task,
-                pk_for_task,
-                policy_for_task,
-            ) {
-                let active_ms = active_end
-                    .lock()
-                    .map(|a| a.accum_ms as i64)
-                    .unwrap_or(0);
-                let now = chrono::Utc::now();
-                let _ = db
-                    .increment_grpc_proxy_session_traffic(
-                        &sid,
-                        &pk,
-                        bi,
-                        bo,
-                        active_ms,
-                        now,
-                        Some(now),
-                    )
-                    .await;
             }
         });
 
@@ -1959,6 +2657,57 @@ impl DeployService for DeployServiceImpl {
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(ReportResourceUsageResponse {
+            status: "ok".to_string(),
+        }))
+    }
+
+    async fn report_display_topology(
+        &self,
+        request: Request<ReportDisplayTopologyRequest>,
+    ) -> Result<Response<ReportDisplayTopologyResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner_ref = request.get_ref();
+        validate_project_id(&inner_ref.project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("ReportDisplayTopology", &inner_ref.project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "ReportDisplayTopology",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let pk = meta
+            .get(META_PUBKEY)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing client pubkey"))?;
+        let inner = request.into_inner();
+        let v: Vec<serde_json::Value> = inner
+            .displays
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "index": d.index,
+                    "label": d.label,
+                    "width": d.width,
+                    "height": d.height,
+                })
+            })
+            .collect();
+        let json = serde_json::to_string(&v).map_err(|e| Status::internal(e.to_string()))?;
+        db.upsert_peer_display_topology(pk, inner.stream_capable, &json)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ReportDisplayTopologyResponse {
             status: "ok".to_string(),
         }))
     }
@@ -2096,27 +2845,60 @@ impl DeployService for DeployServiceImpl {
         let policy_json = proxy_session::policy_json_from_proto(&policy)?;
         let expires_at = proxy_session::expires_at_from_policy(&policy, now);
 
+        let (wire_mode, wire_json_owned) = validate_inbound_wire(
+            inner.wire_mode,
+            inner.wire_config_json.as_deref(),
+        )?;
+        let wire_json_ref = wire_json_owned.as_deref();
+
+        let ingress = validate_ingress_create(inner)?;
+
         let mut raw = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut raw);
         let token = hex::encode(raw);
         let token_hash = proxy_session::hash_session_token_hex(&token);
+
+        let mut sub_raw = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut sub_raw);
+        let subscription_token = hex::encode(sub_raw);
 
         let session_id = db
             .insert_grpc_proxy_session(
                 pk_stored.as_str(),
                 inner.board_label.as_str(),
                 &token_hash,
+                subscription_token.as_str(),
                 expires_at,
                 &policy_json,
+                wire_mode,
+                wire_json_ref,
+                ingress.protocol,
+                ingress.listen_tcp,
+                ingress.listen_udp,
+                ingress.config_json.as_deref(),
+                ingress.tls_json.as_deref(),
+                ingress.template_version,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let expires_ms = proxy_session::client_expires_at_unix_ms(&policy, expires_at);
+
+        let subscription_url = std::env::var("DEPLOY_SUBSCRIPTION_PUBLIC_HOST")
+            .ok()
+            .map(|b| b.trim().trim_end_matches('/').to_string())
+            .filter(|b| !b.is_empty())
+            .map(|base| {
+                format!("{base}/api/v1/public/proxy-subscription/{subscription_token}")
+            });
+
         Ok(Response::new(CreateConnectionResponse {
             session_id,
             session_token: token,
-            expires_at_unix_ms: expires_at.timestamp_millis(),
+            expires_at_unix_ms: expires_ms,
             status: "ok".to_string(),
+            subscription_token: Some(subscription_token),
+            subscription_url,
         }))
     }
 
@@ -2244,7 +3026,7 @@ impl DeployService for DeployServiceImpl {
                 .unwrap_or(0),
             revoked: row.revoked,
             created_at_unix_ms: row.created_at.timestamp_millis(),
-            expires_at_unix_ms: row.expires_at.timestamp_millis(),
+            expires_at_unix_ms: expires_ms_from_policy_json(&row.policy_json, row.expires_at),
         }))
     }
 
@@ -2291,16 +3073,47 @@ impl DeployService for DeployServiceImpl {
         let policy_json = proxy_session::policy_json_from_proto(&policy)?;
         let expires_at = proxy_session::expires_at_from_policy(&policy, now);
 
+        let update_wire = inner.wire_mode.is_some() || inner.wire_config_json.is_some();
+        let (wire_mode, wire_json_owned) = if update_wire {
+            validate_inbound_wire(inner.wire_mode, inner.wire_config_json.as_deref())?
+        } else {
+            (None, None)
+        };
+        let wire_json_ref = wire_json_owned.as_deref();
+
+        let update_ingress = should_update_ingress(inner);
+        let ingress = if update_ingress {
+            validate_ingress_update(inner)?
+        } else {
+            IngressDb::disabled()
+        };
+
         let n = db
-            .update_grpc_proxy_session_policy(&inner.session_id, pk, &policy_json, expires_at)
+            .update_grpc_proxy_session_policy(
+                &inner.session_id,
+                pk,
+                &policy_json,
+                expires_at,
+                update_wire,
+                wire_mode,
+                wire_json_ref,
+                update_ingress,
+                ingress.protocol,
+                ingress.listen_tcp,
+                ingress.listen_udp,
+                ingress.config_json.as_deref(),
+                ingress.tls_json.as_deref(),
+                ingress.template_version,
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if n == 0 {
             return Err(Status::not_found("session not found or revoked"));
         }
+        let expires_ms = proxy_session::client_expires_at_unix_ms(&policy, expires_at);
         Ok(Response::new(UpdateProxySettingsResponse {
             status: "ok".to_string(),
-            expires_at_unix_ms: expires_at.timestamp_millis(),
+            expires_at_unix_ms: expires_ms,
         }))
     }
 
@@ -2467,18 +3280,81 @@ fn proxy_allowlist_check(host: &str) -> Result<(), Status> {
     ))
 }
 
+fn bundle_has_server_bins(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        dir.join("bin/deploy-server.exe").is_file() && dir.join("bin/control-api.exe").is_file()
+    }
+    #[cfg(not(windows))]
+    {
+        dir.join("bin/deploy-server").is_file() && dir.join("bin/control-api").is_file()
+    }
+}
+
+async fn apply_stack_bundle_command(
+    br: &Path,
+    ver: &str,
+    apply_json: Option<&PathBuf>,
+) -> Result<std::process::ExitStatus, String> {
+    #[cfg(unix)]
+    {
+        let mut cmd = tokio::process::Command::new("sudo");
+        cmd.arg("/usr/local/lib/pirate/pirate-apply-stack-bundle.sh")
+            .arg(br)
+            .arg(ver);
+        if let Some(jp) = apply_json {
+            cmd.arg(jp);
+        }
+        cmd.status().await.map_err(|e| format!("sudo apply stack: {e}"))
+    }
+    #[cfg(windows)]
+    {
+        let apply_script = std::env::var_os("PIRATE_APPLY_STACK_SCRIPT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let mut p = std::env::var_os("ProgramFiles")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+                p.push("Pirate");
+                p.push("lib");
+                p.push("pirate");
+                p.push("pirate-apply-stack-bundle.ps1");
+                p
+            });
+        let mut cmd = tokio::process::Command::new("powershell.exe");
+        cmd.arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&apply_script)
+            .arg(br)
+            .arg(ver);
+        if let Some(jp) = apply_json {
+            cmd.arg(jp);
+        }
+        cmd.status().await.map_err(|e| format!("powershell apply stack: {e}"))
+    }
+}
+
 fn find_pirate_bundle_root(extracted: &Path) -> Result<PathBuf, Status> {
-    for name in ["pirate-linux-amd64", "pirate-linux-aarch64"] {
+    for name in [
+        "pirate-linux-amd64",
+        "pirate-linux-aarch64",
+        "pirate-macos-amd64",
+        "pirate-macos-arm64",
+        "pirate-windows-amd64",
+        "pirate-windows-arm64",
+    ] {
         let d = extracted.join(name);
-        if d.join("bin/deploy-server").is_file() && d.join("bin/control-api").is_file() {
+        if bundle_has_server_bins(&d) {
             return Ok(d);
         }
     }
-    if extracted.join("bin/deploy-server").is_file() && extracted.join("bin/control-api").is_file() {
+    if bundle_has_server_bins(extracted) {
         return Ok(extracted.to_path_buf());
     }
     Err(Status::invalid_argument(
-        "expected bundle with bin/deploy-server and bin/control-api (e.g. pirate-linux-amd64/ or pirate-linux-aarch64/)",
+        "expected bundle with bin/deploy-server and bin/control-api (top-level or pirate-*-*/)",
     ))
 }
 
