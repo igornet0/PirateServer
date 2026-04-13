@@ -10,6 +10,8 @@ pub enum WireMode {
     Vless,
     Trojan,
     Vmess,
+    Shadowsocks,
+    Socks5,
 }
 
 impl Default for WireMode {
@@ -24,6 +26,8 @@ impl WireMode {
             1 => Self::Vless,
             2 => Self::Trojan,
             3 => Self::Vmess,
+            4 => Self::Shadowsocks,
+            5 => Self::Socks5,
             _ => Self::RawTcpRelay,
         }
     }
@@ -34,6 +38,8 @@ impl WireMode {
             WireMode::Vless => 1,
             WireMode::Trojan => 2,
             WireMode::Vmess => 3,
+            WireMode::Shadowsocks => 4,
+            WireMode::Socks5 => 5,
         }
     }
 }
@@ -49,6 +55,12 @@ pub struct WireParams {
     /// Optional flow label (reserved).
     #[serde(default)]
     pub flow: Option<String>,
+    /// Shadowsocks AEAD method (e.g. `2022-blake3-aes-128-gcm`).
+    #[serde(default)]
+    pub method: Option<String>,
+    /// SOCKS5 username if auth required.
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

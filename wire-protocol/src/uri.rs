@@ -53,8 +53,7 @@ fn parse_vless(t: &str) -> Result<ParsedSubscription, WireError> {
         mode: WireMode::Vless,
         params: WireParams {
             uuid: Some(uuid),
-            password: None,
-            flow: None,
+            ..Default::default()
         },
         remote_host: host,
         remote_port: port,
@@ -73,9 +72,8 @@ fn parse_trojan(t: &str) -> Result<ParsedSubscription, WireError> {
     Ok(ParsedSubscription {
         mode: WireMode::Trojan,
         params: WireParams {
-            uuid: None,
             password: Some(password),
-            flow: None,
+            ..Default::default()
         },
         remote_host: host,
         remote_port: port,
@@ -112,8 +110,7 @@ fn parse_vmess(t: &str) -> Result<ParsedSubscription, WireError> {
         mode: WireMode::Vmess,
         params: WireParams {
             uuid: Some(id),
-            password: None,
-            flow: None,
+            ..Default::default()
         },
         remote_host: add,
         remote_port: port,
