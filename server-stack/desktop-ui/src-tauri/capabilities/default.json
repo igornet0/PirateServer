@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "default",
+  "description": "Default window and core permissions",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "http://*:*/*" },
+        { "url": "https://*:*/*" },
+        { "url": "http://*:*" },
+        { "url": "https://*:*" },
+        { "url": "http://127.0.0.1:*/*" },
+        { "url": "http://localhost:*/*" },
+        { "url": "https://127.0.0.1:*/*" },
+        { "url": "https://localhost:*/*" },
+        { "url": "http://**" },
+        { "url": "https://**" }
+      ]
+    }
+  ]
+}

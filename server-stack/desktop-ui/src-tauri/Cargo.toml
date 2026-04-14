@@ -1,0 +1,12 @@
+[package]
+name = "pirate-dashboard-desktop"
+version = "0.1.3"
+edition = "2021"
+description = "PirateServer dashboard — Tauri desktop shell"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-http = "2"

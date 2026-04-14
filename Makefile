@@ -52,6 +52,7 @@ help:
 	@echo "Bundles:\n -Server stack:"
 	@echo "  make dist                                                     - rust-release + frontend + dist/release-manifest.json (see VERSION)"
 	@echo "  make dist-linux [ARCH=amd64|arm64] [UI_BUILD=1]               - Linux tar.gz (pirate-linux-<ARCH>-<VERSION>-<date>.tar.gz)"
+	@echo "    macOS: uses Docker (rust:bookworm) for Rust link; LINUX_BUNDLE_HOST_BUILD=1 forces host cargo/zigbuild"
 	@echo "  make dist-macos [ARCH=amd64|arm64] [UI_BUILD=1]               - macOS tar.gz (pirate-macos-<ARCH>-<VERSION>-<date>.tar.gz)"
 	@echo "  make dist-macos-dmg [ARCH=amd64|arm64] [UI_BUILD=1]           - macOS DMG (pirate-macos-<ARCH>-<VERSION>-<date>.dmg)"
 	@echo "  make dist-windows [ARCH=amd64|arm64] [UI_BUILD=1]             - Windows zip (pirate-windows-<ARCH>-<VERSION>-<date>.zip)"
@@ -220,7 +221,7 @@ dist-manifest:
 	./scripts/write-release-manifest.sh
 
 dist-linux:
-	@chmod +x scripts/build-linux-bundle.sh scripts/linux-bundle-build.sh scripts/read-version.sh scripts/write-server-stack-manifest.sh
+	@chmod +x scripts/build-linux-bundle.sh scripts/linux-bundle-build.sh scripts/linux-bundle-build-rust-in-docker.sh scripts/linux-bundle-rust-docker-entry.sh scripts/read-version.sh scripts/write-server-stack-manifest.sh
 	UI_BUILD=$(UI_BUILD) ARCH=$(ARCH) ./scripts/build-linux-bundle.sh
 
 dist-macos:

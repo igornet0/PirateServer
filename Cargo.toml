@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "proto",
     "wire-protocol",
+    "server-stack/ingress-config",
+    "server-stack/xray-export",
     "server-stack/server",
     "server-stack/control-api",
     "server-stack/deploy-control",
@@ -14,4 +16,5 @@ members = [
     "local-stack/local-agent",
     "local-stack/desktop-client",
     "local-stack/desktop-ui/src-tauri",
+    "server-stack/desktop-ui/src-tauri",
 ]
