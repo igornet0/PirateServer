@@ -86,6 +86,10 @@ message DeployChunk {
   string sha256_hex = 4;
   // Logical project id; empty means `default` (legacy single-root layout under --root).
   string project_id = 5;
+  // Optional: full `pirate.toml` body (UTF-8). Sent on the last chunk only; server applies after unpack.
+  string manifest_toml = 6;
+  // Artifact kind: "tar_gz" (default) or reserved for future image transport.
+  string artifact_kind = 7;
 }
 
 message DeployResponse {

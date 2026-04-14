@@ -1,5 +1,10 @@
 //! Shared deployment root layout, version validation, and [`AppState`] for the deploy service.
 
+pub mod display_stream;
+pub mod pirate_project;
+pub mod process_manager;
+pub mod sandbox;
+
 /// Cargo package version of this crate (linked into `pirate` / deploy clients).
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -108,6 +113,17 @@ pub fn read_current_version_from_symlink(root: &Path) -> Option<String> {
 
 /// Native install (and bundles that mimic it) write bundle metadata here.
 pub const PIRATE_VAR_LIB: &str = "/var/lib/pirate";
+
+/// Snapshot written by `install.sh`: GUI probe + `display_stream_consent` at install time.
+pub const HOST_GUI_INSTALL_JSON: &str = "host-gui-install.json";
+
+/// Parse `gui_detected` from `host-gui-install.json` body.
+pub fn host_gui_detected_from_install_json(raw: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()?
+        .get("gui_detected")
+        .and_then(|v| v.as_bool())
+}
 
 /// Systemd `EnvironmentFile` for deploy-server / control-api (see `install.sh`).
 pub const PIRATE_DEPLOY_ENV_PATH: &str = "/etc/pirate-deploy.env";
@@ -257,6 +273,14 @@ CONTROL_UI_ADMIN_PASSWORD=pw
 "#;
         assert!(pirate_deploy_env_dashboard_enabled(s));
         assert!(!pirate_deploy_env_dashboard_enabled("CONTROL_API_JWT_SECRET=\nCONTROL_UI_ADMIN_USERNAME=a\nCONTROL_UI_ADMIN_PASSWORD=b"));
+    }
+
+    #[test]
+    fn host_gui_install_json_parses_gui_detected() {
+        let raw = r#"{"gui_detected":true,"reasons":["x"],"display_stream_consent":1,"ts_unix":1}"#;
+        assert_eq!(host_gui_detected_from_install_json(raw), Some(true));
+        let raw2 = r#"{"gui_detected":false}"#;
+        assert_eq!(host_gui_detected_from_install_json(raw2), Some(false));
     }
 
     #[test]

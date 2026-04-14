@@ -16,6 +16,7 @@ use deploy_proto::deploy::deploy_service_client::DeployServiceClient;
 use deploy_proto::deploy::{
     CreateConnectionRequest, CreateConnectionResponse, ProxyConnectionPolicy,
     RestartProcessRequest, RollbackRequest, StatusRequest, StopProcessRequest,
+    UpdateProxySettingsRequest, UpdateProxySettingsResponse,
 };
 use ed25519_dalek::SigningKey;
 use std::fs;
@@ -551,6 +552,14 @@ impl ControlPlane {
         board_label: String,
         policy: ProxyConnectionPolicy,
         recipient_client_pubkey_b64: Option<String>,
+        wire_mode: Option<i32>,
+        wire_config_json: Option<String>,
+        ingress_protocol: Option<i32>,
+        ingress_listen_port: Option<u32>,
+        ingress_listen_udp_port: Option<u32>,
+        ingress_config_json: Option<String>,
+        ingress_tls_json: Option<String>,
+        ingress_template_version: Option<u32>,
     ) -> Result<CreateConnectionResponse, ControlError> {
         validate_project_id(&project_id).map_err(|e| ControlError::Grpc(e.to_string()))?;
         let pid = normalize_project_id(&project_id);
@@ -568,6 +577,14 @@ impl ControlPlane {
             board_label,
             policy: Some(policy),
             recipient_client_pubkey_b64: recipient,
+            wire_mode,
+            wire_config_json,
+            ingress_protocol,
+            ingress_listen_port,
+            ingress_listen_udp_port,
+            ingress_config_json,
+            ingress_tls_json,
+            ingress_template_version,
         });
         attach_auth_metadata(&mut req, sk, "CreateConnection", &pid, "")
             .map_err(|e| ControlError::Grpc(e.to_string()))?;
@@ -576,6 +593,54 @@ impl ControlPlane {
             .map_err(|e| ControlError::Grpc(e.to_string()))?;
         client
             .create_connection(req)
+            .await
+            .map_err(|e| ControlError::Grpc(e.to_string()))
+            .map(|r| r.into_inner())
+    }
+
+    /// Update managed proxy session policy (and optional wire) via deploy-server `UpdateSettings`.
+    pub async fn update_proxy_invitation(
+        &self,
+        project_id: String,
+        session_id: String,
+        policy: ProxyConnectionPolicy,
+        wire_mode: Option<i32>,
+        wire_config_json: Option<String>,
+        ingress_protocol: Option<i32>,
+        ingress_listen_port: Option<u32>,
+        ingress_listen_udp_port: Option<u32>,
+        ingress_config_json: Option<String>,
+        ingress_tls_json: Option<String>,
+        ingress_template_version: Option<u32>,
+    ) -> Result<UpdateProxySettingsResponse, ControlError> {
+        validate_project_id(&project_id).map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let pid = normalize_project_id(&project_id);
+        let sk = self.grpc_signing_key.as_ref().ok_or_else(|| {
+            ControlError::Grpc(
+                "grpc signing key is not configured; cannot update proxy tunnel invitations"
+                    .to_string(),
+            )
+        })?;
+        let mut req = tonic::Request::new(UpdateProxySettingsRequest {
+            project_id: pid.clone(),
+            session_id,
+            policy: Some(policy),
+            wire_mode,
+            wire_config_json,
+            ingress_protocol,
+            ingress_listen_port,
+            ingress_listen_udp_port,
+            ingress_config_json,
+            ingress_tls_json,
+            ingress_template_version,
+        });
+        attach_auth_metadata(&mut req, sk, "UpdateSettings", &pid, "")
+            .map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let mut client = DeployServiceClient::connect(self.grpc_endpoint.clone())
+            .await
+            .map_err(|e| ControlError::Grpc(e.to_string()))?;
+        client
+            .update_settings(req)
             .await
             .map_err(|e| ControlError::Grpc(e.to_string()))
             .map(|r| r.into_inner())
@@ -621,6 +686,21 @@ impl ControlPlane {
             )
         })?;
         db.fetch_grpc_proxy_session_by_id_only(session_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn fetch_proxy_invitation_by_subscription_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<deploy_db::GrpcProxySessionRow>, ControlError> {
+        let db = self.db.as_ref().ok_or_else(|| {
+            ControlError::Grpc(
+                "metadata database is not configured (set DEPLOY_SQLITE_URL or DATABASE_URL)"
+                    .to_string(),
+            )
+        })?;
+        db.fetch_grpc_proxy_session_by_subscription_token(token)
             .await
             .map_err(Into::into)
     }
