@@ -7,6 +7,7 @@ pub mod display_ingest;
 pub mod bookmarks;
 pub mod connection;
 pub mod deploy;
+pub mod paas;
 pub mod server_stack;
 pub mod host_stats;
 pub mod hosts;
@@ -22,6 +23,10 @@ pub use connection::{
     set_control_api_base, verify_grpc_endpoint, GrpcConnectResult,
 };
 pub use deploy::{DeployOutcome, RollbackOutcome};
+pub use paas::{
+    run_apply_gen, run_init_project, run_pipeline, run_project_build, run_project_test,
+    run_scan_project, run_test_local, PipelineOutcome,
+};
 pub use server_stack::{fetch_server_stack_info_json, run_server_stack_update_with_progress, ServerStackOutcome};
 pub use status::{app_status, AppStatus};
 pub use host_stats::{fetch_host_stats_detail_json, fetch_host_stats_json};
