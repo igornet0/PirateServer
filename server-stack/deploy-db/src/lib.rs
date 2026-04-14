@@ -843,6 +843,78 @@ impl DbStore {
         Ok(row)
     }
 
+    pub async fn upsert_peer_display_topology(
+        &self,
+        client_pubkey_b64: &str,
+        stream_capable: bool,
+        json_displays: &str,
+    ) -> Result<(), DbError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO peer_display_topology (client_pubkey_b64, updated_at_ms, stream_capable, json_displays)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (client_pubkey_b64) DO UPDATE SET
+                      updated_at_ms = EXCLUDED.updated_at_ms,
+                      stream_capable = EXCLUDED.stream_capable,
+                      json_displays = EXCLUDED.json_displays
+                    "#,
+                )
+                .bind(client_pubkey_b64)
+                .bind(now)
+                .bind(stream_capable)
+                .bind(json_displays)
+                .execute(pool)
+                .await?;
+            }
+            Self::Sqlite(pool) => {
+                let sc = if stream_capable { 1i64 } else { 0 };
+                sqlx::query(
+                    r#"
+                    INSERT INTO peer_display_topology (client_pubkey_b64, updated_at_ms, stream_capable, json_displays)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (client_pubkey_b64) DO UPDATE SET
+                      updated_at_ms = excluded.updated_at_ms,
+                      stream_capable = excluded.stream_capable,
+                      json_displays = excluded.json_displays
+                    "#,
+                )
+                .bind(client_pubkey_b64)
+                .bind(now)
+                .bind(sc)
+                .bind(json_displays)
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn fetch_peer_display_topology(
+        &self,
+        client_pubkey_b64: &str,
+    ) -> Result<Option<(i64, bool, String)>, DbError> {
+        let q = r#"
+            SELECT updated_at_ms, stream_capable, json_displays
+            FROM peer_display_topology
+            WHERE client_pubkey_b64 = $1
+        "#;
+        match self {
+            Self::Postgres(pool) => {
+                let row: Option<(i64, bool, String)> =
+                    sqlx::query_as(q).bind(client_pubkey_b64).fetch_optional(pool).await?;
+                Ok(row)
+            }
+            Self::Sqlite(pool) => {
+                let row: Option<(i64, i64, String)> =
+                    sqlx::query_as(q).bind(client_pubkey_b64).fetch_optional(pool).await?;
+                Ok(row.map(|(a, b, j)| (a, b != 0, j)))
+            }
+        }
+    }
+
     pub async fn insert_server_resource_benchmark(
         &self,
         cpu_score: i32,
@@ -926,27 +998,49 @@ impl DbStore {
         client_pubkey_b64: &str,
         board_label: &str,
         token_sha256_hex: &str,
+        subscription_token: &str,
         expires_at: DateTime<Utc>,
         policy_json: &str,
+        wire_mode: Option<i32>,
+        wire_config_json: Option<&str>,
+        ingress_protocol: Option<i16>,
+        ingress_listen_port: Option<i32>,
+        ingress_listen_udp_port: Option<i32>,
+        ingress_config_json: Option<&str>,
+        ingress_tls_json: Option<&str>,
+        ingress_template_version: i32,
     ) -> Result<String, DbError> {
         let session_id = uuid::Uuid::new_v4().to_string();
+        let ver = ingress_template_version.max(1);
         match self {
             Self::Postgres(pool) => {
                 sqlx::query(
                     r#"
             INSERT INTO grpc_proxy_session (
               session_id, client_pubkey_b64, board_label, token_sha256_hex,
-              expires_at, policy_json
+              subscription_token,
+              expires_at, policy_json, wire_mode, wire_config_json,
+              ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+              ingress_config_json, ingress_tls_json, ingress_template_version
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
                 )
                 .bind(&session_id)
                 .bind(client_pubkey_b64)
                 .bind(board_label)
                 .bind(token_sha256_hex)
+                .bind(subscription_token)
                 .bind(expires_at)
                 .bind(policy_json)
+                .bind(wire_mode.map(|x| x as i16))
+                .bind(wire_config_json)
+                .bind(ingress_protocol)
+                .bind(ingress_listen_port)
+                .bind(ingress_listen_udp_port)
+                .bind(ingress_config_json)
+                .bind(ingress_tls_json)
+                .bind(ver)
                 .execute(pool)
                 .await?;
             }
@@ -956,17 +1050,29 @@ impl DbStore {
                     r#"
             INSERT INTO grpc_proxy_session (
               session_id, client_pubkey_b64, board_label, token_sha256_hex,
-              expires_at, policy_json
+              subscription_token,
+              expires_at, policy_json, wire_mode, wire_config_json,
+              ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+              ingress_config_json, ingress_tls_json, ingress_template_version
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
                 )
                 .bind(&session_id)
                 .bind(client_pubkey_b64)
                 .bind(board_label)
                 .bind(token_sha256_hex)
+                .bind(subscription_token)
                 .bind(exp)
                 .bind(policy_json)
+                .bind(wire_mode)
+                .bind(wire_config_json)
+                .bind(ingress_protocol.map(|x| x as i64))
+                .bind(ingress_listen_port.map(|x| x as i64))
+                .bind(ingress_listen_udp_port.map(|x| x as i64))
+                .bind(ingress_config_json)
+                .bind(ingress_tls_json)
+                .bind(ver as i64)
                 .execute(pool)
                 .await?;
             }
@@ -979,9 +1085,11 @@ impl DbStore {
         token_sha256_hex: &str,
     ) -> Result<Option<GrpcProxySessionRow>, DbError> {
         let q = r#"
-            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex,
+            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex, subscription_token,
                    created_at, expires_at, policy_json, bytes_in, bytes_out, active_ms,
-                   last_activity_at, first_open_at, revoked
+                   last_activity_at, first_open_at, revoked, wire_mode, wire_config_json,
+                   ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+                   ingress_config_json, ingress_tls_json, ingress_template_version
             FROM grpc_proxy_session WHERE token_sha256_hex = $1
         "#;
         let row = match self {
@@ -1002,15 +1110,47 @@ impl DbStore {
         Ok(row)
     }
 
+    pub async fn fetch_grpc_proxy_session_by_subscription_token(
+        &self,
+        subscription_token: &str,
+    ) -> Result<Option<GrpcProxySessionRow>, DbError> {
+        let q = r#"
+            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex, subscription_token,
+                   created_at, expires_at, policy_json, bytes_in, bytes_out, active_ms,
+                   last_activity_at, first_open_at, revoked, wire_mode, wire_config_json,
+                   ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+                   ingress_config_json, ingress_tls_json, ingress_template_version
+            FROM grpc_proxy_session WHERE subscription_token = $1
+        "#;
+        let row = match self {
+            Self::Postgres(pool) => {
+                sqlx::query_as::<_, GrpcProxySessionRow>(q)
+                    .bind(subscription_token)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as::<_, GrpcProxySessionRowSqlite>(q)
+                    .bind(subscription_token)
+                    .fetch_optional(pool)
+                    .await?
+                    .map(Into::into)
+            }
+        };
+        Ok(row)
+    }
+
     pub async fn fetch_grpc_proxy_session_by_id(
         &self,
         session_id: &str,
         client_pubkey_b64: &str,
     ) -> Result<Option<GrpcProxySessionRow>, DbError> {
         let q = r#"
-            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex,
+            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex, subscription_token,
                    created_at, expires_at, policy_json, bytes_in, bytes_out, active_ms,
-                   last_activity_at, first_open_at, revoked
+                   last_activity_at, first_open_at, revoked, wire_mode, wire_config_json,
+                   ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+                   ingress_config_json, ingress_tls_json, ingress_template_version
             FROM grpc_proxy_session WHERE session_id = $1 AND client_pubkey_b64 = $2
         "#;
         let row = match self {
@@ -1154,9 +1294,11 @@ impl DbStore {
         session_id: &str,
     ) -> Result<Option<GrpcProxySessionRow>, DbError> {
         let q = r#"
-            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex,
+            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex, subscription_token,
                    created_at, expires_at, policy_json, bytes_in, bytes_out, active_ms,
-                   last_activity_at, first_open_at, revoked
+                   last_activity_at, first_open_at, revoked, wire_mode, wire_config_json,
+                   ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+                   ingress_config_json, ingress_tls_json, ingress_template_version
             FROM grpc_proxy_session WHERE session_id = $1
         "#;
         let row = match self {
@@ -1189,9 +1331,11 @@ impl DbStore {
         match (self, revoked_filter) {
             (Self::Postgres(pool), None) => {
                 let q = r#"
-            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex,
+            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex, subscription_token,
                    created_at, expires_at, policy_json, bytes_in, bytes_out, active_ms,
-                   last_activity_at, first_open_at, revoked
+                   last_activity_at, first_open_at, revoked, wire_mode, wire_config_json,
+                   ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+                   ingress_config_json, ingress_tls_json, ingress_template_version
             FROM grpc_proxy_session
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
@@ -1204,9 +1348,11 @@ impl DbStore {
             }
             (Self::Postgres(pool), Some(rev)) => {
                 let q = r#"
-            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex,
+            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex, subscription_token,
                    created_at, expires_at, policy_json, bytes_in, bytes_out, active_ms,
-                   last_activity_at, first_open_at, revoked
+                   last_activity_at, first_open_at, revoked, wire_mode, wire_config_json,
+                   ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+                   ingress_config_json, ingress_tls_json, ingress_template_version
             FROM grpc_proxy_session
             WHERE revoked = $3
             ORDER BY created_at DESC
@@ -1221,9 +1367,11 @@ impl DbStore {
             }
             (Self::Sqlite(pool), None) => {
                 let q = r#"
-            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex,
+            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex, subscription_token,
                    created_at, expires_at, policy_json, bytes_in, bytes_out, active_ms,
-                   last_activity_at, first_open_at, revoked
+                   last_activity_at, first_open_at, revoked, wire_mode, wire_config_json,
+                   ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+                   ingress_config_json, ingress_tls_json, ingress_template_version
             FROM grpc_proxy_session
             ORDER BY created_at DESC
             LIMIT ?1 OFFSET ?2
@@ -1240,9 +1388,11 @@ impl DbStore {
             (Self::Sqlite(pool), Some(rev)) => {
                 let rev_i: i64 = if rev { 1 } else { 0 };
                 let q = r#"
-            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex,
+            SELECT session_id, client_pubkey_b64, board_label, token_sha256_hex, subscription_token,
                    created_at, expires_at, policy_json, bytes_in, bytes_out, active_ms,
-                   last_activity_at, first_open_at, revoked
+                   last_activity_at, first_open_at, revoked, wire_mode, wire_config_json,
+                   ingress_protocol, ingress_listen_port, ingress_listen_udp_port,
+                   ingress_config_json, ingress_tls_json, ingress_template_version
             FROM grpc_proxy_session
             WHERE revoked = ?3
             ORDER BY created_at DESC
@@ -1267,34 +1417,175 @@ impl DbStore {
         client_pubkey_b64: &str,
         policy_json: &str,
         expires_at: DateTime<Utc>,
+        update_wire: bool,
+        wire_mode: Option<i32>,
+        wire_config_json: Option<&str>,
+        update_ingress: bool,
+        ingress_protocol: Option<i16>,
+        ingress_listen_port: Option<i32>,
+        ingress_listen_udp_port: Option<i32>,
+        ingress_config_json: Option<&str>,
+        ingress_tls_json: Option<&str>,
+        ingress_template_version: i32,
     ) -> Result<u64, DbError> {
+        let ver = ingress_template_version.max(1);
         let n = match self {
             Self::Postgres(pool) => {
-                let r = sqlx::query(
-                    r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2
+                match (update_wire, update_ingress) {
+                    (true, true) => {
+                        let r = sqlx::query(
+                            r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2,
+                       wire_mode = $5, wire_config_json = $6,
+                       ingress_protocol = $7, ingress_listen_port = $8, ingress_listen_udp_port = $9,
+                       ingress_config_json = $10, ingress_tls_json = $11, ingress_template_version = $12
                        WHERE session_id = $3 AND client_pubkey_b64 = $4 AND revoked = FALSE"#,
-                )
-                .bind(policy_json)
-                .bind(expires_at)
-                .bind(session_id)
-                .bind(client_pubkey_b64)
-                .execute(pool)
-                .await?;
-                r.rows_affected()
+                        )
+                        .bind(policy_json)
+                        .bind(expires_at)
+                        .bind(session_id)
+                        .bind(client_pubkey_b64)
+                        .bind(wire_mode.map(|x| x as i16))
+                        .bind(wire_config_json)
+                        .bind(ingress_protocol)
+                        .bind(ingress_listen_port)
+                        .bind(ingress_listen_udp_port)
+                        .bind(ingress_config_json)
+                        .bind(ingress_tls_json)
+                        .bind(ver)
+                        .execute(pool)
+                        .await?;
+                        r.rows_affected()
+                    }
+                    (true, false) => {
+                        let r = sqlx::query(
+                            r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2,
+                       wire_mode = $5, wire_config_json = $6
+                       WHERE session_id = $3 AND client_pubkey_b64 = $4 AND revoked = FALSE"#,
+                        )
+                        .bind(policy_json)
+                        .bind(expires_at)
+                        .bind(session_id)
+                        .bind(client_pubkey_b64)
+                        .bind(wire_mode.map(|x| x as i16))
+                        .bind(wire_config_json)
+                        .execute(pool)
+                        .await?;
+                        r.rows_affected()
+                    }
+                    (false, true) => {
+                        let r = sqlx::query(
+                            r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2,
+                       ingress_protocol = $5, ingress_listen_port = $6, ingress_listen_udp_port = $7,
+                       ingress_config_json = $8, ingress_tls_json = $9, ingress_template_version = $10
+                       WHERE session_id = $3 AND client_pubkey_b64 = $4 AND revoked = FALSE"#,
+                        )
+                        .bind(policy_json)
+                        .bind(expires_at)
+                        .bind(session_id)
+                        .bind(client_pubkey_b64)
+                        .bind(ingress_protocol)
+                        .bind(ingress_listen_port)
+                        .bind(ingress_listen_udp_port)
+                        .bind(ingress_config_json)
+                        .bind(ingress_tls_json)
+                        .bind(ver)
+                        .execute(pool)
+                        .await?;
+                        r.rows_affected()
+                    }
+                    (false, false) => {
+                        let r = sqlx::query(
+                            r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2
+                       WHERE session_id = $3 AND client_pubkey_b64 = $4 AND revoked = FALSE"#,
+                        )
+                        .bind(policy_json)
+                        .bind(expires_at)
+                        .bind(session_id)
+                        .bind(client_pubkey_b64)
+                        .execute(pool)
+                        .await?;
+                        r.rows_affected()
+                    }
+                }
             }
             Self::Sqlite(pool) => {
                 let exp = expires_at.to_rfc3339();
-                let r = sqlx::query(
-                    r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2
+                match (update_wire, update_ingress) {
+                    (true, true) => {
+                        let r = sqlx::query(
+                            r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2,
+                       wire_mode = $5, wire_config_json = $6,
+                       ingress_protocol = $7, ingress_listen_port = $8, ingress_listen_udp_port = $9,
+                       ingress_config_json = $10, ingress_tls_json = $11, ingress_template_version = $12
                        WHERE session_id = $3 AND client_pubkey_b64 = $4 AND revoked = 0"#,
-                )
-                .bind(policy_json)
-                .bind(exp)
-                .bind(session_id)
-                .bind(client_pubkey_b64)
-                .execute(pool)
-                .await?;
-                r.rows_affected()
+                        )
+                        .bind(policy_json)
+                        .bind(&exp)
+                        .bind(session_id)
+                        .bind(client_pubkey_b64)
+                        .bind(wire_mode)
+                        .bind(wire_config_json)
+                        .bind(ingress_protocol.map(|x| x as i64))
+                        .bind(ingress_listen_port.map(|x| x as i64))
+                        .bind(ingress_listen_udp_port.map(|x| x as i64))
+                        .bind(ingress_config_json)
+                        .bind(ingress_tls_json)
+                        .bind(ver as i64)
+                        .execute(pool)
+                        .await?;
+                        r.rows_affected()
+                    }
+                    (true, false) => {
+                        let r = sqlx::query(
+                            r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2,
+                       wire_mode = $5, wire_config_json = $6
+                       WHERE session_id = $3 AND client_pubkey_b64 = $4 AND revoked = 0"#,
+                        )
+                        .bind(policy_json)
+                        .bind(&exp)
+                        .bind(session_id)
+                        .bind(client_pubkey_b64)
+                        .bind(wire_mode)
+                        .bind(wire_config_json)
+                        .execute(pool)
+                        .await?;
+                        r.rows_affected()
+                    }
+                    (false, true) => {
+                        let r = sqlx::query(
+                            r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2,
+                       ingress_protocol = $5, ingress_listen_port = $6, ingress_listen_udp_port = $7,
+                       ingress_config_json = $8, ingress_tls_json = $9, ingress_template_version = $10
+                       WHERE session_id = $3 AND client_pubkey_b64 = $4 AND revoked = 0"#,
+                        )
+                        .bind(policy_json)
+                        .bind(&exp)
+                        .bind(session_id)
+                        .bind(client_pubkey_b64)
+                        .bind(ingress_protocol.map(|x| x as i64))
+                        .bind(ingress_listen_port.map(|x| x as i64))
+                        .bind(ingress_listen_udp_port.map(|x| x as i64))
+                        .bind(ingress_config_json)
+                        .bind(ingress_tls_json)
+                        .bind(ver as i64)
+                        .execute(pool)
+                        .await?;
+                        r.rows_affected()
+                    }
+                    (false, false) => {
+                        let r = sqlx::query(
+                            r#"UPDATE grpc_proxy_session SET policy_json = $1, expires_at = $2
+                       WHERE session_id = $3 AND client_pubkey_b64 = $4 AND revoked = 0"#,
+                        )
+                        .bind(policy_json)
+                        .bind(&exp)
+                        .bind(session_id)
+                        .bind(client_pubkey_b64)
+                        .execute(pool)
+                        .await?;
+                        r.rows_affected()
+                    }
+                }
             }
         };
         Ok(n)
@@ -1386,6 +1677,8 @@ pub struct GrpcProxySessionRow {
     pub client_pubkey_b64: String,
     pub board_label: String,
     pub token_sha256_hex: String,
+    /// Random secret for public subscription URL (not the session auth token).
+    pub subscription_token: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub policy_json: String,
@@ -1395,6 +1688,17 @@ pub struct GrpcProxySessionRow {
     pub last_activity_at: Option<DateTime<Utc>>,
     pub first_open_at: Option<DateTime<Utc>>,
     pub revoked: bool,
+    /// 1 = VLESS, 2 = Trojan, 3 = VMess (deploy_proto ProxyWireMode).
+    /// PostgreSQL `SMALLINT`; map to i32 at API boundaries.
+    pub wire_mode: Option<i16>,
+    pub wire_config_json: Option<String>,
+    /// 1=VLESS, 2=VMess, 3=Trojan, 4=Shadowsocks, 5=SOCKS, 6=Hysteria2; None = public ingress disabled.
+    pub ingress_protocol: Option<i16>,
+    pub ingress_listen_port: Option<i32>,
+    pub ingress_listen_udp_port: Option<i32>,
+    pub ingress_config_json: Option<String>,
+    pub ingress_tls_json: Option<String>,
+    pub ingress_template_version: i32,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1403,6 +1707,7 @@ struct GrpcProxySessionRowSqlite {
     client_pubkey_b64: String,
     board_label: String,
     token_sha256_hex: String,
+    subscription_token: Option<String>,
     created_at: String,
     expires_at: String,
     policy_json: String,
@@ -1412,6 +1717,14 @@ struct GrpcProxySessionRowSqlite {
     last_activity_at: Option<String>,
     first_open_at: Option<String>,
     revoked: i64,
+    wire_mode: Option<i64>,
+    wire_config_json: Option<String>,
+    ingress_protocol: Option<i64>,
+    ingress_listen_port: Option<i64>,
+    ingress_listen_udp_port: Option<i64>,
+    ingress_config_json: Option<String>,
+    ingress_tls_json: Option<String>,
+    ingress_template_version: i64,
 }
 
 impl From<GrpcProxySessionRowSqlite> for GrpcProxySessionRow {
@@ -1427,6 +1740,7 @@ impl From<GrpcProxySessionRowSqlite> for GrpcProxySessionRow {
             client_pubkey_b64: r.client_pubkey_b64,
             board_label: r.board_label,
             token_sha256_hex: r.token_sha256_hex,
+            subscription_token: r.subscription_token,
             created_at: parse_dt(&r.created_at),
             expires_at: parse_dt(&r.expires_at),
             policy_json: r.policy_json,
@@ -1436,6 +1750,14 @@ impl From<GrpcProxySessionRowSqlite> for GrpcProxySessionRow {
             last_activity_at: opt(r.last_activity_at),
             first_open_at: opt(r.first_open_at),
             revoked: r.revoked != 0,
+            wire_mode: r.wire_mode.map(|x| x as i16),
+            wire_config_json: r.wire_config_json,
+            ingress_protocol: r.ingress_protocol.map(|x| x as i16),
+            ingress_listen_port: r.ingress_listen_port.map(|x| x as i32),
+            ingress_listen_udp_port: r.ingress_listen_udp_port.map(|x| x as i32),
+            ingress_config_json: r.ingress_config_json,
+            ingress_tls_json: r.ingress_tls_json,
+            ingress_template_version: r.ingress_template_version.max(1) as i32,
         }
     }
 }
