@@ -332,7 +332,8 @@ fn save_board_rules_form(form: pirate_desktop::BoardRulesForm) -> Result<(), Str
 #[tauri::command]
 fn pick_server_stack_tar_gz() -> Result<Option<String>, String> {
     Ok(rfd::FileDialog::new()
-        .add_filter("Tarball", &["tar.gz", "tgz"])
+        // Native dialogs usually filter by final extension, so include "gz" too.
+        .add_filter("Tarball", &["tar", "tgz", "gz"])
         .pick_file()
         .map(|p| p.to_string_lossy().to_string()))
 }
@@ -340,6 +341,63 @@ fn pick_server_stack_tar_gz() -> Result<Option<String>, String> {
 #[tauri::command]
 fn fetch_server_stack_info_cmd() -> Result<String, String> {
     pirate_desktop::fetch_server_stack_info_json()
+}
+
+#[tauri::command]
+fn paas_init_project(path: String, name: Option<String>) -> Result<String, String> {
+    pirate_desktop::run_init_project(PathBuf::from(path), name)
+}
+
+#[tauri::command]
+fn paas_scan_project(path: String, dry_run: bool) -> Result<String, String> {
+    let r = pirate_desktop::run_scan_project(PathBuf::from(path), dry_run)?;
+    serde_json::to_string(&r).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn paas_project_build(path: String) -> Result<String, String> {
+    let r = pirate_desktop::run_project_build(PathBuf::from(path))?;
+    serde_json::to_string(&r).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn paas_project_test(path: String) -> Result<String, String> {
+    let r = pirate_desktop::run_project_test(PathBuf::from(path))?;
+    serde_json::to_string(&r).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn paas_test_local(path: String, image: Option<String>) -> Result<String, String> {
+    let r = pirate_desktop::run_test_local(
+        PathBuf::from(path),
+        image.unwrap_or_else(|| "pirate-local-test".to_string()),
+    )?;
+    serde_json::to_string(&r).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn paas_apply_gen(path: String) -> Result<(), String> {
+    pirate_desktop::run_apply_gen(PathBuf::from(path))
+}
+
+#[tauri::command]
+fn paas_pipeline(
+    path: String,
+    do_init: bool,
+    name: Option<String>,
+    skip_test_local: bool,
+    version: Option<String>,
+    chunk_size: Option<u32>,
+) -> Result<String, String> {
+    let r = pirate_desktop::run_pipeline(
+        PathBuf::from(path),
+        do_init,
+        name,
+        skip_test_local,
+        version,
+        chunk_size.unwrap_or(64 * 1024) as usize,
+    )?;
+    serde_json::to_string(&r).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -420,6 +478,13 @@ fn main() {
             pick_server_stack_tar_gz,
             fetch_server_stack_info_cmd,
             apply_server_stack_update,
+            paas_init_project,
+            paas_scan_project,
+            paas_project_build,
+            paas_project_test,
+            paas_test_local,
+            paas_apply_gen,
+            paas_pipeline,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

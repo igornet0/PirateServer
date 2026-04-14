@@ -321,7 +321,8 @@ pub fn signing_payload(method: &str, project_id: &str, secondary: &str) -> Strin
         // Same signing payload shape as GetStatus / StopProcess (project only when not default).
         "ProxyTunnel" | "GetStatus" | "StopProcess" | "RestartProcess" | "GetHostStats"
         | "GetHostStatsDetail" | "GetServerStackInfo" | "ListSessions" | "QuerySessionLogs"
-        | "UpdateConnectionProfile" | "ReportResourceUsage" | "ConnectionProbe"
+        | "UpdateConnectionProfile" | "ReportResourceUsage" | "ReportDisplayTopology"
+        | "ConnectionProbe"
         | "CreateConnection" | "CloseConnection" | "GetStats" | "UpdateSettings" => {
             if is_default {
                 String::new()

@@ -81,6 +81,16 @@ type ServerStackOutcome = {
   controlApiPkgVersion?: string | null;
 };
 
+type ParsedStackInfo = {
+  bundleVersion?: string;
+  deployServerBinaryVersion?: string;
+  hostDashboardEnabled?: boolean;
+  hostGuiDetectedAtInstall?: string | null;
+  hostGuiInstallJson?: string | null;
+  hostNginxPirateSite?: boolean;
+  manifestJson?: string;
+};
+
 /** @deprecated Use HostStatsSnapshot from `./host-stats-types` */
 export type HostMetrics = HostStatsSnapshot;
 
@@ -96,6 +106,12 @@ function formatBytes(n: number): string {
 /** Match Rust `normalize_url` / `normalize_endpoint` for bookmark vs active endpoint. */
 function normalizeGrpcUrl(s: string): string {
   return s.trim().replace(/\/+$/, "");
+}
+
+function formatMaybe(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return String(value);
 }
 
 // -----------------------------------------------------------------------------
@@ -155,12 +171,18 @@ export function Dashboard() {
   const [deployMsg, setDeployMsg] = useState<string | null>(null);
   const [deployCancelRequested, setDeployCancelRequested] = useState(false);
 
+  const [paasMsg, setPaasMsg] = useState<string | null>(null);
+  const [paasBusy, setPaasBusy] = useState(false);
+
   const [stackPath, setStackPath] = useState<string | null>(null);
   const [stackVersion, setStackVersion] = useState("stack-1.0.0");
   const [stackUploading, setStackUploading] = useState(false);
   const [stackProgress, setStackProgress] = useState(0);
   const [stackMsg, setStackMsg] = useState<string | null>(null);
   const [stackInfo, setStackInfo] = useState<string | null>(null);
+  const [stackModalOpen, setStackModalOpen] = useState(false);
+  const [stackTargetUrl, setStackTargetUrl] = useState<string | null>(null);
+  const [stackTargetLabel, setStackTargetLabel] = useState<string | null>(null);
 
   const [modalConnectOpen, setModalConnectOpen] = useState(false);
   const [modalAddServerOpen, setModalAddServerOpen] = useState(false);
@@ -449,22 +471,28 @@ export function Dashboard() {
     }
   };
 
+  const paasPath = deployDir;
+  const runPaas = async (label: string, fn: () => Promise<void>) => {
+    if (!paasPath) {
+      setPaasMsg("Choose a project folder first (same as Deploy).");
+      return;
+    }
+    setPaasBusy(true);
+    setPaasMsg(`${label}…`);
+    try {
+      await fn();
+    } catch (e) {
+      setPaasMsg(String(e));
+    } finally {
+      setPaasBusy(false);
+    }
+  };
+
   const onPickStackTar = async () => {
     try {
       const p = await invoke<string | null>("pick_server_stack_tar_gz");
       setStackPath(p ?? null);
       if (!p) setStackMsg("No bundle file selected.");
-      else setStackMsg(null);
-    } catch (e) {
-      setStackMsg(String(e));
-    }
-  };
-
-  const onPickStackFolder = async () => {
-    try {
-      const p = await invoke<string | null>("pick_deploy_directory");
-      setStackPath(p ?? null);
-      if (!p) setStackMsg("No folder selected.");
       else setStackMsg(null);
     } catch (e) {
       setStackMsg(String(e));
@@ -483,7 +511,7 @@ export function Dashboard() {
 
   const onApplyServerStack = async () => {
     if (!stackPath || !stackVersion.trim()) {
-      setStackMsg("Choose a .tar.gz or extracted pirate-linux-amd64 folder and enter a version.");
+      setStackMsg("Choose a .tar.gz bundle and enter a version.");
       return;
     }
     setStackUploading(true);
@@ -520,6 +548,20 @@ export function Dashboard() {
     }
   };
 
+  const onOpenStackUpdate = async (bookmark?: ServerBookmark) => {
+    if (bookmark) {
+      setStackTargetUrl(bookmark.url);
+      setStackTargetLabel(bookmark.label);
+      if (!endpoint || normalizeGrpcUrl(bookmark.url) !== normalizeGrpcUrl(endpoint)) {
+        await onUseBookmark(bookmark.url);
+      }
+    } else {
+      setStackTargetUrl(endpoint);
+      setStackTargetLabel(null);
+    }
+    setStackModalOpen(true);
+  };
+
   const liveState = grpcLive?.state?.toLowerCase() ?? "";
   const isRunning = liveState === "running";
 
@@ -529,6 +571,24 @@ export function Dashboard() {
     const hit = bookmarks.find((b) => normalizeGrpcUrl(b.url) === n);
     return hit ? hit.url : "";
   }, [endpoint, bookmarks]);
+
+  const parsedStackInfo = useMemo(() => {
+    if (!stackInfo) return null;
+    try {
+      return JSON.parse(stackInfo) as ParsedStackInfo;
+    } catch {
+      return null;
+    }
+  }, [stackInfo]);
+
+  const parsedManifest = useMemo(() => {
+    if (!parsedStackInfo?.manifestJson) return null;
+    try {
+      return JSON.parse(parsedStackInfo.manifestJson) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }, [parsedStackInfo]);
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-deep via-[#100408] to-deep pb-16 text-slate-100">
@@ -855,6 +915,15 @@ export function Dashboard() {
                           </button>
                           <button
                             type="button"
+                            disabled={connectionSwitching}
+                            onClick={() => void onOpenStackUpdate(b)}
+                            className={`${btnBase} border border-amber-700/45 bg-amber-950/30 px-3 py-2 text-amber-100 hover:bg-amber-900/40 disabled:pointer-events-none disabled:opacity-40`}
+                          >
+                            <FileArchive className="h-4 w-4" />
+                            Update
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => {
                               setRenameId(b.id);
                               setRenameLabel(b.label);
@@ -897,6 +966,144 @@ export function Dashboard() {
 
             {mainTab === "overview" ? (
             <>
+            {/* PaaS: init / build / test / docker / pipeline */}
+            <section
+              className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card"
+              aria-labelledby="paas-heading"
+            >
+              <h2 id="paas-heading" className="text-lg font-semibold text-slate-100">
+                Project pipeline
+              </h2>
+              <p className="mt-2 text-sm text-slate-400">
+                Uses <code className="rounded bg-black/40 px-1 text-amber-200/90">pirate.toml</code> in the
+                selected folder. Run{" "}
+                <strong className="text-slate-300">Init</strong> once, then{" "}
+                <strong className="text-slate-300">Build &amp; deploy</strong> for the full pipeline.
+              </p>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={paasBusy || !paasPath}
+                  onClick={() =>
+                    void runPaas("Init project", async () => {
+                      const s = await invoke<string>("paas_init_project", {
+                        path: paasPath,
+                        name: null,
+                      });
+                      setPaasMsg(`Created: ${s}`);
+                    })
+                  }
+                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
+                >
+                  Init project
+                </button>
+                <button
+                  type="button"
+                  disabled={paasBusy || !paasPath}
+                  onClick={() =>
+                    void runPaas("Scan", async () => {
+                      const s = await invoke<string>("paas_scan_project", {
+                        path: paasPath,
+                        dryRun: false,
+                      });
+                      setPaasMsg(s);
+                    })
+                  }
+                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
+                >
+                  Scan
+                </button>
+                <button
+                  type="button"
+                  disabled={paasBusy || !paasPath}
+                  onClick={() =>
+                    void runPaas("Build", async () => {
+                      const s = await invoke<string>("paas_project_build", { path: paasPath });
+                      setPaasMsg(s);
+                    })
+                  }
+                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
+                >
+                  Build
+                </button>
+                <button
+                  type="button"
+                  disabled={paasBusy || !paasPath}
+                  onClick={() =>
+                    void runPaas("Test", async () => {
+                      const s = await invoke<string>("paas_project_test", { path: paasPath });
+                      setPaasMsg(s);
+                    })
+                  }
+                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
+                >
+                  Test
+                </button>
+                <button
+                  type="button"
+                  disabled={paasBusy || !paasPath}
+                  onClick={() =>
+                    void runPaas("Test locally", async () => {
+                      const s = await invoke<string>("paas_test_local", {
+                        path: paasPath,
+                        image: null,
+                      });
+                      setPaasMsg(s);
+                    })
+                  }
+                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
+                >
+                  Test locally
+                </button>
+                <button
+                  type="button"
+                  disabled={paasBusy || !paasPath}
+                  onClick={() =>
+                    void runPaas("Apply gen", async () => {
+                      await invoke("paas_apply_gen", { path: paasPath });
+                      setPaasMsg("Generated run.sh / compose sidecars.");
+                    })
+                  }
+                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
+                >
+                  Apply gen
+                </button>
+                <button
+                  type="button"
+                  disabled={paasBusy || !deployDir || !deployVersion.trim()}
+                  onClick={() =>
+                    void runPaas("Pipeline", async () => {
+                      await invoke("set_active_project", { project_id: deployProject });
+                      const s = await invoke<string>("paas_pipeline", {
+                        path: paasPath,
+                        doInit: false,
+                        name: null,
+                        skipTestLocal: true,
+                        version: deployVersion.trim(),
+                        chunkSize: null,
+                      });
+                      setPaasMsg(s);
+                      try {
+                        const live = await invoke<GrpcConnectResult>("refresh_grpc_status");
+                        setGrpcLive(live);
+                      } catch {
+                        /* ignore */
+                      }
+                    })
+                  }
+                  className={`${btnBase} bg-gradient-to-r from-red-900 to-amber-950 text-white shadow-md shadow-black/40 hover:brightness-110`}
+                >
+                  {paasBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  Build &amp; deploy
+                </button>
+              </div>
+              {paasMsg ? (
+                <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-all text-xs text-slate-400">
+                  {paasMsg}
+                </pre>
+              ) : null}
+            </section>
+
             {/* 4. Deploy artifact */}
             <section
               className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card"
@@ -988,98 +1195,6 @@ export function Dashboard() {
               {/* Tauri: invoke('deploy_from_directory', { directory, version, chunkSize }) */}
             </section>
 
-            {/* 5. Server stack OTA */}
-            <section
-              className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card"
-              aria-labelledby="stack-heading"
-            >
-              <h2 id="stack-heading" className="text-lg font-semibold text-slate-100">
-                Server stack update
-              </h2>
-              <p className="mt-2 text-sm text-slate-400">
-                Upload the Linux bundle (e.g.{" "}
-                <code className="rounded bg-black/40 px-1 text-amber-200/90">pirate-linux-amd64*.tar.gz</code>{" "}
-                from <code className="rounded bg-black/40 px-1">build-linux-bundle.sh</code>). Requires{" "}
-                <code className="rounded bg-black/40 px-1">DEPLOY_ALLOW_SERVER_STACK_UPDATE=1</code> on the
-                host.
-              </p>
-              <p className="mt-1 text-xs text-slate-500">
-                Local UI release (repo <code className="rounded bg-black/30 px-1">VERSION</code>):{" "}
-                {import.meta.env.VITE_APP_RELEASE}
-              </p>
-              {stackPath ? (
-                <p className="mt-3 break-all text-sm text-emerald-300/90">
-                  <FolderOpen className="mr-1 inline h-4 w-4" />
-                  {stackPath}
-                </p>
-              ) : (
-                <p className="mt-3 text-sm text-slate-500">No bundle path selected.</p>
-              )}
-              <label className="mt-4 block text-xs font-medium text-slate-500">
-                Stack version label
-                <input
-                  value={stackVersion}
-                  onChange={(e) => setStackVersion(e.target.value)}
-                  className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35"
-                  placeholder="20260411"
-                />
-              </label>
-              <div className="mt-4 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  disabled={stackUploading}
-                  onClick={() => void onPickStackTar()}
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  <FileArchive className="h-4 w-4" />
-                  .tar.gz…
-                </button>
-                <button
-                  type="button"
-                  disabled={stackUploading}
-                  onClick={() => void onPickStackFolder()}
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  <FolderOpen className="h-4 w-4" />
-                  Folder…
-                </button>
-                <button
-                  type="button"
-                  disabled={stackUploading || !stackPath}
-                  onClick={() => void onApplyServerStack()}
-                  className={`${btnBase} bg-gradient-to-r from-amber-900 to-red-900 text-white shadow-md shadow-black/40 hover:brightness-110`}
-                >
-                  {stackUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  Apply stack
-                </button>
-                <button
-                  type="button"
-                  disabled={stackUploading}
-                  onClick={() => void onFetchStackInfo()}
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  <RefreshCw className="h-4 w-4" />
-                  Stack info
-                </button>
-              </div>
-              {stackUploading ? (
-                <div className="mt-4">
-                  <div className="mb-1 flex justify-between text-xs text-slate-500">
-                    <span>Upload</span>
-                    <span>{Math.round(stackProgress)}%</span>
-                  </div>
-                  <ProgressBar ratio={stackProgress / 100} />
-                </div>
-              ) : null}
-              {stackInfo ? (
-                <pre className="mt-3 max-h-32 overflow-auto rounded-lg bg-black/40 p-2 text-xs text-slate-400">
-                  {stackInfo}
-                </pre>
-              ) : null}
-              {stackMsg ? (
-                <p className="mt-3 text-sm text-slate-400">{stackMsg}</p>
-              ) : null}
-            </section>
             </>
             ) : null}
           </div>
@@ -1207,6 +1322,199 @@ export function Dashboard() {
                 className={`${btnBase} bg-gradient-to-r from-red-700 to-red-950 text-white shadow-md shadow-red-950/50`}
               >
                 Save
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Modal: server stack update */}
+      {stackModalOpen ? (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="stack-update-title"
+          onClick={(e) => e.target === e.currentTarget && setStackModalOpen(false)}
+        >
+          <div className="w-full max-w-2xl rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h3 id="stack-update-title" className="text-lg font-semibold text-slate-100">
+                  Server stack update
+                </h3>
+                <p className="mt-1 text-sm text-slate-400">
+                  {stackTargetLabel ? (
+                    <>
+                      Target: <span className="text-slate-200">{stackTargetLabel}</span>
+                    </>
+                  ) : (
+                    "Update the currently connected server."
+                  )}
+                </p>
+                {stackTargetUrl ? (
+                  <code className="mt-2 block break-all rounded bg-black/40 px-2 py-1 text-xs text-amber-200/90">
+                    {stackTargetUrl}
+                  </code>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onClick={() => setStackModalOpen(false)}
+                className={`${btnBase} border border-white/10 bg-white/5 p-2`}
+                title="Close"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <p className="mt-4 text-sm text-slate-400">
+              Upload the Linux bundle (e.g.{" "}
+              <code className="rounded bg-black/40 px-1 text-amber-200/90">pirate-linux-amd64*.tar.gz</code>{" "}
+              from <code className="rounded bg-black/40 px-1">build-linux-bundle.sh</code>). Requires{" "}
+              <code className="rounded bg-black/40 px-1">DEPLOY_ALLOW_SERVER_STACK_UPDATE=1</code> on the host.
+            </p>
+            <p className="mt-1 text-xs text-slate-500">
+              Local UI release (repo <code className="rounded bg-black/30 px-1">VERSION</code>):{" "}
+              {import.meta.env.VITE_APP_RELEASE}
+            </p>
+            {stackPath ? (
+              <p className="mt-3 break-all text-sm text-emerald-300/90">
+                <FolderOpen className="mr-1 inline h-4 w-4" />
+                {stackPath}
+              </p>
+            ) : (
+              <p className="mt-3 text-sm text-slate-500">No bundle path selected.</p>
+            )}
+            <label className="mt-4 block text-xs font-medium text-slate-500">
+              Stack version label
+              <input
+                value={stackVersion}
+                onChange={(e) => setStackVersion(e.target.value)}
+                className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35"
+                placeholder="20260411"
+              />
+            </label>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={stackUploading}
+                onClick={() => void onPickStackTar()}
+                className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
+              >
+                <FileArchive className="h-4 w-4" />
+                .tar.gz…
+              </button>
+              <button
+                type="button"
+                disabled={stackUploading || !stackPath}
+                onClick={() => void onApplyServerStack()}
+                className={`${btnBase} bg-gradient-to-r from-amber-900 to-red-900 text-white shadow-md shadow-black/40 hover:brightness-110`}
+              >
+                {stackUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                Apply stack
+              </button>
+              <button
+                type="button"
+                disabled={stackUploading}
+                onClick={() => void onFetchStackInfo()}
+                className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
+              >
+                <RefreshCw className="h-4 w-4" />
+                Stack info
+              </button>
+            </div>
+            {stackUploading ? (
+              <div className="mt-4">
+                <div className="mb-1 flex justify-between text-xs text-slate-500">
+                  <span>Upload</span>
+                  <span>{Math.round(stackProgress)}%</span>
+                </div>
+                <ProgressBar ratio={stackProgress / 100} />
+              </div>
+            ) : null}
+            {stackInfo ? (
+              parsedStackInfo ? (
+                <div className="mt-3 space-y-3 rounded-xl border border-white/10 bg-black/25 p-3">
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2">
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Bundle version</p>
+                      <p className="mt-1 break-all text-sm text-slate-200">
+                        {formatMaybe(parsedStackInfo.bundleVersion)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2">
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Deploy-server binary</p>
+                      <p className="mt-1 break-all text-sm text-slate-200">
+                        {formatMaybe(parsedStackInfo.deployServerBinaryVersion)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2">
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Host dashboard enabled</p>
+                      <p className="mt-1 text-sm text-slate-200">
+                        {formatMaybe(parsedStackInfo.hostDashboardEnabled)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2">
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Nginx pirate site</p>
+                      <p className="mt-1 text-sm text-slate-200">
+                        {formatMaybe(parsedStackInfo.hostNginxPirateSite)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2">
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">
+                        GUI detected at install
+                      </p>
+                      <p className="mt-1 break-all text-sm text-slate-200">
+                        {formatMaybe(parsedStackInfo.hostGuiDetectedAtInstall)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2">
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">GUI install json</p>
+                      <p className="mt-1 break-all text-sm text-slate-200">
+                        {formatMaybe(parsedStackInfo.hostGuiInstallJson)}
+                      </p>
+                    </div>
+                  </div>
+                  {parsedManifest ? (
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Manifest</p>
+                      <div className="mt-1 max-h-44 overflow-auto rounded-lg bg-black/40 p-2">
+                        {Object.entries(parsedManifest).map(([key, value]) => (
+                          <div
+                            key={key}
+                            className="grid grid-cols-[minmax(110px,160px)_1fr] gap-2 border-b border-white/5 py-1 last:border-b-0"
+                          >
+                            <span className="text-xs text-slate-400">{key}</span>
+                            <span className="break-all text-xs text-slate-200">{formatMaybe(value)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : parsedStackInfo.manifestJson ? (
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Manifest (raw)</p>
+                      <pre className="mt-1 max-h-32 overflow-auto rounded-lg bg-black/40 p-2 text-xs text-slate-400">
+                        {parsedStackInfo.manifestJson}
+                      </pre>
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <pre className="mt-3 max-h-32 overflow-auto rounded-lg bg-black/40 p-2 text-xs text-slate-400">
+                  {stackInfo}
+                </pre>
+              )
+            ) : null}
+            {stackMsg ? <p className="mt-3 text-sm text-slate-400">{stackMsg}</p> : null}
+
+            <div className="mt-4 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setStackModalOpen(false)}
+                className={`${btnBase} border border-white/10 bg-white/5`}
+              >
+                Close
               </button>
             </div>
           </div>
