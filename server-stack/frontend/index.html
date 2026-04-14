@@ -76,6 +76,18 @@
             type="button"
             class="tab"
             role="tab"
+            id="tab-inbounds"
+            aria-selected="false"
+            tabindex="-1"
+            aria-controls="panel-inbounds"
+            data-i18n="tab.inbounds"
+          >
+            Inbounds
+          </button>
+          <button
+            type="button"
+            class="tab"
+            role="tab"
             id="tab-projects"
             aria-selected="false"
             tabindex="-1"
@@ -228,6 +240,84 @@
                 </details>
                 <p id="grpc-sessions-error" class="muted danger-text" hidden></p>
               </section>
+
+              <section id="display-stream-section" class="panel-block local-client-bundle">
+                <h3 class="subheading" data-i18n="status.displayStream.heading">Display stream (producer)</h3>
+                <p class="muted" data-i18n="status.displayStream.hint">
+                  Build a config for the CLI producer: paste the data URL on the remote host
+                  (<code class="mono-inline">client display-stream run --config …</code>). Use an ingest URL from the
+                  local Pirate desktop client (receive) or any HTTP POST target.
+                </p>
+                <div class="row actions display-stream-form" style="flex-wrap: wrap; gap: 0.75rem; align-items: flex-end">
+                  <label class="stacked-label">
+                    <span data-i18n="status.displayStream.ingestUrl">Ingest URL</span>
+                    <input
+                      id="display-stream-ingest-url"
+                      type="url"
+                      class="mono-input"
+                      placeholder="http://192.168.0.10:12345/ingest"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <label class="stacked-label">
+                    <span data-i18n="status.displayStream.token">Bearer token (optional)</span>
+                    <input id="display-stream-token" type="password" class="mono-input" autocomplete="off" />
+                  </label>
+                  <label class="stacked-label">
+                    <span data-i18n="status.displayStream.quality">Quality (1–100)</span>
+                    <input id="display-stream-quality" type="number" min="1" max="100" value="70" class="mono-input" />
+                  </label>
+                  <label class="stacked-label">
+                    <span data-i18n="status.displayStream.fps">FPS (1–60)</span>
+                    <input id="display-stream-fps" type="number" min="1" max="60" value="10" class="mono-input" />
+                  </label>
+                  <label class="stacked-label">
+                    <span data-i18n="status.displayStream.encrypt">Transport</span>
+                    <select id="display-stream-encrypt" class="mono-input">
+                      <option value="none" data-i18n="status.displayStream.encryptNone">HTTP (no TLS)</option>
+                      <option value="tls" data-i18n="status.displayStream.encryptTls">HTTPS (TLS)</option>
+                    </select>
+                  </label>
+                  <label class="stacked-label">
+                    <span data-i18n="status.displayStream.peer">gRPC peer (displays)</span>
+                    <select id="display-stream-peer" class="mono-input">
+                      <option value="" data-i18n="status.displayStream.peerManual">— manual index —</option>
+                    </select>
+                  </label>
+                  <label class="stacked-label">
+                    <span data-i18n="status.displayStream.displayIndex">Display index</span>
+                    <select id="display-stream-display-index" class="mono-input"></select>
+                  </label>
+                </div>
+                <p class="muted" data-i18n="status.displayStream.protocolNote">Protocol: HTTP POST <code>image/jpeg</code> (fixed).</p>
+                <pre id="display-stream-data-url" class="mono-block" style="white-space: pre-wrap; word-break: break-all"></pre>
+                <div class="row actions">
+                  <button type="button" id="btn-copy-display-stream" class="ghost">
+                    <span data-i18n="status.displayStream.copy">Copy data URL</span>
+                  </button>
+                  <button type="button" id="btn-display-stream-preview" class="ghost">
+                    <span data-i18n="status.displayStream.previewOpen">Preview stream</span>
+                  </button>
+                </div>
+                <dialog id="display-stream-preview-dialog" class="display-stream-preview-dialog" aria-labelledby="display-stream-preview-title">
+                  <div class="display-stream-preview-inner">
+                    <h3 id="display-stream-preview-title" class="display-stream-preview-title" data-i18n="status.displayStream.previewTitle">
+                      Ingest preview
+                    </h3>
+                    <p class="muted display-stream-preview-hint" data-i18n="status.displayStream.previewHint"></p>
+                    <div class="display-stream-preview-frame">
+                      <img id="display-stream-preview-img" alt="" decoding="async" />
+                    </div>
+                    <p id="display-stream-preview-err" class="muted danger-text" hidden></p>
+                    <div class="row actions display-stream-preview-actions">
+                      <button type="button" id="btn-display-stream-preview-close" class="ghost" data-i18n="status.displayStream.previewClose">
+                        Close
+                      </button>
+                    </div>
+                  </div>
+                </dialog>
+              </section>
+
               <div id="local-client-bundle" class="local-client-bundle" hidden>
                 <h3 class="subheading" data-i18n="status.localClient.heading">
                   Local client connection
@@ -239,6 +329,52 @@
                 <button type="button" id="btn-copy-local-client">
                   <span data-i18n="status.localClient.copy">Copy JSON</span>
                 </button>
+              </div>
+            </section>
+          </div>
+
+          <div
+            class="tab-panel"
+            id="panel-inbounds"
+            role="tabpanel"
+            aria-labelledby="tab-inbounds"
+            hidden
+          >
+            <section id="inbounds-section" class="panel-block">
+              <h2 data-i18n="inbounds.heading">Inbounds</h2>
+              <p class="muted" data-i18n="inbounds.hint">
+                Managed proxy sessions (gRPC tunnel + optional public sing-box ingress). Use -1 for unlimited traffic fields and no calendar expiry when “Never expires” is checked.
+              </p>
+              <div class="row actions">
+                <button type="button" id="inbounds-refresh" class="ghost" data-i18n="inbounds.refresh">
+                  Refresh
+                </button>
+                <button type="button" id="inbounds-add-open" class="primary" data-i18n="inbounds.addConnection">
+                  Add connection
+                </button>
+              </div>
+              <p id="inbounds-error" class="muted danger-text" hidden></p>
+              <div class="grpc-sessions-scroll">
+                <table class="proj-table" aria-label="Inbounds">
+                  <thead>
+                    <tr>
+                      <th data-i18n="inbounds.colLabel">Label</th>
+                      <th data-i18n="inbounds.colProtocol">Tunnel</th>
+                      <th data-i18n="inbounds.colIngress">Ingress</th>
+                      <th
+                        data-i18n="inbounds.colClients"
+                        data-i18n-title="inbounds.colClientsHint"
+                      >
+                        Clients
+                      </th>
+                      <th data-i18n="inbounds.colExpires">Expires</th>
+                      <th data-i18n="inbounds.colTraffic">Traffic</th>
+                      <th data-i18n="inbounds.colRevoked">Revoked</th>
+                      <th data-i18n="inbounds.colMenu">Menu</th>
+                    </tr>
+                  </thead>
+                  <tbody id="inbounds-tbody"></tbody>
+                </table>
               </div>
             </section>
           </div>
@@ -757,6 +893,532 @@
               </button>
             </div>
           </form>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog
+      id="dialog-inbounds-create"
+      class="server-info-dialog smb-datasource-dialog inbounds-create-dialog"
+      aria-labelledby="dialog-inbounds-create-title"
+    >
+      <div class="server-info-dialog-inner smb-datasource-inner inbounds-create-inner">
+        <h2 id="dialog-inbounds-create-title" data-i18n="inbounds.dialogTitle">New connection</h2>
+        <p class="muted smb-datasource-hint inbounds-dialog-hint">
+          <span data-i18n="inbounds.dialogHint">
+            Configure protocol credentials and limits. Use -1 for unlimited traffic; optional calendar expiry.
+          </span>
+          <span
+            class="inbounds-field-help"
+            data-i18n-title="inbounds.fieldHelp.dialogIntro"
+            data-i18n-aria="inbounds.fieldHelpIconAria"
+            role="img"
+            tabindex="0"
+            ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+          >
+        </p>
+        <p id="inbounds-dialog-error" class="smb-form-error" hidden></p>
+        <div class="inbounds-form">
+          <div class="inbounds-auto-config-block">
+            <div class="inbounds-auto-config-head">
+              <span class="inbounds-auto-config-title" data-i18n="inbounds.autoConfigTitle"
+                >Connection autoconfiguration</span
+              >
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.autoConfig"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </div>
+            <div class="inbounds-quick-row inbounds-auto-config-buttons">
+              <button
+                type="button"
+                class="ghost inbounds-chips-btn inbounds-connection-preset"
+                data-preset="simple"
+                data-i18n="inbounds.presetSimple"
+                data-i18n-title="inbounds.presetSimpleHint"
+              >
+                Simple
+              </button>
+              <button
+                type="button"
+                class="ghost inbounds-chips-btn inbounds-connection-preset"
+                data-preset="complex"
+                data-i18n="inbounds.presetComplex"
+                data-i18n-title="inbounds.presetComplexHint"
+              >
+                Complex
+              </button>
+              <button
+                type="button"
+                class="ghost inbounds-chips-btn inbounds-connection-preset"
+                data-preset="extrem"
+                data-i18n="inbounds.presetExtrem"
+                data-i18n-title="inbounds.presetExtremHint"
+              >
+                EXTREM
+              </button>
+            </div>
+          </div>
+          <div class="row">
+            <label class="inbounds-label-with-help" for="inbounds-label">
+              <span class="inbounds-label-text" data-i18n="inbounds.boardLabel">Label</span>
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.boardLabel"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <input id="inbounds-label" type="text" autocomplete="off" />
+          </div>
+          <div class="row">
+            <label class="inbounds-label-with-help" for="inbounds-wire-mode">
+              <span class="inbounds-label-text" data-i18n="inbounds.wireMode">Protocol</span>
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.wireMode"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <select id="inbounds-wire-mode">
+              <option value="1">VLESS</option>
+              <option value="2">Trojan</option>
+              <option value="3">VMess</option>
+              <option value="4">Shadowsocks</option>
+              <option value="5">SOCKS5</option>
+            </select>
+          </div>
+          <div class="row" id="inbounds-row-method" hidden>
+            <label class="inbounds-label-with-help" for="inbounds-method">
+              <span class="inbounds-label-text" data-i18n="inbounds.cipherMethod">Cipher (Shadowsocks)</span>
+            </label>
+            <input id="inbounds-method" type="text" autocomplete="off" class="mono-input" placeholder="aes-256-gcm" />
+          </div>
+          <div class="row" id="inbounds-row-username" hidden>
+            <label class="inbounds-label-with-help" for="inbounds-username">
+              <span class="inbounds-label-text" data-i18n="inbounds.socksUser">SOCKS5 user (optional)</span>
+            </label>
+            <input id="inbounds-username" type="text" autocomplete="off" />
+          </div>
+          <div class="row" id="inbounds-row-uuid">
+            <label class="inbounds-label-with-help" for="inbounds-uuid">
+              <span class="inbounds-label-text" data-i18n="inbounds.uuid">UUID</span>
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.uuid"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <input id="inbounds-uuid" type="text" autocomplete="off" class="mono-input" />
+          </div>
+          <div class="row" id="inbounds-row-password" hidden>
+            <label class="inbounds-label-with-help" for="inbounds-password">
+              <span class="inbounds-label-text" data-i18n="inbounds.password">Password</span>
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.password"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <input id="inbounds-password" type="password" autocomplete="off" />
+          </div>
+          <div class="row" id="inbounds-row-flow">
+            <label class="inbounds-label-with-help" for="inbounds-flow">
+              <span class="inbounds-label-text" data-i18n="inbounds.flow">Flow</span>
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.flow"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <select id="inbounds-flow">
+              <option value="" data-i18n="inbounds.flowOptionNone">None (plain TLS)</option>
+              <option value="xtls-rprx-vision">xtls-rprx-vision</option>
+              <option value="xtls-rprx-vision-udp443">xtls-rprx-vision-udp443</option>
+            </select>
+          </div>
+          <div class="row inbounds-ingress-block">
+            <label class="inbounds-label-with-help" for="inbounds-ingress-enable">
+              <span class="inbounds-label-text" data-i18n="inbounds.ingressEnable">Public ingress (sing-box)</span>
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.ingressEnable"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <input type="checkbox" id="inbounds-ingress-enable" />
+          </div>
+          <div id="inbounds-ingress-fields" class="inbounds-ingress-fields" hidden>
+            <div class="row">
+              <label class="inbounds-label-with-help" for="inbounds-ingress-protocol">
+                <span class="inbounds-label-text" data-i18n="inbounds.ingressProtocol">Ingress protocol</span>
+              </label>
+              <select id="inbounds-ingress-protocol">
+                <option value="1">VLESS</option>
+                <option value="2">VMess</option>
+                <option value="3">Trojan</option>
+                <option value="4">Shadowsocks</option>
+                <option value="5">SOCKS</option>
+                <option value="6">Hysteria2</option>
+              </select>
+            </div>
+            <div class="row">
+              <label class="inbounds-label-with-help" for="inbounds-ingress-port">
+                <span class="inbounds-label-text" data-i18n="inbounds.ingressPort">Listen port</span>
+              </label>
+              <input id="inbounds-ingress-port" type="number" min="1" max="65535" />
+            </div>
+            <div class="row">
+              <label class="inbounds-label-with-help" for="inbounds-ingress-udp">
+                <span class="inbounds-label-text" data-i18n="inbounds.ingressUdp">UDP port (optional)</span>
+              </label>
+              <input id="inbounds-ingress-udp" type="number" min="0" max="65535" placeholder="0" />
+            </div>
+            <div class="row">
+              <label class="inbounds-label-with-help" for="inbounds-ingress-config">
+                <span class="inbounds-label-text" data-i18n="inbounds.ingressConfig">Ingress JSON</span>
+              </label>
+              <textarea id="inbounds-ingress-config" class="mono-input" rows="4" placeholder='{"uuid":"..."}'></textarea>
+            </div>
+            <div class="row">
+              <label class="inbounds-label-with-help" for="inbounds-ingress-tls">
+                <span class="inbounds-label-text" data-i18n="inbounds.ingressTls">TLS JSON (optional)</span>
+              </label>
+              <textarea id="inbounds-ingress-tls" class="mono-input" rows="2" placeholder='{"server_name":"..."}'></textarea>
+            </div>
+          </div>
+          <div class="row">
+            <label
+              class="inbounds-label-with-help"
+              id="inbounds-max-dur-label"
+              for="inbounds-max-dur"
+            >
+              <span class="inbounds-label-text" data-i18n="inbounds.maxSessionDurationSec"
+                >Max session duration (sec, -1 = none)</span
+              >
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.maxSessionDurationSec"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <div class="inbounds-field-stack" id="inbounds-max-dur-stack" data-mode="duration">
+              <div class="inbounds-quick-row">
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-dur-preset"
+                  data-sec="3600"
+                  data-i18n="inbounds.presetHour"
+                >
+                  1 h
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-dur-preset"
+                  data-sec="86400"
+                  data-i18n="inbounds.presetDay"
+                >
+                  1 d
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-dur-preset"
+                  data-sec="604800"
+                  data-i18n="inbounds.presetWeek"
+                >
+                  1 w
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-dur-preset"
+                  data-sec="2592000"
+                  data-i18n="inbounds.presetMonth"
+                >
+                  30 d
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn"
+                  id="inbounds-max-dur-mode-toggle"
+                  data-i18n="inbounds.durationModeToggleToCalendar"
+                >
+                  By date
+                </button>
+              </div>
+              <div id="inbounds-max-dur-duration-wrap">
+                <input id="inbounds-max-dur" type="number" value="-1" />
+              </div>
+              <div id="inbounds-max-dur-calendar-wrap" hidden>
+                <input id="inbounds-max-dur-calendar" type="datetime-local" />
+              </div>
+            </div>
+          </div>
+          <div class="row" id="inbounds-limit-by-active-row" hidden>
+            <label class="inbounds-checkbox-label" for="inbounds-limit-by-active-time">
+              <input type="checkbox" id="inbounds-limit-by-active-time" />
+              <span data-i18n="inbounds.limitByActiveTime">Limit by accumulated active time</span>
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.limitByActiveTime"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+          </div>
+          <div class="row">
+            <label class="inbounds-label-with-help" for="inbounds-traffic-total">
+              <span class="inbounds-label-text" data-i18n="inbounds.trafficTotal"
+                >Total traffic limit (bytes, -1)</span
+              >
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.trafficTotal"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <div class="inbounds-field-stack">
+              <div class="inbounds-quick-row">
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-total"
+                  data-bytes="1073741824"
+                  data-i18n="inbounds.trafficPreset1g"
+                >
+                  1 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-total"
+                  data-bytes="10737418240"
+                  data-i18n="inbounds.trafficPreset10g"
+                >
+                  10 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-total"
+                  data-bytes="107374182400"
+                  data-i18n="inbounds.trafficPreset100g"
+                >
+                  100 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset inbounds-traffic-unlimited"
+                  data-input-id="inbounds-traffic-total"
+                  data-bytes="-1"
+                  data-i18n-aria="inbounds.trafficUnlimitedAria"
+                >
+                  <span class="inbounds-infinity-icon" aria-hidden="true">∞</span>
+                </button>
+              </div>
+              <input id="inbounds-traffic-total" type="number" value="-1" />
+            </div>
+          </div>
+          <div class="row">
+            <label class="inbounds-label-with-help" for="inbounds-traffic-in">
+              <span class="inbounds-label-text" data-i18n="inbounds.trafficIn"
+                >Inbound limit (bytes, -1)</span
+              >
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.trafficIn"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <div class="inbounds-field-stack">
+              <div class="inbounds-quick-row">
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-in"
+                  data-bytes="1073741824"
+                  data-i18n="inbounds.trafficPreset1g"
+                >
+                  1 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-in"
+                  data-bytes="10737418240"
+                  data-i18n="inbounds.trafficPreset10g"
+                >
+                  10 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-in"
+                  data-bytes="107374182400"
+                  data-i18n="inbounds.trafficPreset100g"
+                >
+                  100 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset inbounds-traffic-unlimited"
+                  data-input-id="inbounds-traffic-in"
+                  data-bytes="-1"
+                  data-i18n-aria="inbounds.trafficUnlimitedAria"
+                >
+                  <span class="inbounds-infinity-icon" aria-hidden="true">∞</span>
+                </button>
+              </div>
+              <input id="inbounds-traffic-in" type="number" value="-1" />
+            </div>
+          </div>
+          <div class="row">
+            <label class="inbounds-label-with-help" for="inbounds-traffic-out">
+              <span class="inbounds-label-text" data-i18n="inbounds.trafficOut"
+                >Outbound limit (bytes, -1)</span
+              >
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.trafficOut"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <div class="inbounds-field-stack">
+              <div class="inbounds-quick-row">
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-out"
+                  data-bytes="1073741824"
+                  data-i18n="inbounds.trafficPreset1g"
+                >
+                  1 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-out"
+                  data-bytes="10737418240"
+                  data-i18n="inbounds.trafficPreset10g"
+                >
+                  10 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset"
+                  data-input-id="inbounds-traffic-out"
+                  data-bytes="107374182400"
+                  data-i18n="inbounds.trafficPreset100g"
+                >
+                  100 GB
+                </button>
+                <button
+                  type="button"
+                  class="ghost inbounds-chips-btn inbounds-traffic-preset inbounds-traffic-unlimited"
+                  data-input-id="inbounds-traffic-out"
+                  data-bytes="-1"
+                  data-i18n-aria="inbounds.trafficUnlimitedAria"
+                >
+                  <span class="inbounds-infinity-icon" aria-hidden="true">∞</span>
+                </button>
+              </div>
+              <input id="inbounds-traffic-out" type="number" value="-1" />
+            </div>
+          </div>
+          <div class="row">
+            <label class="inbounds-label-with-help" for="inbounds-max-devices">
+              <span class="inbounds-label-text" data-i18n="inbounds.maxConcurrentDevices"
+                >Max concurrent devices</span
+              >
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.maxConcurrentDevices"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <input
+              id="inbounds-max-devices"
+              type="text"
+              autocomplete="off"
+              class="mono-input"
+              placeholder=""
+            />
+          </div>
+          <div class="row">
+            <label class="inbounds-label-with-help" for="inbounds-recipient">
+              <span class="inbounds-label-text" data-i18n="inbounds.recipientPubkey"
+                >Recipient client key (optional)</span
+              >
+              <span
+                class="inbounds-field-help"
+                data-i18n-title="inbounds.fieldHelp.recipientPubkey"
+                data-i18n-aria="inbounds.fieldHelpIconAria"
+                role="img"
+                tabindex="0"
+                ><span class="inbounds-field-help-mark" aria-hidden="true">!</span></span
+              >
+            </label>
+            <input id="inbounds-recipient" type="text" autocomplete="off" class="mono-input" />
+          </div>
+        </div>
+        <pre id="inbounds-create-result" class="mono-block inbounds-create-result" hidden></pre>
+        <div class="row actions smb-datasource-actions">
+          <button type="button" id="inbounds-dialog-cancel" class="ghost" data-i18n="inbounds.cancel">
+            Cancel
+          </button>
+          <button type="button" id="inbounds-submit" class="primary" data-i18n="inbounds.create">Create</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="dialog-inbounds-qr" class="server-info-dialog" aria-labelledby="dialog-inbounds-qr-title">
+      <div class="server-info-dialog-inner smb-datasource-inner">
+        <h2 id="dialog-inbounds-qr-title" data-i18n="inbounds.qrTitle">QR code</h2>
+        <p id="inbounds-qr-hint" class="muted inbounds-qr-hint" hidden></p>
+        <div class="inbounds-qr-img-wrap">
+          <img id="inbounds-qr-img" alt="" width="280" height="280" />
+        </div>
+        <div class="row actions smb-datasource-actions">
+          <button type="button" id="inbounds-qr-close" class="ghost" data-i18n="inbounds.qrClose">
+            Close
+          </button>
         </div>
       </div>
     </dialog>

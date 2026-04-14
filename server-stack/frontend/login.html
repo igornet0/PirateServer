@@ -40,6 +40,86 @@
             <h1 data-i18n="dash.title">Deploy dashboard</h1>
           </div>
         </div>
+
+        <div id="desktop-setup" class="desktop-setup" hidden>
+          <h2 class="desktop-setup-title" data-i18n="login.desktopSetupTitle">Connect to your server</h2>
+          <p class="muted" data-i18n="login.desktopSetupBlurb">
+            Use the same values as on the host after install.sh --nginx --ui (domain, dashboard user, optional display stream consent).
+          </p>
+          <div class="row">
+            <label for="deploy-setup-domain" data-i18n="login.desktopSetupDomainLabel">Domain (FQDN)</label>
+            <input
+              id="deploy-setup-domain"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              data-i18n-placeholder="login.desktopSetupDomainPlaceholder"
+              placeholder="e.g. deploy.example.com (optional)"
+            />
+          </div>
+          <p class="muted small-hint" data-i18n="login.desktopSetupDomainHint">
+            Same as pirate_DOMAIN / install prompt; leave empty if you use IP only.
+          </p>
+          <div class="row">
+            <label for="deploy-control-api-url" data-i18n="login.desktopSetupUrlLabel"
+              >Deployment / Control API base URL</label
+            >
+            <input
+              id="deploy-control-api-url"
+              type="url"
+              autocomplete="url"
+              spellcheck="false"
+              data-i18n-placeholder="login.desktopSetupUrlPlaceholder"
+              placeholder="https://deploy.example.com or http://203.0.113.10"
+            />
+          </div>
+          <p class="muted small-hint" data-i18n="login.desktopSetupUrlHint">
+            Open the dashboard in a browser at this origin; nginx proxies /api to control-api (see install.sh).
+          </p>
+          <div class="row">
+            <label for="deploy-setup-username" data-i18n="login.desktopSetupUserLabel">Dashboard username</label>
+            <input
+              id="deploy-setup-username"
+              type="text"
+              autocomplete="username"
+              spellcheck="false"
+            />
+          </div>
+          <div class="row">
+            <label for="deploy-setup-password" data-i18n="login.desktopSetupPasswordLabel">Dashboard password</label>
+            <input
+              id="deploy-setup-password"
+              type="password"
+              autocomplete="new-password"
+              spellcheck="false"
+            />
+          </div>
+          <p class="muted small-hint" data-i18n="login.desktopSetupCredHint">
+            Same as CONTROL_UI_ADMIN_USERNAME / CONTROL_UI_ADMIN_PASSWORD written by install.sh --ui.
+          </p>
+          <div class="row row-checkbox">
+            <input type="checkbox" id="deploy-setup-display-stream" />
+            <label for="deploy-setup-display-stream" data-i18n="login.desktopSetupDisplayStreamLabel"
+              >Server allows display stream (PIRATE_DISPLAY_STREAM_CONSENT)</label
+            >
+          </div>
+          <p class="muted small-hint" data-i18n="login.desktopSetupDisplayStreamHint">
+            Checked if you answered yes to screen streaming during install on the server. This only stores a note in the app; the setting itself is on the host.
+          </p>
+          <p id="desktop-setup-error" class="login-error" role="alert"></p>
+          <div class="row actions">
+            <button
+              type="button"
+              id="desktop-setup-continue"
+              class="primary"
+              data-i18n="login.desktopSetupContinue"
+            >
+              Continue to sign in
+            </button>
+          </div>
+        </div>
+
+        <div id="login-main-block">
         <p class="muted" data-i18n="login.blurb">
           Sign in with the admin account from the server (or skip for open API / static token).
         </p>
@@ -78,6 +158,12 @@
               placeholder="Optional; copied to dashboard when you skip"
             />
           </div>
+        </div>
+        <p class="muted login-desktop-change-url" id="login-change-server-url-wrap" hidden>
+          <button type="button" id="login-change-server-url" class="linkish" data-i18n="login.desktopChangeServerUrl">
+            Change server URL
+          </button>
+        </p>
         </div>
       </div>
     </div>

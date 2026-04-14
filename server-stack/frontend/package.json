@@ -1,7 +1,7 @@
 {
   "name": "deploy-dashboard",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,11 +10,14 @@
     "preview": "vite preview"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.6",
     "typescript": "~5.6.3",
     "vite": "^5.4.11"
   },
   "dependencies": {
+    "@tauri-apps/plugin-http": "^2.5.8",
     "mermaid": "^11.14.0",
+    "qrcode": "^1.5.4",
     "uplot": "^1.6.32"
   }
 }

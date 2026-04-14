@@ -1,10 +1,12 @@
 import uPlot from "uplot";
 import {
   apiToken,
+  apiUrl,
   fetchHostStats,
   fetchHostStatsDetail,
   fetchHostStatsSeries,
 } from "../api/client.js";
+import { deployFetch } from "../api/deploy-fetch.js";
 import { HostStatsClient } from "../api/host-stats.js";
 import type {
   CpuDetail,
@@ -1396,15 +1398,12 @@ function bindLiveSse(checkbox: HTMLInputElement): void {
       const ctrl = new AbortController();
       sseAbort = ctrl;
       try {
-        const res = await fetch(
-          `${window.location.origin}/api/v1/host-stats/stream`,
-          {
-            method: "GET",
-            headers,
-            signal: ctrl.signal,
-            cache: "no-store",
-          },
-        );
+        const res = await deployFetch(apiUrl("/api/v1/host-stats/stream"), {
+          method: "GET",
+          headers,
+          signal: ctrl.signal,
+          cache: "no-store",
+        });
         if (!res.ok) {
           checkbox.checked = false;
           if (badge) {

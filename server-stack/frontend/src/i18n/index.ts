@@ -109,6 +109,15 @@ function applyI18nElements(root: ParentNode = document): void {
     }
     el.setAttribute("aria-label", t(key));
   });
+
+  root.querySelectorAll<HTMLElement>("[data-i18n-title]").forEach((el) => {
+    // Use getAttribute: `dataset.i18nTitle` for `data-i18n-title` is fragile across browsers.
+    const key = el.getAttribute("data-i18n-title") as MessageKey | null;
+    if (!key) {
+      return;
+    }
+    el.setAttribute("title", t(key));
+  });
 }
 
 export function applyDocumentTranslations(): void {

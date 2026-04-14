@@ -16,6 +16,7 @@ import {
   loadDatabaseInfo,
   refreshDatabaseFromLocale,
 } from "./views/database.js";
+import { bindInboundsTab, loadInbounds } from "./views/inbounds.js";
 import { loadNginx, saveNginx } from "./views/nginx.js";
 
 initI18n();
@@ -23,6 +24,7 @@ onLocaleChange(() => {
   void refreshDashboard();
   void loadNginx();
   refreshDatabaseFromLocale();
+  void loadInbounds();
 });
 
 function bootstrapDashboard(): void {
@@ -41,6 +43,9 @@ function bootstrapDashboard(): void {
   initDashboardTabs();
   if (document.getElementById("tab-database")?.getAttribute("aria-selected") === "true") {
     void loadDatabaseInfo();
+  }
+  if (document.getElementById("tab-inbounds")?.getAttribute("aria-selected") === "true") {
+    void loadInbounds();
   }
   const ap = document.getElementById("active-project") as HTMLInputElement | null;
   if (ap) {
@@ -62,6 +67,7 @@ function bootstrapDashboard(): void {
   bindNginxWizard();
   bindHostServerDialog();
   bindDatabaseTab();
+  bindInboundsTab();
 
   document.getElementById("btn-copy-local-client")?.addEventListener("click", async () => {
     const text = document.getElementById("local-client-json")?.textContent?.trim();
@@ -72,6 +78,18 @@ function bootstrapDashboard(): void {
       await navigator.clipboard.writeText(text);
     } catch {
       /* ignore — clipboard may be denied */
+    }
+  });
+
+  document.getElementById("btn-copy-display-stream")?.addEventListener("click", async () => {
+    const text = document.getElementById("display-stream-data-url")?.textContent?.trim();
+    if (!text) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      /* ignore */
     }
   });
 

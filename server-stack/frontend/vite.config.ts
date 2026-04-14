@@ -9,7 +9,9 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://[::1]:8080",
+        // Match control-api default bind (127.0.0.1) from start-local-macos-stack / install.
+        // [::1] fails when the API is IPv4-only (common on macOS local stack).
+        target: "http://127.0.0.1:8080",
         changeOrigin: true,
         ws: true,
         configure(proxy) {
@@ -21,7 +23,7 @@ export default defineConfig({
           });
         },
       },
-      "/health": "http://[::1]:8080",
+      "/health": "http://127.0.0.1:8080",
     },
   },
   build: {

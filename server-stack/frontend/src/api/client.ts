@@ -1,3 +1,5 @@
+import { apiUrl } from "./api-base.js";
+import { deployFetch } from "./deploy-fetch.js";
 import type {
   ApiErrorBody,
   CpuDetail,
@@ -23,11 +25,17 @@ import type {
   ProjectsView,
   ReleasesView,
   RollbackView,
+  RevokeProxySessionResponse,
   SeriesResponse,
   SmbBrowseView,
   StatusView,
+  BootstrapHintsView,
+  CreateProxySessionResponse,
+  ProxySessionsPage,
 } from "./types.js";
 import { ApiRequestError } from "./types.js";
+
+export { apiUrl };
 
 const ACCESS_TOKEN_KEY = "deploy.accessToken";
 
@@ -104,11 +112,16 @@ async function parseError(res: Response): Promise<never> {
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const r = await fetch(path, { headers: baseHeaders() });
+  const r = await deployFetch(apiUrl(path), { headers: baseHeaders() });
   if (!r.ok) {
     await parseError(r);
   }
   return r.json() as Promise<T>;
+}
+
+/** Public gRPC URL from `DEPLOY_GRPC_PUBLIC_URL` (for Inbounds export). */
+export async function fetchBootstrapHints(): Promise<BootstrapHintsView> {
+  return getJson<BootstrapHintsView>("/api/v1/bootstrap-hints");
 }
 
 async function postJson<T>(path: string, body?: unknown): Promise<T> {
@@ -116,7 +129,7 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
     "Content-Type": "application/json",
     ...baseHeaders(),
   };
-  const r = await fetch(path, {
+  const r = await deployFetch(apiUrl(path), {
     method: "POST",
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -127,8 +140,24 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+async function patchJson<T>(path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...baseHeaders(),
+  };
+  const r = await deployFetch(apiUrl(path), {
+    method: "PATCH",
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) {
+    await parseError(r);
+  }
+  return r.json() as Promise<T>;
+}
+
 async function deleteJson(path: string): Promise<void> {
-  const r = await fetch(path, {
+  const r = await deployFetch(apiUrl(path), {
     method: "DELETE",
     headers: baseHeaders(),
   });
@@ -139,6 +168,86 @@ async function deleteJson(path: string): Promise<void> {
 
 export async function fetchStatus(): Promise<StatusView> {
   return getJson<StatusView>(`/api/v1/status${projectQuery()}`);
+}
+
+export async function fetchProxySessions(
+  opts?: { limit?: number; offset?: number; revoked?: boolean },
+): Promise<ProxySessionsPage> {
+  const q = new URLSearchParams();
+  q.set("project", activeProject());
+  if (opts?.limit != null) {
+    q.set("limit", String(opts.limit));
+  }
+  if (opts?.offset != null) {
+    q.set("offset", String(opts.offset));
+  }
+  if (opts?.revoked != null) {
+    q.set("revoked", String(opts.revoked));
+  }
+  return getJson<ProxySessionsPage>(`/api/v1/proxy-sessions?${q.toString()}`);
+}
+
+export async function createProxySession(body: {
+  board_label: string;
+  policy: Record<string, unknown>;
+  recipient_client_pubkey_b64?: string;
+  wire_mode?: number;
+  wire_config?: Record<string, unknown>;
+  ingress?: {
+    protocol: number;
+    listen_port: number;
+    listen_udp_port?: number;
+    config: Record<string, unknown>;
+    tls?: Record<string, unknown>;
+    template_version?: number;
+  };
+}): Promise<CreateProxySessionResponse> {
+  const q = new URLSearchParams();
+  q.set("project", activeProject());
+  return postJson<CreateProxySessionResponse>(
+    `/api/v1/proxy-sessions?${q.toString()}`,
+    body,
+  );
+}
+
+export async function patchProxySession(
+  sessionId: string,
+  body: {
+    policy: Record<string, unknown>;
+    wire_mode?: number;
+    wire_config?: Record<string, unknown>;
+    ingress?: {
+      protocol: number;
+      listen_port: number;
+      listen_udp_port?: number;
+      config: Record<string, unknown>;
+      tls?: Record<string, unknown>;
+      template_version?: number;
+    };
+    ingress_clear?: boolean;
+  },
+): Promise<{ status: string; expires_at_unix_ms: number }> {
+  const q = new URLSearchParams();
+  q.set("project", activeProject());
+  return patchJson<{ status: string; expires_at_unix_ms: number }>(
+    `/api/v1/proxy-sessions/${encodeURIComponent(sessionId)}?${q.toString()}`,
+    body,
+  );
+}
+
+export async function revokeProxySession(sessionId: string): Promise<RevokeProxySessionResponse> {
+  return postJson<RevokeProxySessionResponse>(
+    `/api/v1/proxy-sessions/${encodeURIComponent(sessionId)}/revoke`,
+  );
+}
+
+/** Authenticated Xray JSON for a session (same document as the public subscription URL). */
+export async function fetchProxySessionXrayConfig(sessionId: string): Promise<unknown> {
+  const q = new URLSearchParams();
+  q.set("project", activeProject());
+  return getJson<unknown>(
+    `/api/v1/proxy-sessions/${encodeURIComponent(sessionId)}/xray-config?${q.toString()}`,
+  );
 }
 
 export async function fetchGrpcSessions(
@@ -378,7 +487,7 @@ export async function putNginxConfig(content: string): Promise<NginxPutResponseV
       headers.Authorization = `Bearer ${nt}`;
     }
   }
-  const r = await fetch("/api/v1/nginx/config", {
+  const r = await deployFetch(apiUrl("/api/v1/nginx/config"), {
     method: "PUT",
     headers,
     body: JSON.stringify({ content }),

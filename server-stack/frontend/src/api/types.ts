@@ -35,6 +35,14 @@ export interface GrpcSessionEventView {
   detail: string;
 }
 
+/** Monitor row from `ReportDisplayTopology` (metadata DB). */
+export interface DisplayTopologyDisplayView {
+  index: number;
+  label: string;
+  width: number;
+  height: number;
+}
+
 /** One row per known client key — last activity from the metadata DB. */
 export interface GrpcSessionPeerView {
   client_public_key_b64: string;
@@ -48,6 +56,8 @@ export interface GrpcSessionPeerView {
   last_gpu_percent?: number | null;
   proxy_bytes_in_total: number;
   proxy_bytes_out_total: number;
+  display_topology?: DisplayTopologyDisplayView[];
+  display_stream_capable?: boolean | null;
 }
 
 /** Latest `deploy-server resource-benchmark` row (this host). */
@@ -376,6 +386,70 @@ export interface ApiErrorPayload {
 
 export interface ApiErrorBody {
   error: ApiErrorPayload;
+}
+
+/** Managed proxy sessions (inbounds) — `GET /api/v1/proxy-sessions`. */
+export interface ProxyPolicyOut {
+  max_session_duration_sec: number;
+  traffic_total_bytes: number;
+  traffic_bytes_in_limit: number;
+  traffic_bytes_out_limit: number;
+  active_idle_timeout_sec?: number | null;
+  access_schedule?: unknown;
+  never_expires: boolean;
+  limit_duration_by_active_time: boolean;
+  /** Omitted = server default; -1 = unlimited; >= 0 = explicit cap. */
+  max_concurrent_devices_per_session?: number | null;
+}
+
+export interface ProxySessionRow {
+  session_id: string;
+  board_label: string;
+  client_pubkey_b64: string;
+  created_at_unix_ms: number;
+  expires_at_unix_ms: number;
+  policy: ProxyPolicyOut;
+  bytes_in: number;
+  bytes_out: number;
+  active_ms: number;
+  last_activity_unix_ms: number;
+  revoked: boolean;
+  wire_mode: number | null;
+  wire_config: Record<string, unknown> | null;
+  /** Full ingress (sing-box): 1=VLESS … 6=Hysteria2 */
+  ingress_protocol?: number | null;
+  ingress_listen_port?: number | null;
+  ingress_listen_udp_port?: number | null;
+  ingress_config?: Record<string, unknown> | null;
+  ingress_tls?: Record<string, unknown> | null;
+  ingress_template_version?: number;
+  /** Cumulative tunnel opens (Redis); omitted if control-api has no Redis. */
+  proxy_tunnels_total?: number | null;
+  /** Currently open tunnels (Redis); omitted if control-api has no Redis. */
+  proxy_tunnels_online?: number | null;
+}
+
+export interface ProxySessionsPage {
+  items: ProxySessionRow[];
+}
+
+export interface CreateProxySessionResponse {
+  session_id: string;
+  session_token: string;
+  expires_at_unix_ms: number;
+  status: string;
+  subscription_token?: string | null;
+  subscription_url?: string | null;
+  /** Public URL for `GET` pirate-bootstrap JSON (needs `DEPLOY_SUBSCRIPTION_PUBLIC_HOST` and `DEPLOY_GRPC_PUBLIC_URL`). */
+  pirate_bootstrap_url?: string | null;
+}
+
+export interface BootstrapHintsView {
+  grpc_public_url: string | null;
+}
+
+export interface RevokeProxySessionResponse {
+  revoked: number;
 }
 
 export class ApiRequestError extends Error {

@@ -14,10 +14,129 @@ export const TRANSLATIONS = {
 
     "tabs.sectionsAria": "Dashboard sections",
     "tab.status": "Status",
+    "tab.inbounds": "Inbounds",
     "tab.projects": "Projects",
     "tab.inventory": "Inventory",
     "tab.databases": "Databases",
     "tab.nginx": "Nginx",
+
+    "inbounds.heading": "Inbounds",
+    "inbounds.hint":
+      "Managed proxy sessions for VLESS, Trojan, and VMess over the deploy-server tunnel. Use -1 for unlimited traffic limits. Invitation calendar expiry follows max session duration: -1 means no fixed end date; a positive value or a picked end date sets the term.",
+    "inbounds.refresh": "Refresh",
+    "inbounds.createHeading": "New inbound",
+    "inbounds.addConnection": "Add connection",
+    "inbounds.dialogTitle": "New connection",
+    "inbounds.dialogHint":
+      "Set protocol credentials and traffic or time limits. Use -1 for unlimited byte limits. Max session duration -1 (seconds) means the invitation has no calendar expiry; otherwise a term applies.",
+    "inbounds.cancel": "Cancel",
+    "inbounds.boardLabel": "Label",
+    "inbounds.wireMode": "Protocol",
+    "inbounds.uuid": "UUID",
+    "inbounds.password": "Password",
+    "inbounds.flow": "Flow",
+    "inbounds.flowOptionNone": "None (plain TLS / no XTLS flow)",
+    "inbounds.maxSessionDurationSec": "Max session duration (sec, -1 = none)",
+    "inbounds.presetHour": "1H",
+    "inbounds.presetDay": "1D",
+    "inbounds.presetWeek": "1W",
+    "inbounds.presetMonth": "30D",
+    "inbounds.durationModeToggleToCalendar": "Pick end date",
+    "inbounds.durationModeToggleToSeconds": "Enter seconds",
+    "inbounds.trafficPreset1g": "1GB",
+    "inbounds.trafficPreset10g": "10GB",
+    "inbounds.trafficPreset100g": "100GB",
+    "inbounds.trafficUnlimitedAria": "Unlimited (−1)",
+    "inbounds.maxDurCalendarRequired": "Choose an end date and time, or switch back to seconds.",
+    "inbounds.maxDurCalendarPast": "End date must be in the future.",
+    "inbounds.limitByActiveTime": "Limit by accumulated active time",
+    "inbounds.fieldHelp.limitByActiveTime":
+      "When enabled, the duration (seconds) is enforced against cumulative active proxy time (idle-aware), not wall-clock since first use. Only applies when duration is set in seconds, not when using the calendar.",
+    "inbounds.trafficTotal": "Total traffic limit (bytes, -1 = unlimited)",
+    "inbounds.trafficIn": "Inbound limit (bytes, -1 = unlimited)",
+    "inbounds.trafficOut": "Outbound limit (bytes, -1 = unlimited)",
+    "inbounds.maxConcurrentDevices": "Max concurrent devices (empty = server default)",
+    "inbounds.fieldHelp.maxConcurrentDevices":
+      "Cap on simultaneous proxy tunnels for this session (gRPC and public ingress). Leave empty to use the server default (DEPLOY_DEFAULT_MAX_DEVICES_PER_SESSION, usually 10). Use -1 for unlimited.",
+    "inbounds.maxDevicesInvalid": "Max concurrent devices must be empty, -1 (unlimited), or a non-negative number.",
+    "inbounds.recipientPubkey": "Recipient client key (optional)",
+    "inbounds.create": "Create",
+    "inbounds.colLabel": "Label",
+    "inbounds.colProtocol": "Tunnel",
+    "inbounds.colIngress": "Ingress",
+    "inbounds.colClients": "Clients (total / online)",
+    "inbounds.colClientsHint":
+      "Managed proxy tunnels for this session: total opens and currently open (requires DEPLOY_REDIS_URL on control-api and deploy-server).",
+    "inbounds.colExpires": "Expires",
+    "inbounds.colTraffic": "Traffic (in / out)",
+    "inbounds.colRevoked": "Revoked",
+    "inbounds.colMenu": "Menu",
+    "inbounds.menuAria": "Open row menu",
+    "inbounds.menuOpenQr": "Show QR code",
+    "inbounds.menuCopyJson": "Copy JSON",
+    "inbounds.menuCopyUrl": "Copy subscription URL",
+    "inbounds.menuRevoke": "Revoke",
+    "inbounds.qrTitle": "Session QR",
+    "inbounds.qrClose": "Close",
+    "inbounds.qrError": "Could not generate QR (payload too large or error). Use Copy JSON instead.",
+    "inbounds.revokeConfirm": "Revoke this connection? It cannot be undone.",
+    "inbounds.revoke": "Revoke",
+    "inbounds.createdToken": "Session token (copy now; not shown again)",
+    "inbounds.loading": "Loading…",
+    "inbounds.error": "Could not load inbounds.",
+    "inbounds.cipherMethod": "Cipher (Shadowsocks)",
+    "inbounds.cipherRequired": "Shadowsocks cipher method is required (e.g. aes-256-gcm).",
+    "inbounds.socksUser": "SOCKS5 user (optional)",
+    "inbounds.ingressEnable": "Public ingress (sing-box)",
+    "inbounds.fieldHelp.ingressEnable":
+      "When enabled, the host runs a sing-box inbound listener (port, protocol, TLS) so clients can connect directly to this server instead of only through the deploy gRPC tunnel. Requires valid ingress JSON and optional TLS; the control plane stores the config and reloads sing-box.",
+    "inbounds.ingressProtocol": "Ingress protocol",
+    "inbounds.ingressPort": "Listen port",
+    "inbounds.ingressUdp": "UDP port (optional)",
+    "inbounds.ingressConfig": "Ingress JSON (protocol fields)",
+    "inbounds.ingressTls": "TLS JSON (optional)",
+    "inbounds.ingressPortInvalid": "Ingress listen port must be between 1 and 65535.",
+    "inbounds.ingressConfigRequired": "Ingress JSON is required when public ingress is enabled.",
+    "inbounds.ingressConfigJson": "Ingress JSON must be valid JSON.",
+    "inbounds.ingressTlsJson": "TLS JSON must be valid JSON.",
+
+    "inbounds.autoConfigTitle": "Connection autoconfiguration",
+    "inbounds.presetSimple": "Simple",
+    "inbounds.presetSimpleHint":
+      "Minimal wire crypto (SOCKS5), moderate time and traffic caps, split-tuning oriented board flags (no bundled JSON rules).",
+    "inbounds.presetComplex": "Complex",
+    "inbounds.presetComplexHint":
+      "Shadowsocks (AEAD), unlimited caps by default, anti-ad block list via default-rules/anti-adw.json.",
+    "inbounds.presetExtrem": "EXTREM",
+    "inbounds.presetExtremHint":
+      "VLESS + flow, TLS keep-alive hints, bundled anti-adw + ru-full + ru-block-domain JSON slots.",
+    "inbounds.clientSnippetPlaceholder": "Click a preset above to fill this JSON template.",
+
+    "inbounds.fieldHelp.dialogIntro":
+      "Overview: set credentials for the chosen protocol, optional traffic caps (-1 = unlimited bytes), and max session duration (-1 = no calendar expiry for the invitation) or an end date.",
+    "inbounds.fieldHelp.boardLabel":
+      "Display name for this inbound in the list and in stored session metadata.",
+    "inbounds.fieldHelp.wireMode":
+      "Wire protocol inside the deploy-server tunnel: VLESS (1) and VMess (3) use a UUID; Trojan (2) uses a password. Must match the JSON you send in wire_config.",
+    "inbounds.fieldHelp.uuid":
+      "User ID for VLESS/VMess (UUID string). Stored in wire_config_json as \"uuid\" and checked on the wire.",
+    "inbounds.fieldHelp.password":
+      "Trojan shared secret. Stored in wire_config_json as \"password\" (masked in the list after save).",
+    "inbounds.fieldHelp.flow":
+      "VLESS / VMess only: XTLS flow mode. `xtls-rprx-vision` is the usual Vision mode (sing-box / Xray). `xtls-rprx-vision-udp443` skips UDP/443 interception (Xray). Not used for Trojan, Shadowsocks, or SOCKS5.",
+    "inbounds.fieldHelp.maxSessionDurationSec":
+      "Maximum lifetime of a single tunnel after it first opens, in seconds. Use -1 for no per-session time cap and no calendar expiry on the invitation. A positive value sets both the per-tunnel cap and the invitation’s calendar term (unless you use “Limit by accumulated active time”). You can also pick an end date instead of seconds.",
+    "inbounds.fieldHelp.trafficTotal":
+      "Upper bound on total bytes (in + out) counted for this session. -1 means no total cap.",
+    "inbounds.fieldHelp.trafficIn":
+      "Cap on bytes from client toward the proxy (upload direction). -1 = unlimited.",
+    "inbounds.fieldHelp.trafficOut":
+      "Cap on bytes from proxy toward the client (download direction). -1 = unlimited.",
+    "inbounds.fieldHelp.recipientPubkey":
+      "Optional Ed25519 public key (URL-safe Base64, 32-byte key) to bind the session to another client; empty uses your current dashboard client key.",
+    "inbounds.fieldHelp.autoConfig":
+      "Presets only change this form and show a template for the local stack client. Traffic rules (JSON bundles) are configured in the client settings file, not on the server session row.",
+    "inbounds.fieldHelpIconAria": "Field description",
 
     "database.heading": "Data sources",
     "database.hint":
@@ -141,6 +260,28 @@ export const TRANSLATIONS = {
     "status.localClient.hint":
       "Paste into the desktop client. With full gRPC auth you get token, url, and pairing. The Docker test stack uses open gRPC — only url is shown (set DEPLOY_GRPC_PUBLIC_URL on the server if it should differ).",
     "status.localClient.copy": "Copy JSON",
+    "status.displayStream.heading": "Display stream (producer)",
+    "status.displayStream.hint":
+      "Build a config for the CLI producer: paste the data URL on the remote host (`client display-stream run --config …`). Use an ingest URL from the local Pirate desktop client (receive) or any HTTP POST target.",
+    "status.displayStream.ingestUrl": "Ingest URL",
+    "status.displayStream.token": "Bearer token (optional)",
+    "status.displayStream.quality": "Quality (1–100)",
+    "status.displayStream.fps": "FPS (1–60)",
+    "status.displayStream.encrypt": "Transport",
+    "status.displayStream.encryptNone": "HTTP (no TLS)",
+    "status.displayStream.encryptTls": "HTTPS (TLS)",
+    "status.displayStream.peer": "gRPC peer (displays)",
+    "status.displayStream.peerManual": "— manual index —",
+    "status.displayStream.displayIndex": "Display index",
+    "status.displayStream.protocolNote": "Protocol: HTTP POST image/jpeg (fixed).",
+    "status.displayStream.copy": "Copy data URL",
+    "status.displayStream.previewOpen": "Preview stream",
+    "status.displayStream.previewTitle": "Ingest preview",
+    "status.displayStream.previewHint":
+      "Shows JPEG frames from the receiver’s GET /last.jpg (same base URL as ingest, without /ingest). Start the desktop ingest consumer and a producer sending to this ingest URL.",
+    "status.displayStream.previewClose": "Close",
+    "status.displayStream.previewErr":
+      "Enter a valid ingest URL ending with /ingest (e.g. http://127.0.0.1:39100/ingest).",
     "status.sessions.heading": "gRPC client connections (audit)",
     "status.sessions.hint":
       "Peer keys with last IP and presence; recent audit hides raw TCP open/close unless expanded.",
@@ -297,6 +438,35 @@ export const TRANSLATIONS = {
     "login.apiTokenLabel": "API Bearer token (<code>CONTROL_API_BEARER_TOKEN</code>)",
     "login.apiTokenPlaceholder": "Optional; copied to dashboard when you skip",
 
+    "login.desktopSetupTitle": "Connect to your server",
+    "login.desktopSetupBlurb":
+      "Use the same values as on the host after sudo ./install.sh --nginx --ui: domain (optional), dashboard URL, admin user and password, and whether display streaming was allowed on the server.",
+    "login.desktopSetupDomainLabel": "Domain (FQDN)",
+    "login.desktopSetupDomainPlaceholder": "e.g. deploy.example.com (optional)",
+    "login.desktopSetupDomainHint":
+      "Same as pirate_DOMAIN or the install prompt; leave empty if you only use the server IP.",
+    "login.desktopSetupUrlLabel": "Deployment / Control API base URL",
+    "login.desktopSetupUrlPlaceholder": "https://deploy.example.com or http://203.0.113.10",
+    "login.desktopSetupUrlHint":
+      "Use the same origin you open in the browser; nginx proxies /api to control-api (see install.sh). http://127.0.0.1:8080 only works if control-api runs on this same computer (or use an SSH tunnel). For another PC or server, use https://your-domain or http://LAN-IP (e.g. 192.168.x.x).",
+    "login.desktopSetupUserLabel": "Dashboard username",
+    "login.desktopSetupPasswordLabel": "Dashboard password",
+    "login.desktopSetupCredHint":
+      "Same as CONTROL_UI_ADMIN_USERNAME and CONTROL_UI_ADMIN_PASSWORD from install.sh --ui.",
+    "login.desktopSetupDisplayStreamLabel":
+      "Server allows display stream (PIRATE_DISPLAY_STREAM_CONSENT)",
+    "login.desktopSetupDisplayStreamHint":
+      "Enable if you agreed to screen streaming during install on the server. This only saves a note in the app; the real setting is /etc/pirate-deploy.env on the host.",
+    "login.desktopSetupContinue": "Continue to sign in",
+    "login.desktopSetupErr.empty": "Enter a URL (for example https://deploy.example.com or http://192.168.1.10).",
+    "login.desktopSetupErr.invalid": "Invalid URL. Use http:// or https:// with host and optional port.",
+    "login.desktopSetupErr.scheme": "Only http:// and https:// URLs are allowed.",
+    "login.err.desktopSetupDomain": "Invalid domain (use a hostname like deploy.example.com, no path or port here).",
+    "login.err.desktopSetupUsername":
+      "Username must be 1–64 characters: letters, digits, . _ - (same as install.sh web user).",
+    "login.err.desktopSetupPassword": "Enter the dashboard password from install.",
+    "login.desktopChangeServerUrl": "Change server connection",
+
     "login.err.username": "Enter username.",
     "login.err.login503":
       "Login unavailable (set CONTROL_API_JWT_SECRET and DATABASE_URL on control-api).",
@@ -334,10 +504,130 @@ export const TRANSLATIONS = {
 
     "tabs.sectionsAria": "Разделы панели",
     "tab.status": "Статус",
+    "tab.inbounds": "Входящие",
     "tab.projects": "Проекты",
     "tab.inventory": "Инвентарь",
     "tab.databases": "Базы данных",
     "tab.nginx": "Nginx",
+
+    "inbounds.heading": "Входящие",
+    "inbounds.hint":
+      "Управляемые proxy-сессии VLESS, Trojan и VMess через туннель deploy-server. Для безлимитного трафика укажите -1. Календарный срок приглашения задаётся макс. длительностью: -1 — без фиксированной даты; положительное значение или выбранная дата — со сроком.",
+    "inbounds.refresh": "Обновить",
+    "inbounds.createHeading": "Новый inbound",
+    "inbounds.addConnection": "Добавить соединение",
+    "inbounds.dialogTitle": "Новое соединение",
+    "inbounds.dialogHint":
+      "Укажите учётные данные протокола и лимиты трафика или времени. Для байтов -1 = без лимита. Макс. длительность сессии -1 (сек) — приглашение без календарного срока; иначе действует ограничение по сроку.",
+    "inbounds.cancel": "Отмена",
+    "inbounds.boardLabel": "Метка",
+    "inbounds.wireMode": "Протокол",
+    "inbounds.uuid": "UUID",
+    "inbounds.password": "Пароль",
+    "inbounds.flow": "Flow",
+    "inbounds.flowOptionNone": "Нет (обычный TLS, без XTLS flow)",
+    "inbounds.maxSessionDurationSec": "Макс. длительность сессии (сек, -1 = нет)",
+    "inbounds.presetHour": "1Ч",
+    "inbounds.presetDay": "1Д",
+    "inbounds.presetWeek": "1Нед",
+    "inbounds.presetMonth": "30Д",
+    "inbounds.durationModeToggleToCalendar": "Дата окончания",
+    "inbounds.durationModeToggleToSeconds": "Секунды",
+    "inbounds.trafficPreset1g": "1ГБ",
+    "inbounds.trafficPreset10g": "10ГБ",
+    "inbounds.trafficPreset100g": "100ГБ",
+    "inbounds.trafficUnlimitedAria": "Без лимита (−1)",
+    "inbounds.maxDurCalendarRequired": "Укажите дату и время окончания или вернитесь к вводу секунд.",
+    "inbounds.maxDurCalendarPast": "Дата окончания должна быть в будущем.",
+    "inbounds.limitByActiveTime": "Лимит по накопленному времени активности",
+    "inbounds.fieldHelp.limitByActiveTime":
+      "Если включено, длительность (сек) ограничивает суммарное активное время прокси (с учётом пауз по idle), а не календарное время с первого подключения. Действует только при вводе секунд, не в режиме даты.",
+    "inbounds.trafficTotal": "Лимит общего трафика (байт, -1 = без лимита)",
+    "inbounds.trafficIn": "Лимит входящего (байт, -1 = без лимита)",
+    "inbounds.trafficOut": "Лимит исходящего (байт, -1 = без лимита)",
+    "inbounds.maxConcurrentDevices": "Макс. одновременных устройств (пусто = по умолчанию на сервере)",
+    "inbounds.fieldHelp.maxConcurrentDevices":
+      "Лимит одновременных туннелей для этой сессии (gRPC и публичный ingress). Пусто — значение по умолчанию на сервере (DEPLOY_DEFAULT_MAX_DEVICES_PER_SESSION, обычно 10). −1 — без лимита.",
+    "inbounds.maxDevicesInvalid":
+      "Макс. устройств: пусто, −1 (без лимита) или неотрицательное число.",
+    "inbounds.recipientPubkey": "Ключ клиента-получателя (необязательно)",
+    "inbounds.create": "Создать",
+    "inbounds.colLabel": "Метка",
+    "inbounds.colProtocol": "Туннель",
+    "inbounds.colIngress": "Входящий",
+    "inbounds.colClients": "Клиенты (всего / онлайн)",
+    "inbounds.colClientsHint":
+      "Туннели прокси по этой сессии: всего открытий и сейчас активных (нужен DEPLOY_REDIS_URL у control-api и deploy-server).",
+    "inbounds.colExpires": "Истекает",
+    "inbounds.colTraffic": "Трафик (вх / исх)",
+    "inbounds.colRevoked": "Отозван",
+    "inbounds.colMenu": "Меню",
+    "inbounds.menuAria": "Открыть меню строки",
+    "inbounds.menuOpenQr": "QR-код",
+    "inbounds.menuCopyJson": "Копировать JSON",
+    "inbounds.menuCopyUrl": "Копировать URL подписки",
+    "inbounds.menuRevoke": "Отозвать",
+    "inbounds.qrTitle": "QR сессии",
+    "inbounds.qrClose": "Закрыть",
+    "inbounds.qrError": "Не удалось сгенерировать QR (слишком большой payload или ошибка). Используйте «Копировать JSON».",
+    "inbounds.revokeConfirm": "Отозвать это соединение? Это необратимо.",
+    "inbounds.revoke": "Отозвать",
+    "inbounds.createdToken": "Токен сессии (скопируйте сейчас; больше не показывается)",
+    "inbounds.loading": "Загрузка…",
+    "inbounds.error": "Не удалось загрузить входящие.",
+    "inbounds.cipherMethod": "Шифр (Shadowsocks)",
+    "inbounds.cipherRequired": "Укажите метод AEAD (например aes-256-gcm).",
+    "inbounds.socksUser": "Пользователь SOCKS5 (необязательно)",
+    "inbounds.ingressEnable": "Публичный ingress (sing-box)",
+    "inbounds.fieldHelp.ingressEnable":
+      "Если включено, на хосте поднимается sing-box inbound (порт, протокол, при необходимости TLS) — клиенты подключаются к этому серверу напрямую, а не только через туннель deploy по gRPC. Нужны корректные JSON полей ingress/TLS; конфигурация сохраняется в control plane и перезагружает sing-box.",
+    "inbounds.ingressProtocol": "Протокол ingress",
+    "inbounds.ingressPort": "Порт прослушивания",
+    "inbounds.ingressUdp": "UDP-порт (необязательно)",
+    "inbounds.ingressConfig": "JSON ingress",
+    "inbounds.ingressTls": "JSON TLS (необязательно)",
+    "inbounds.ingressPortInvalid": "Порт ingress должен быть от 1 до 65535.",
+    "inbounds.ingressConfigRequired": "При включённом ingress нужен JSON конфигурации.",
+    "inbounds.ingressConfigJson": "Некорректный JSON ingress.",
+    "inbounds.ingressTlsJson": "Некорректный JSON TLS.",
+
+    "inbounds.autoConfigTitle": "Конфигурация соединения (автонастройка)",
+    "inbounds.presetSimple": "Простой",
+    "inbounds.presetSimpleHint":
+      "Минимальное шифрование на wire (SOCKS5), умеренные лимиты времени и трафика, флаги сплита трафика без готовых JSON-наборов.",
+    "inbounds.presetComplex": "Сложный",
+    "inbounds.presetComplexHint":
+      "Shadowsocks (AEAD), по умолчанию без лимитов по трафику/времени, набор anti-adw.json через default-rules/anti-adw.json.",
+    "inbounds.presetExtrem": "EXTREM",
+    "inbounds.presetExtremHint":
+      "VLESS + flow, подсказки по надёжности TLS/keep-alive, три слота правил: anti-adw.json, ru-full.json, ru-block-domain.json.",
+    "inbounds.clientSnippetPlaceholder": "Нажмите пресет выше, чтобы заполнить шаблон JSON.",
+
+    "inbounds.fieldHelp.dialogIntro":
+      "Кратко: учётные данные протокола, при необходимости лимиты трафика (-1 = без лимита по байтам) и макс. длительность (-1 = без календарного срока приглашения) или дата окончания.",
+    "inbounds.fieldHelp.boardLabel":
+      "Понятное имя этого inbound в списке и в метаданных сохранённой сессии.",
+    "inbounds.fieldHelp.wireMode":
+      "Протокол поверх туннеля deploy-server: VLESS (1) и VMess (3) — по UUID; Trojan (2) — по паролю. Должен совпадать с JSON в wire_config.",
+    "inbounds.fieldHelp.uuid":
+      "Идентификатор пользователя для VLESS/VMess (строка UUID). Пишется в wire_config_json как «uuid» и проверяется на wire-слое.",
+    "inbounds.fieldHelp.password":
+      "Общий секрет Trojan. Хранится в wire_config_json как «password» (в списке после сохранения маскируется).",
+    "inbounds.fieldHelp.flow":
+      "Только VLESS / VMess: режим XTLS flow. `xtls-rprx-vision` — обычный Vision (sing-box / Xray). `xtls-rprx-vision-udp443` — без перехвата UDP/443 (Xray). Для Trojan, Shadowsocks и SOCKS5 не используется.",
+    "inbounds.fieldHelp.maxSessionDurationSec":
+      "Максимальная длительность одного туннеля после первого открытия, в секундах. -1 — без лимита по времени туннеля и без календарного срока приглашения. Положительное значение задаёт и лимит туннеля, и срок действия приглашения (если не включён «лимит по накопленному времени»). Можно вместо секунд выбрать дату окончания.",
+    "inbounds.fieldHelp.trafficTotal":
+      "Потолок суммарного трафика (вход + выход) по этой сессии. -1 = без лимита по сумме.",
+    "inbounds.fieldHelp.trafficIn":
+      "Лимит байт от клиента к прокси (направление «вход»). -1 = без лимита.",
+    "inbounds.fieldHelp.trafficOut":
+      "Лимит байт от прокси к клиенту (направление «выход»). -1 = без лимита.",
+    "inbounds.fieldHelp.recipientPubkey":
+      "Необязательный публичный ключ Ed25519 (Base64 URL-safe, 32 байта), чтобы привязать сессию к другому клиенту; пусто — используется ключ текущего клиента панели.",
+    "inbounds.fieldHelp.autoConfig":
+      "Пресеты меняют только эту форму и показывают шаблон для локального клиента. Правила трафика (JSON) настраиваются в файле настроек клиента, а не в строке сессии на сервере.",
+    "inbounds.fieldHelpIconAria": "Описание поля",
 
     "database.heading": "Источники данных",
     "database.hint":
@@ -461,6 +751,28 @@ export const TRANSLATIONS = {
     "status.localClient.hint":
       "Вставьте в настольный клиент. При полной gRPC-аутентификации будут token, url и pairing. В Docker-тесте gRPC открыт — обычно только url (при необходимости задайте DEPLOY_GRPC_PUBLIC_URL на сервере).",
     "status.localClient.copy": "Копировать JSON",
+    "status.displayStream.heading": "Стрим дисплея (producer)",
+    "status.displayStream.hint":
+      "Соберите конфиг для CLI producer: вставьте data URL на удалённом хосте (`client display-stream run --config …`). Ingest URL — из настольного Pirate (приём) или любой HTTP POST.",
+    "status.displayStream.ingestUrl": "URL приёма (ingest)",
+    "status.displayStream.token": "Bearer-токен (необязательно)",
+    "status.displayStream.quality": "Качество (1–100)",
+    "status.displayStream.fps": "FPS (1–60)",
+    "status.displayStream.encrypt": "Транспорт",
+    "status.displayStream.encryptNone": "HTTP (без TLS)",
+    "status.displayStream.encryptTls": "HTTPS (TLS)",
+    "status.displayStream.peer": "gRPC-пир (дисплеи)",
+    "status.displayStream.peerManual": "— вручную индекс —",
+    "status.displayStream.displayIndex": "Индекс дисплея",
+    "status.displayStream.protocolNote": "Протокол: HTTP POST image/jpeg (фиксированно).",
+    "status.displayStream.copy": "Копировать data URL",
+    "status.displayStream.previewOpen": "Превью трансляции",
+    "status.displayStream.previewTitle": "Превью приёма (ingest)",
+    "status.displayStream.previewHint":
+      "Кадры JPEG с GET /last.jpg у приёмника (тот же хост, что и ingest, без суффикса /ingest). Запустите настольный приём и producer, шлющий на этот ingest.",
+    "status.displayStream.previewClose": "Закрыть",
+    "status.displayStream.previewErr":
+      "Укажите корректный ingest URL, оканчивающийся на /ingest (например http://127.0.0.1:39100/ingest).",
     "status.sessions.heading": "Подключения gRPC-клиентов (аудит)",
     "status.sessions.hint":
       "Ключи пиров с последним IP и статусом; недавний аудит без сырых tcp_open/tcp_close (ниже можно развернуть).",
@@ -618,6 +930,35 @@ export const TRANSLATIONS = {
     "login.advancedToggle": "Дополнительно: статический bearer-токен",
     "login.apiTokenLabel": "Bearer-токен API (<code>CONTROL_API_BEARER_TOKEN</code>)",
     "login.apiTokenPlaceholder": "Необязательно; при «Пропустить» копируется в панель",
+
+    "login.desktopSetupTitle": "Подключение к серверу",
+    "login.desktopSetupBlurb":
+      "Те же данные, что на хосте после sudo ./install.sh --nginx --ui: домен (необязательно), URL дашборда, логин и пароль администратора, признак согласия на трансляцию экрана.",
+    "login.desktopSetupDomainLabel": "Домен (FQDN)",
+    "login.desktopSetupDomainPlaceholder": "например deploy.example.com (необязательно)",
+    "login.desktopSetupDomainHint":
+      "Как pirate_DOMAIN или вопрос установщика; оставьте пустым, если заходите только по IP.",
+    "login.desktopSetupUrlLabel": "URL развёртывания / база Control API",
+    "login.desktopSetupUrlPlaceholder": "https://deploy.example.com или http://203.0.113.10",
+    "login.desktopSetupUrlHint":
+      "Тот же origin, что открываете в браузере; nginx проксирует /api на control-api (см. install.sh). http://127.0.0.1:8080 имеет смысл только если control-api на этом же ПК (или через SSH-туннель). Для другого сервера укажите https://домен или http://IP-в-LAN (например 192.168.x.x).",
+    "login.desktopSetupUserLabel": "Имя пользователя веб-дашборда",
+    "login.desktopSetupPasswordLabel": "Пароль веб-дашборда",
+    "login.desktopSetupCredHint":
+      "Как CONTROL_UI_ADMIN_USERNAME и CONTROL_UI_ADMIN_PASSWORD из install.sh --ui.",
+    "login.desktopSetupDisplayStreamLabel":
+      "На сервере разрешена трансляция экрана (PIRATE_DISPLAY_STREAM_CONSENT)",
+    "login.desktopSetupDisplayStreamHint":
+      "Включите, если при установке на сервере вы согласились на трансляцию. Здесь сохраняется только пометка в приложении; сам параметр — в /etc/pirate-deploy.env на хосте.",
+    "login.desktopSetupContinue": "Далее: вход",
+    "login.desktopSetupErr.empty": "Введите URL (например https://deploy.example.com или http://192.168.1.10).",
+    "login.desktopSetupErr.invalid": "Некорректный URL. Используйте http:// или https:// с хостом и при необходимости портом.",
+    "login.desktopSetupErr.scheme": "Допустимы только URL с http:// и https://.",
+    "login.err.desktopSetupDomain": "Некорректный домен (имя вида deploy.example.com, без пути и порта в этом поле).",
+    "login.err.desktopSetupUsername":
+      "Имя пользователя: 1–64 символа, латиница, цифры, . _ - (как у веб-пользователя в install.sh).",
+    "login.err.desktopSetupPassword": "Введите пароль веб-дашборда из установки.",
+    "login.desktopChangeServerUrl": "Сменить подключение к серверу",
 
     "login.err.username": "Введите имя пользователя.",
     "login.err.login503":
