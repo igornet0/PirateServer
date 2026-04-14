@@ -8,7 +8,8 @@ use crate::tunnel_flush::{
 };
 use crate::tunnel_registry::{redis_fields_snapshot, RedisTunnelDropGuard, TunnelRedis};
 use deploy_core::{
-    normalize_project_id, project_deploy_root, read_current_version_from_symlink,
+    normalize_project_id, pirate_project::PirateManifest, process_manager,
+    project_deploy_root, read_current_version_from_symlink,
     read_host_stack_ui_flags, read_server_stack_bundle_version_from_var_lib, refresh_process_state,
     release_dir_for_version, status_current_version_display, validate_project_id,
     validate_version as validate_version_core, AppState,
@@ -916,6 +917,7 @@ impl DeployService for DeployServiceImpl {
         let mut expected_sha_hex: Option<String> = None;
         let mut temp_path: Option<PathBuf> = None;
         let mut file: Option<tokio::fs::File> = None;
+        let mut manifest_toml_from_stream: Option<String> = None;
 
         while let Some(item) = stream.next().await {
             let chunk = item.map_err(|e| Status::internal(e.to_string()))?;
@@ -1013,6 +1015,9 @@ impl DeployService for DeployServiceImpl {
                     ));
                 }
                 expected_sha_hex = Some(chunk.sha256_hex.clone());
+                if !chunk.manifest_toml.is_empty() {
+                    manifest_toml_from_stream = Some(chunk.manifest_toml.clone());
+                }
             }
         }
 
@@ -1066,6 +1071,30 @@ impl DeployService for DeployServiceImpl {
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(|e| Status::internal(e))?;
 
+        let rd_apply = release_dir.clone();
+        let sidecar2 = manifest_toml_from_stream;
+        let manifest_opt: Option<PirateManifest> = tokio::task::spawn_blocking(move || -> Result<Option<PirateManifest>, String> {
+            if let Some(raw) = sidecar2 {
+                if !raw.trim().is_empty() {
+                    let m = PirateManifest::parse(&raw).map_err(|e| e.to_string())?;
+                    process_manager::apply_sidecar_manifest(&rd_apply, &m)
+                        .map_err(|e| e.to_string())?;
+                    return Ok(Some(m));
+                }
+            }
+            let p = rd_apply.join("pirate.toml");
+            if p.is_file() {
+                let m = PirateManifest::read_file(&p).map_err(|e| e.to_string())?;
+                process_manager::apply_sidecar_manifest(&rd_apply, &m)
+                    .map_err(|e| e.to_string())?;
+                return Ok(Some(m));
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(Status::internal)?;
+
         info!(project = %project_key, version = %version, "artifact unpacked");
 
         let root = project_root.clone();
@@ -1087,10 +1116,22 @@ impl DeployService for DeployServiceImpl {
 
         match spawn_release(&root, &version, &bf).await {
             Ok(child) => {
+                let pid = child.id();
                 st.child = Some(child);
                 st.current_version = version.clone();
                 st.state = "running".to_string();
                 st.last_error = None;
+                if let Some(ref man) = manifest_opt {
+                    let port = man.health.port;
+                    let mut rs = process_manager::RuntimeState::default();
+                    rs.project_id = project_key.clone();
+                    rs.release_version = version.clone();
+                    rs.pid = pid;
+                    rs.port = port;
+                    rs.status = "running".to_string();
+                    rs.last_start_unix_ms = now_unix_ms();
+                    let _ = process_manager::write_runtime_state(&root, &rs);
+                }
                 info!(project = %project_key, version = %version, "deployed and started");
                 let cur = st.current_version.clone();
                 let state = st.state.clone();

@@ -1,0 +1,67 @@
+{
+    "version": 1,
+    "last_updated": "2026-04-12",
+    "domains_block": [
+      "doubleclick.net",
+      "googlesyndication.com",
+      "googleadservices.com",
+      "adservice.google.com",
+      "pagead2.googlesyndication.com",
+      "ad.doubleclick.net",
+  
+      "ads.yahoo.com",
+      "adserver.yahoo.com",
+  
+      "amazon-adsystem.com",
+      "aax.amazon-adsystem.com",
+  
+      "ads.facebook.com",
+      "connect.facebook.net",
+  
+      "ads.twitter.com",
+      "t.co",
+  
+      "ads.linkedin.com",
+  
+      "adroll.com",
+      "adsrvr.org",
+      "taboola.com",
+      "outbrain.com",
+  
+      "adsystem.com",
+      "advertising.com",
+      "adnxs.com",
+      "rubiconproject.com",
+      "openx.net",
+      "pubmatic.com",
+  
+      "scorecardresearch.com",
+      "quantserve.com",
+      "criteo.com",
+      "criteo.net",
+  
+      "zedo.com",
+      "adsafeprotected.com",
+  
+      "tracking.example.com"
+    ],
+    "domain_patterns_block": [
+      "*.doubleclick.net",
+      "*.googlesyndication.com",
+      "*.adservice.*",
+      "*.ads.*",
+      "*.adserver.*",
+      "*.tracking.*",
+      "*.track.*",
+      "*.analytics.*",
+      "*.banner.*"
+    ],
+    "ips_block": [
+      "172.217.0.0/16",
+      "142.250.0.0/15"
+    ],
+    "notes": {
+      "ips_warning": "IP ranges often belong to shared CDNs (Google, Amazon). Blocking may break legitimate content.",
+      "recommended": "Prefer domain-based filtering over IP filtering."
+    }
+  }

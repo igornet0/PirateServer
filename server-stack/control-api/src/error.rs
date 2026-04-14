@@ -64,6 +64,14 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: message.into(),
+        }
+    }
 }
 
 impl From<ControlError> for ApiError {

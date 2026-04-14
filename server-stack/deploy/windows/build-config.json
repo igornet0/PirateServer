@@ -1,0 +1,10 @@
+{
+  "copyFromUbuntu": [
+    { "src": "env.example", "dst": "." },
+    { "src": "Makefile", "dst": "." },
+    { "src": "nginx-pirate-site.conf", "dst": "nginx/" },
+    { "src": "nginx-pirate-site-domain.conf.in", "dst": "nginx/" },
+    { "src": "nginx-pirate-api-only.conf", "dst": "nginx/" },
+    { "src": "nginx-pirate-api-only-domain.conf.in", "dst": "nginx/" }
+  ]
+}

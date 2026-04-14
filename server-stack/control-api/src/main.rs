@@ -4,13 +4,15 @@ mod auth;
 mod cors;
 mod data_sources_api;
 mod error;
+mod proxy_sessions_api;
+mod proxy_tunnel_redis;
 
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use futures::Stream;
 use std::collections::HashMap;
@@ -37,7 +39,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 #[derive(Clone)]
-struct ApiState {
+pub(crate) struct ApiState {
     plane: Arc<ControlPlane>,
     nginx_config_path: Option<PathBuf>,
     nginx_test_full_config: bool,
@@ -62,6 +64,16 @@ struct ApiState {
     data_mounts_root: PathBuf,
     smb_mount_script: PathBuf,
     smb_umount_script: PathBuf,
+    /// Same Redis as deploy-server (`DEPLOY_REDIS_URL`) for per-session tunnel metrics in inbounds list.
+    tunnel_redis: Option<redis::Client>,
+    /// Base URL for subscription links (e.g. `https://dash.example.com`). Env: `DEPLOY_SUBSCRIPTION_PUBLIC_HOST` / `CONTROL_API_SUBSCRIPTION_PUBLIC_HOST`.
+    subscription_public_base: Option<String>,
+    /// Hostname extracted from `subscription_public_base` for Xray `outbound` address.
+    subscription_server_hostname: Option<String>,
+    /// Optional TLS SNI for Xray export (`DEPLOY_SUBSCRIPTION_TLS_SNI`).
+    subscription_tls_sni: Option<String>,
+    /// Same as deploy-server `DEPLOY_GRPC_PUBLIC_URL` — public gRPC URL for clients (bootstrap JSON, hints).
+    pub(crate) grpc_public_url: Option<String>,
 }
 
 /// Parse database URL and strip password for safe display (PostgreSQL; SQLite returned as-is).
@@ -235,7 +247,7 @@ struct HistoryQuery {
     project: Option<String>,
 }
 
-fn project_or_default(project: &str) -> String {
+pub(crate) fn project_or_default(project: &str) -> String {
     if project.trim().is_empty() {
         "default".to_string()
     } else {
@@ -254,6 +266,22 @@ async fn api_status(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+#[derive(serde::Serialize)]
+struct BootstrapHintsOut {
+    grpc_public_url: Option<String>,
+}
+
+/// Authenticated: exposes `DEPLOY_GRPC_PUBLIC_URL` for UI exports (e.g. Inbounds Copy JSON).
+async fn api_bootstrap_hints(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<BootstrapHintsOut>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(BootstrapHintsOut {
+        grpc_public_url: s.grpc_public_url.clone(),
+    }))
 }
 
 async fn api_database_info(
@@ -685,6 +713,14 @@ struct GrpcSessionEventView {
 }
 
 #[derive(serde::Serialize)]
+struct DisplayTopologyDisplayView {
+    index: u32,
+    label: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(serde::Serialize)]
 struct GrpcSessionPeerView {
     client_public_key_b64: String,
     last_seen_at: chrono::DateTime<chrono::Utc>,
@@ -697,6 +733,10 @@ struct GrpcSessionPeerView {
     last_gpu_percent: Option<f64>,
     proxy_bytes_in_total: u64,
     proxy_bytes_out_total: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    display_topology: Vec<DisplayTopologyDisplayView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_stream_capable: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -766,6 +806,33 @@ async fn api_grpc_sessions(
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
         let online = (now - r.last_created_at).num_seconds() <= online_secs;
+        let (display_topology, display_stream_capable) = match db
+            .fetch_peer_display_topology(&r.client_pubkey_b64)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+        {
+            None => (vec![], None),
+            Some((_ts, cap, json)) => {
+                #[derive(serde::Deserialize)]
+                struct Dj {
+                    index: u32,
+                    label: String,
+                    width: u32,
+                    height: u32,
+                }
+                let rows: Vec<Dj> = serde_json::from_str(&json).unwrap_or_default();
+                let dt: Vec<DisplayTopologyDisplayView> = rows
+                    .into_iter()
+                    .map(|x| DisplayTopologyDisplayView {
+                        index: x.index,
+                        label: x.label,
+                        width: x.width,
+                        height: x.height,
+                    })
+                    .collect();
+                (dt, Some(cap))
+            }
+        };
         peers.push(GrpcSessionPeerView {
             client_public_key_b64: r.client_pubkey_b64,
             last_seen_at: r.last_created_at,
@@ -778,6 +845,8 @@ async fn api_grpc_sessions(
             last_gpu_percent: snap.as_ref().and_then(|s| s.gpu_percent),
             proxy_bytes_in_total: bin,
             proxy_bytes_out_total: bout,
+            display_topology,
+            display_stream_capable,
         });
     }
     let server_benchmark = db
@@ -1214,6 +1283,39 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
+    let tunnel_redis = std::env::var("DEPLOY_REDIS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|url| redis::Client::open(url).ok());
+
+    let subscription_public_base = std::env::var("DEPLOY_SUBSCRIPTION_PUBLIC_HOST")
+        .or_else(|_| std::env::var("CONTROL_API_SUBSCRIPTION_PUBLIC_HOST"))
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+    let subscription_server_hostname = subscription_public_base.as_deref().and_then(|raw| {
+        if raw.contains("://") {
+            url::Url::parse(raw)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()))
+        } else {
+            raw.split('/')
+                .next()
+                .and_then(|h| h.split(':').next())
+                .map(|s| s.to_string())
+        }
+    });
+    let subscription_tls_sni = std::env::var("DEPLOY_SUBSCRIPTION_TLS_SNI")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let grpc_public_url = std::env::var("DEPLOY_GRPC_PUBLIC_URL")
+        .or_else(|_| std::env::var("CONTROL_API_GRPC_PUBLIC_URL"))
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+
     let state = ApiState {
         plane,
         nginx_config_path: args.nginx_config_path.clone(),
@@ -1231,6 +1333,11 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         data_mounts_root: args.data_mounts_root.clone(),
         smb_mount_script: args.smb_mount_script.clone(),
         smb_umount_script: args.smb_umount_script.clone(),
+        tunnel_redis,
+        subscription_public_base,
+        subscription_server_hostname,
+        subscription_tls_sni,
+        grpc_public_url,
     };
 
     let app = Router::new()
@@ -1265,6 +1372,32 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/projects", get(api_projects))
         .route("/api/v1/history", get(api_history))
         .route("/api/v1/grpc-sessions", get(api_grpc_sessions))
+        .route(
+            "/api/v1/proxy-sessions",
+            get(proxy_sessions_api::api_proxy_sessions_list)
+                .post(proxy_sessions_api::api_proxy_sessions_create),
+        )
+        .route(
+            "/api/v1/proxy-sessions/:id",
+            patch(proxy_sessions_api::api_proxy_sessions_patch),
+        )
+        .route(
+            "/api/v1/proxy-sessions/:id/revoke",
+            post(proxy_sessions_api::api_proxy_sessions_revoke),
+        )
+        .route(
+            "/api/v1/proxy-sessions/:id/xray-config",
+            get(proxy_sessions_api::api_proxy_session_xray_config),
+        )
+        .route(
+            "/api/v1/public/proxy-subscription/:token",
+            get(proxy_sessions_api::api_public_proxy_subscription),
+        )
+        .route(
+            "/api/v1/public/pirate-bootstrap/:token",
+            get(proxy_sessions_api::api_public_pirate_bootstrap),
+        )
+        .route("/api/v1/bootstrap-hints", get(api_bootstrap_hints))
         .route("/api/v1/database-info", get(api_database_info))
         .route("/api/v1/database/schemas", get(api_database_schemas))
         .route("/api/v1/database/tables", get(api_database_tables))

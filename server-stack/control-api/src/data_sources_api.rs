@@ -6,12 +6,30 @@ use axum::Json;
 use deploy_control::{DataSourceItemView, DataSourcesListView, SmbBrowseEntry, SmbBrowseView};
 use serde::Deserialize;
 use serde_json::json;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as FsPath, PathBuf};
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::ApiState;
+
+#[cfg(unix)]
+fn set_secret_file_permissions(path: &FsPath) -> std::io::Result<()> {
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(windows)]
+fn set_secret_file_permissions(_path: &FsPath) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn set_secret_file_permissions(_path: &FsPath) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[derive(Deserialize)]
 pub struct PostSmbBody {
@@ -166,11 +184,7 @@ pub async fn api_post_smb(
             std::fs::create_dir_all(parent).map_err(|e| ApiError::internal(e.to_string()))?;
             std::fs::write(&cred_path, cred_content.as_bytes())
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-            let mut perms = std::fs::metadata(&cred_path)
-                .map_err(|e| ApiError::internal(e.to_string()))?
-                .permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(&cred_path, perms).map_err(|e| ApiError::internal(e.to_string()))?;
+            set_secret_file_permissions(&cred_path).map_err(|e| ApiError::internal(e.to_string()))?;
 
             let out = std::process::Command::new("sudo")
                 .arg(mount_script.as_os_str())
@@ -301,11 +315,7 @@ pub async fn api_post_connection(
                     std::fs::create_dir_all(parent).map_err(|e| ApiError::internal(e.to_string()))?;
                     std::fs::write(&cred_path, pw.as_bytes())
                         .map_err(|e| ApiError::internal(e.to_string()))?;
-                    let mut perms = std::fs::metadata(&cred_path)
-                        .map_err(|e| ApiError::internal(e.to_string()))?
-                        .permissions();
-                    perms.set_mode(0o600);
-                    std::fs::set_permissions(&cred_path, perms)
+                    set_secret_file_permissions(&cred_path)
                         .map_err(|e| ApiError::internal(e.to_string()))?;
                     Ok(())
                 }

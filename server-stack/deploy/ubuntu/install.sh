@@ -17,6 +17,12 @@
 # Статистика хостов в дашборде: CONTROL_API_HOST_STATS_SERIES / CONTROL_API_HOST_STATS_STREAM; см. pirate_CONTROL_API_HOST_STATS_* в usage.
 # Явно задать домен: sudo pirate_DOMAIN=deploy.example.com ./install.sh  или  --domain deploy.example.com
 # Каталог: распакованный pirate-linux-amd64/ (рядом с bin/, share/, install.sh).
+# Состав бандла (см. scripts/linux-bundle-build.sh): bin/{deploy-server,control-api,client,pirate},
+#   systemd/*.service, nginx/*.conf*, lib/pirate/*.sh, share/ui/dist (если не .bundle-no-ui),
+#   server-stack-manifest.json, env.example.
+# Блок «GUI / трансляция»: сначала bin/pirate (или bin/client) gui-check из бандла, иначе pirate-gui-probe.sh;
+#   затем вопрос о display stream при gui_detected; см. PIRATE_DISPLAY_STREAM_CONSENT в /etc/pirate-deploy.env
+#   и /var/lib/pirate/host-gui-install.json.
 # После установки в PATH: client и pirate (симлинк на client) — gRPC CLI к deploy-server на этом хосте.
 # Если в каталоге есть .bundle-no-ui (архив собран с UI_BUILD=0), флаги --ui и pirate_UI=1 запрещены.
 
@@ -45,6 +51,7 @@ usage() {
   echo "  С --ui: пользователь дашборда — pirate_UI_ADMIN_USERNAME, pirate_UI_ADMIN_PASSWORD" >&2
   echo "  OTA server-stack: pirate_DEPLOY_ALLOW_SERVER_STACK_UPDATE=0|1 (без вопроса; иначе спросит в TTY)" >&2
   echo "  Статистика хостов (дашборд): pirate_CONTROL_API_HOST_STATS_SERIES=0|1, pirate_CONTROL_API_HOST_STATS_STREAM=0|1" >&2
+  echo "  Трансляция экрана: pirate_DISPLAY_STREAM_CONSENT=0|1 (без вопроса в TTY; иначе вопрос если bin/pirate gui-check дал gui_detected)" >&2
   echo "  Опционально: pirate_INSTALL_CIFS=1; pirate_INSTALL_POSTGRESQL=1; pirate_INSTALL_MYSQL=1;" >&2
   echo "    pirate_INSTALL_REDIS=1; pirate_INSTALL_MONGODB=1; pirate_INSTALL_MSSQL=1;" >&2
   echo "    pirate_INSTALL_CLICKHOUSE=1; pirate_INSTALL_ORACLE_NOTES=1 (установка СУБД на хост)." >&2
@@ -287,6 +294,84 @@ elif [[ -t 0 ]] && [[ "${pirate_NONINTERACTIVE:-}" != "1" ]]; then
   esac
 fi
 
+# GUI probe (для вопроса и для host-gui-install.json): приоритет bin/pirate gui-check → bin/client gui-check → pirate-gui-probe.sh.
+install_gui_probe_json_default='{"gui_detected":false,"reasons":[],"monitor_count":null}'
+INSTALL_GUI_PROBE_JSON="$install_gui_probe_json_default"
+
+_validate_install_gui_json_line() {
+  [[ -n "${1:-}" ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import json,sys; json.loads(sys.argv[1])" "$1" >/dev/null 2>&1
+  else
+    # До apt-get python3 может отсутствовать — грубая проверка одной строки JSON.
+    case "$1" in
+      \{*\"gui_detected\"*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+}
+
+_try_install_gui_check_bin() {
+  local _bin="$1"
+  [[ -f "$_bin" ]] || return 1
+  [[ -x "$_bin" ]] || chmod +x "$_bin" 2>/dev/null || true
+  [[ -x "$_bin" ]] || return 1
+  local _line
+  _line="$("$_bin" gui-check 2>/dev/null | tail -n 1)" || true
+  if _validate_install_gui_json_line "$_line"; then
+    INSTALL_GUI_PROBE_JSON="$_line"
+    return 0
+  fi
+  return 1
+}
+
+PROBE_SCRIPT="$SCRIPT_DIR/lib/pirate/pirate-gui-probe.sh"
+if [[ -f "$BIN_LOCAL/pirate" ]]; then
+  _try_install_gui_check_bin "$BIN_LOCAL/pirate" || true
+fi
+if [[ "$INSTALL_GUI_PROBE_JSON" == "$install_gui_probe_json_default" ]] && [[ -f "$BIN_LOCAL/client" ]]; then
+  _try_install_gui_check_bin "$BIN_LOCAL/client" || true
+fi
+if [[ "$INSTALL_GUI_PROBE_JSON" == "$install_gui_probe_json_default" ]]; then
+  if [[ -f "$PROBE_SCRIPT" ]]; then
+    _shell_line="$(bash "$PROBE_SCRIPT" 2>/dev/null | tail -n 1)"
+    if _validate_install_gui_json_line "$_shell_line"; then
+      INSTALL_GUI_PROBE_JSON="$_shell_line"
+    fi
+  fi
+fi
+
+PIRATE_DISPLAY_STREAM_CONSENT_VALUE="0"
+if [[ -n "${pirate_DISPLAY_STREAM_CONSENT:-}" ]]; then
+  case "${pirate_DISPLAY_STREAM_CONSENT,,}" in
+    1|true|yes|y) PIRATE_DISPLAY_STREAM_CONSENT_VALUE="1" ;;
+    0|false|no|n) PIRATE_DISPLAY_STREAM_CONSENT_VALUE="0" ;;
+    *)
+      echo "Ошибка: pirate_DISPLAY_STREAM_CONSENT — ожидается 0/1, true/false, yes/no, y/n." >&2
+      exit 1
+      ;;
+  esac
+elif [[ -t 0 ]] && [[ "${pirate_NONINTERACTIVE:-}" != "1" ]]; then
+  GUI_FLAG=0
+  if command -v python3 >/dev/null 2>&1; then
+    GUI_FLAG="$(python3 -c "import json,sys; print(1 if json.loads(sys.argv[1]).get('gui_detected') else 0)" "$INSTALL_GUI_PROBE_JSON" 2>/dev/null || echo 0)"
+  fi
+  if [[ "$GUI_FLAG" == "1" ]]; then
+    echo ""
+    read -r -p "Обнаружен графический рабочий стол. Разрешить клиентам трансляцию экрана (display stream) с этого хоста? [y/N]: " _ds_consent
+    _ds_consent="${_ds_consent#"${_ds_consent%%[![:space:]]*}"}"
+    _ds_consent="${_ds_consent%"${_ds_consent##*[![:space:]]}"}"
+    case "${_ds_consent,,}" in
+      y|yes|1|true|д|да) PIRATE_DISPLAY_STREAM_CONSENT_VALUE="1" ;;
+      ""|n|no|0|false) PIRATE_DISPLAY_STREAM_CONSENT_VALUE="0" ;;
+      *)
+        echo "Ошибка: введите y/да или n; пустой ввод — нет." >&2
+        exit 1
+        ;;
+    esac
+  fi
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 if [[ "$pirate_NGINX" == "1" ]]; then
@@ -446,6 +531,22 @@ touch /var/lib/pirate/deploy/deploy.db
 chown pirate:pirate /var/lib/pirate/deploy/deploy.db
 chmod 0640 /var/lib/pirate/deploy/deploy.db
 
+if command -v python3 >/dev/null 2>&1; then
+  echo "==> snapshot GUI / display-stream consent -> /var/lib/pirate/host-gui-install.json"
+  python3 -c 'import json,time,sys
+d=json.loads(sys.argv[1])
+d["display_stream_consent"]=int(sys.argv[2])
+d["ts_unix"]=int(time.time())
+path=sys.argv[3]
+with open(path, "w", encoding="utf-8") as f:
+    f.write(json.dumps(d))
+' "$INSTALL_GUI_PROBE_JSON" "$PIRATE_DISPLAY_STREAM_CONSENT_VALUE" /var/lib/pirate/host-gui-install.json
+  chown pirate:pirate /var/lib/pirate/host-gui-install.json
+  chmod 0644 /var/lib/pirate/host-gui-install.json
+else
+  echo "Предупреждение: python3 не найден — host-gui-install.json не записан (установите python3 или задайте pirate_DISPLAY_STREAM_CONSENT вручную)." >&2
+fi
+
 echo "==> /etc/pirate-deploy.env"
 DEPLOY_SQLITE_URL="sqlite:///var/lib/pirate/deploy/deploy.db"
 pirate_PUBLIC_IP=""
@@ -464,6 +565,7 @@ CONTROL_API_BIND=127.0.0.1
 DEPLOY_ALLOW_SERVER_STACK_UPDATE=${DEPLOY_ALLOW_SERVER_STACK_UPDATE_VALUE}
 CONTROL_API_HOST_STATS_SERIES=${CONTROL_API_HOST_STATS_SERIES_VALUE}
 CONTROL_API_HOST_STATS_STREAM=${CONTROL_API_HOST_STATS_STREAM_VALUE}
+PIRATE_DISPLAY_STREAM_CONSENT=${PIRATE_DISPLAY_STREAM_CONSENT_VALUE}
 EOF
   if [[ "$pirate_UI" == "1" ]]; then
     cat <<EOF

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Starts a minimal nginx master (for nginx -t / reload in control-api), then control-api.
-# Intended for docker-compose.nginx-e2e.yml only.
+# Intended for tests/docker/docker-compose.nginx-e2e.yml only.
 
 if [[ -d /data ]]; then
   chown -R deploy:deploy /data

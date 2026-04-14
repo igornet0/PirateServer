@@ -1,0 +1,95 @@
+{
+    "version": 1,
+    "last_updated": "2026-04-12",
+    "domains_our": [
+      "facebook.com",
+      "instagram.com",
+      "twitter.com",
+      "t.co",
+      "youtube.com",
+      "youtu.be",
+  
+      "telegram.org",
+      "web.telegram.org",
+      "api.telegram.org",
+  
+      "whatsapp.com",
+      "web.whatsapp.com",
+  
+      "signal.org",
+  
+      "snapchat.com",
+  
+      "roblox.com",
+  
+      "linkedin.com",
+  
+      "bbc.com",
+      "bbc.co.uk",
+  
+      "meduza.io",
+      "zona.media",
+      "istories.media",
+  
+      "kasparov.ru",
+      "grani.ru",
+  
+      "rutracker.org",
+  
+      "zerkalo.io"
+    ],
+    "domain_patterns_our": [
+      "*.facebook.com",
+      "*.instagram.com",
+      "*.twitter.com",
+      "*.youtube.com",
+      "*.googlevideo.com",
+  
+      "*.telegram.org",
+      "*.whatsapp.com",
+  
+      "*.bbc.*",
+  
+      "*.meduza.io",
+      "*.zona.media",
+  
+      "*.vpn.*",
+      "*.proxy.*"
+    ],
+    "ips_our": [
+      "31.13.64.0/18",
+      "157.240.0.0/16",
+      "149.154.160.0/20",
+      "91.108.4.0/22"
+    ],
+    "categories_our": {
+      "social": [
+        "facebook.com",
+        "instagram.com",
+        "twitter.com",
+        "snapchat.com"
+      ],
+      "messengers": [
+        "telegram.org",
+        "whatsapp.com",
+        "signal.org"
+      ],
+      "media": [
+        "bbc.com",
+        "meduza.io",
+        "zona.media"
+      ],
+      "torrent": [
+        "rutracker.org"
+      ],
+      "other": [
+        "roblox.com",
+        "linkedin.com"
+      ]
+    },
+    "notes": {
+      "important": "Russia uses DPI and DNS blocking; domains may be partially accessible or throttled.",
+      "ip_warning": "IP ranges overlap with shared infrastructure (Meta, Telegram). Blocking IP may break unrelated services.",
+      "dynamic": "List is incomplete and constantly changing."
+    }
+  }
