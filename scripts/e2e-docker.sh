@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run inside the e2e container (see docker-compose.test.yml) or invoke from host via scripts/run-docker-e2e.sh
+# Run inside the e2e container (see tests/docker/docker-compose.test.yml) or invoke from host via scripts/run-docker-e2e.sh
 set -euo pipefail
 
 API="${CONTROL_API_DIRECT:-http://control-api:8080}"

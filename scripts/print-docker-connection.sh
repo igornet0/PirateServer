@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Print connection bundle for the docker-compose.test.yml stack (after `up`).
+# Print connection bundle for the tests/docker/docker-compose.test.yml stack (after `up`).
 # Use from host: gRPC client, browser dashboard, optional direct control-api.
 set -euo pipefail
 
@@ -24,7 +24,7 @@ if [[ -n "${DOCKER_E2E_API_TOKEN:-}" ]]; then
   echo ""
 else
   echo "HTTP /api/v1/* has no Bearer requirement unless you start the stack with"
-  echo "  docker compose -f docker-compose.test.yml -f docker-compose.bearer-override.yml up -d"
+  echo "  docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.bearer-override.yml up -d"
   echo "  (set DOCKER_E2E_API_TOKEN in the environment or .env)."
   echo ""
 fi

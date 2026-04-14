@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-COMPOSE=(docker compose -f docker-compose.test.yml)
+COMPOSE=(docker compose -f tests/docker/docker-compose.test.yml)
 
 "${COMPOSE[@]}" up -d --build
 # shellcheck source=scripts/print-docker-connection.sh

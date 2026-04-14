@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run inside grpc-client-e2e (see docker-compose.grpc-client-e2e.yml): Pair, ProxyTunnel via board, signed deploys.
+# Run inside grpc-client-e2e (see tests/docker/docker-compose.grpc-client-e2e.yml): Pair, ProxyTunnel via board, signed deploys.
 set -euo pipefail
 
 GRPC="${GRPC_ENDPOINT:-http://deploy-server:50051}"

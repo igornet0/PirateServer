@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Optional: from the host, call `client status` against the published gRPC port (requires `client` on PATH).
-# Run after: docker compose -f docker-compose.test.yml up -d
+# Run after: docker compose -f tests/docker/docker-compose.test.yml up -d
 set -euo pipefail
 HOST="${DOCKER_E2E_HOST:-127.0.0.1}"
 PORT="${DOCKER_E2E_GRPC_PORT:-50051}"

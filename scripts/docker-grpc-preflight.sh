@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fail fast if nothing listens on HOST:PORT (gRPC from docker-compose.test.yml).
+# Fail fast if nothing listens on HOST:PORT (gRPC from tests/docker/docker-compose.test.yml).
 # Usage: scripts/docker-grpc-preflight.sh [HOST] [PORT]
 set -euo pipefail
 

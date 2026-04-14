@@ -43,7 +43,16 @@ else
   OUT_TGZ="$DIST_DIR/${OUT_PREFIX}-${REL}-${DATE_TAG}.tar.gz"
 fi
 
-rustup target add "$TARGET_TRIPLE" >/dev/null 2>&1 || true
+HOST_OS="$(uname -s)"
+LINUX_BUNDLE_HOST_BUILD="${LINUX_BUNDLE_HOST_BUILD:-0}"
+case "${LINUX_BUNDLE_HOST_BUILD,,}" in
+  1|true|yes|on) LINUX_BUNDLE_HOST_BUILD=1 ;;
+  *) LINUX_BUNDLE_HOST_BUILD=0 ;;
+esac
+
+if [[ "$HOST_OS" != "Darwin" || "$LINUX_BUNDLE_HOST_BUILD" == "1" ]]; then
+  rustup target add "$TARGET_TRIPLE" >/dev/null 2>&1 || true
+fi
 
 if [[ "$UI_BUILD" == "1" ]]; then
   echo "==> frontend (npm run build)"
@@ -61,7 +70,16 @@ else
 fi
 
 echo "==> Rust release ($TARGET_TRIPLE)"
-if command -v cargo-zigbuild >/dev/null 2>&1; then
+if [[ "$HOST_OS" == "Darwin" && "$LINUX_BUNDLE_HOST_BUILD" != "1" ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: on macOS, Docker is required to build this bundle (deploy-client links libxcb via xcap)." >&2
+    echo "      Install Docker Desktop, or set LINUX_BUNDLE_HOST_BUILD=1 to use cargo-zigbuild/cargo on the host (link may fail on -lxcb)." >&2
+    exit 1
+  fi
+  chmod +x "$REPO_ROOT/scripts/linux-bundle-build-rust-in-docker.sh" "$REPO_ROOT/scripts/linux-bundle-rust-docker-entry.sh" 2>/dev/null || true
+  REPO_ROOT="$REPO_ROOT" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+    "$REPO_ROOT/scripts/linux-bundle-build-rust-in-docker.sh" "$TARGET_TRIPLE"
+elif command -v cargo-zigbuild >/dev/null 2>&1; then
   cargo zigbuild --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client
 else
   echo "cargo-zigbuild not found; using cargo (install zig+cargo-zigbuild or cross for $TARGET_TRIPLE)"
