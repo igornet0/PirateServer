@@ -1,0 +1,42 @@
+[project]
+name = "test-project"
+
+[runtime]
+type = "node"
+version = "18"
+
+[build]
+cmd = "npm install && npm run build"
+
+[test]
+cmd = "npm test"
+
+[start]
+cmd = "npm start"
+
+[services]
+postgres = true
+redis = true
+
+[proxy]
+type = "nginx"
+port = 3000
+domain = ""
+
+[process]
+manager = "internal"
+restart = "on-fail"
+cpu_limit_percent = 100
+memory_limit_mb = 512
+
+[docker]
+enabled = true
+
+[env]
+NODE_ENV = "production"
+
+[health]
+kind = "http"
+path = "/"
+port = 3000
+timeout_ms = 5000
