@@ -19,6 +19,9 @@ pub mod settings;
 pub mod tls_profile;
 pub mod upload;
 pub mod proxy_test;
+pub mod project_control;
+pub mod local_pipeline;
+pub mod project_registry;
 
 /// Stable API for the desktop shell: local HTTP CONNECT proxy (`board`) and settings.
 pub mod internet_proxy {
@@ -40,10 +43,18 @@ pub mod internet_proxy {
 
 pub use bundle_inspect::{inspect_bundle_path, inspect_bundle_tar_gz, BundleProfile};
 pub use ops::{
-    build_chunks, build_server_stack_chunks, default_version, pack_directory, read_or_pack_bundle,
-    validate_version as validate_version_label,
+    build_chunks, build_chunks_with_manifest, build_server_stack_chunks, default_version,
+    pack_directory, read_or_pack_bundle, validate_version as validate_version_label,
 };
 pub use upload::{
-    deploy_directory, fetch_server_stack_info, upload_artifact, upload_server_stack_artifact,
-    upload_server_stack_artifact_with_progress, DeploySummary,
+    deploy_directory, fetch_server_stack_info, upload_artifact, upload_artifact_with_manifest,
+    upload_server_stack_artifact, upload_server_stack_artifact_with_progress, DeploySummary,
+};
+pub use project_control::{init_project, scan_project, ScanReport};
+pub use local_pipeline::{
+    apply_generated_files, ensure_dockerfile, run_build, run_test, test_local_docker, StepResult,
+};
+pub use project_registry::{
+    list_projects, register, register_from_pirate_toml_dir, remove as remove_project_registry,
+    resolve_path,
 };

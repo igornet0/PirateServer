@@ -67,7 +67,22 @@ pub fn build_chunks(
     sha256_hex: &str,
     chunk_size: usize,
 ) -> Vec<DeployChunk> {
+    build_chunks_with_manifest(bytes, version, project_id, sha256_hex, chunk_size, None, "tar_gz")
+}
+
+/// Same as [`build_chunks`], optional `pirate.toml` body on last chunk + artifact kind label.
+pub fn build_chunks_with_manifest(
+    bytes: &[u8],
+    version: &str,
+    project_id: &str,
+    sha256_hex: &str,
+    chunk_size: usize,
+    manifest_toml: Option<&str>,
+    artifact_kind: &str,
+) -> Vec<DeployChunk> {
     assert!(chunk_size > 0, "chunk_size must be > 0");
+    let man = manifest_toml.unwrap_or("");
+    let kind = artifact_kind.to_string();
     if bytes.is_empty() {
         return vec![DeployChunk {
             data: vec![],
@@ -75,6 +90,8 @@ pub fn build_chunks(
             is_last: true,
             sha256_hex: sha256_hex.to_string(),
             project_id: project_id.to_string(),
+            manifest_toml: man.to_string(),
+            artifact_kind: kind,
         }];
     }
     let mut out = Vec::new();
@@ -99,6 +116,16 @@ pub fn build_chunks(
             },
             project_id: if first {
                 project_id.to_string()
+            } else {
+                String::new()
+            },
+            manifest_toml: if is_last {
+                man.to_string()
+            } else {
+                String::new()
+            },
+            artifact_kind: if is_last {
+                kind.clone()
             } else {
                 String::new()
             },

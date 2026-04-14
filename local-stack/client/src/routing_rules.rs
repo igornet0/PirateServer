@@ -82,7 +82,7 @@ fn tunnel_decision_merged(
 /// Only `global.default_rules` JSON; board list fields ignored (not_ru_web still applies).
 fn tunnel_decision_bundles(
     host: &str,
-    board: &BoardConfig,
+    _board: &BoardConfig,
     global: &GlobalSettings,
     rules: Option<&CompiledDefaultRules>,
 ) -> Result<TunnelDecision, String> {

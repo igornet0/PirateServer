@@ -260,6 +260,98 @@ enum Commands {
         #[command(subcommand)]
         target: UninstallTarget,
     },
+    /// Create `pirate.toml` with auto-detected runtime (Node, Python, Go, …).
+    #[command(name = "init-project")]
+    InitProject {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Scan project markers and refresh `pirate.toml` (port/runtime hints).
+    #[command(name = "scan-project")]
+    ScanProject {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run `[build].cmd` from `pirate.toml` in the project directory.
+    #[command(name = "project-build")]
+    ProjectBuild {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Run `[test].cmd` from `pirate.toml`.
+    #[command(name = "project-test")]
+    ProjectTest {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Generate `Dockerfile` if missing, build image, run container, HTTP health check.
+    #[command(name = "test-local")]
+    TestLocal {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value = "pirate-local-test")]
+        image: String,
+    },
+    /// Write `run.sh`, `docker-compose.pirate.yml`, nginx snippet from `pirate.toml`.
+    #[command(name = "apply-gen")]
+    ApplyGen {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Run build/test/deploy using `[project].name` from the local registry (`pirate projects add`).
+    #[command(name = "project")]
+    Project {
+        /// Value of `[project].name` in `pirate.toml` (must match a registered project path).
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
+    /// Manage project name → path registry (under config dir: `pirate-projects.json`).
+    Projects {
+        #[command(subcommand)]
+        sub: ProjectsCmd,
+    },
+}
+
+/// Subcommands for `pirate project <NAME> …`
+#[derive(Subcommand, Debug)]
+enum ProjectCmd {
+    /// Run `[build].cmd` from the project's `pirate.toml`.
+    Build,
+    /// Run `[test].cmd`.
+    Test,
+    /// Pack directory and upload (same as `deploy` but resolved by project name).
+    Deploy {
+        /// Optional note for this deploy (saved under `.pirate/last-deploy-message.txt`).
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Release version label (same rules as `deploy --release`).
+        #[arg(long = "release")]
+        release: Option<String>,
+        #[arg(long, default_value_t = 64 * 1024)]
+        chunk_size: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectsCmd {
+    /// Register a directory: reads `pirate.toml` and stores `[project].name` → path.
+    Add {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Print registered names and paths as JSON.
+    List,
+    /// Remove a name from the registry (files on disk are untouched).
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1340,6 +1432,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!(
                         "If `pirate board` or similar is still running, stop it manually (no PID file is used)."
                     );
+                }
+            }
+            return Ok(());
+        }
+        Commands::InitProject { path, name } => {
+            let p = deploy_client::init_project(path.as_path(), name.as_deref())?;
+            println!("{}", p.display());
+            return Ok(());
+        }
+        Commands::ScanProject { path, dry_run } => {
+            let r = deploy_client::scan_project(path.as_path(), *dry_run)?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            return Ok(());
+        }
+        Commands::ProjectBuild { path } => {
+            let r = deploy_client::run_build(path.as_path())?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            if !r.ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Commands::ProjectTest { path } => {
+            let r = deploy_client::run_test(path.as_path())?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            if !r.ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Commands::TestLocal { path, image } => {
+            let r = deploy_client::test_local_docker(path.as_path(), image.as_str())?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            if !r.ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Commands::ApplyGen { path } => {
+            deploy_client::apply_generated_files(path.as_path())?;
+            println!("ok: generated run.sh / sidecars under {}", path.display());
+            return Ok(());
+        }
+        Commands::Project { name, cmd } => {
+            let root = deploy_client::resolve_path(name)?;
+            match cmd {
+                ProjectCmd::Build => {
+                    let r = deploy_client::run_build(root.as_path())?;
+                    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+                    if !r.ok {
+                        std::process::exit(1);
+                    }
+                }
+                ProjectCmd::Test => {
+                    let r = deploy_client::run_test(root.as_path())?;
+                    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+                    if !r.ok {
+                        std::process::exit(1);
+                    }
+                }
+                ProjectCmd::Deploy {
+                    message,
+                    release,
+                    chunk_size,
+                } => {
+                    if let Some(ref m) = message {
+                        eprintln!("deploy message: {}", m);
+                        let dir = root.join(".pirate");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(dir.join("last-deploy-message.txt"), m);
+                    }
+                    let endpoint = resolve_endpoint_normalized(&cli);
+                    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+                        eprintln!("endpoint must start with http:// or https://");
+                        std::process::exit(2);
+                    }
+                    let version = release.clone().unwrap_or_else(default_version);
+                    validate_version_label(&version)?;
+                    eprintln!("packing {} …", root.display());
+                    let sk = if use_signed_requests(&endpoint) {
+                        Some(load_or_create_identity()?)
+                    } else {
+                        None
+                    };
+                    let resp = deploy_directory(
+                        &endpoint,
+                        root.as_path(),
+                        &version,
+                        &cli.project,
+                        *chunk_size,
+                        sk.as_ref(),
+                    )
+                    .await?;
+                    println!(
+                        "status={} deployed_version={} bytes={} chunks={}",
+                        resp.response.status,
+                        resp.response.deployed_version,
+                        resp.artifact_bytes,
+                        resp.chunk_count
+                    );
+                }
+            }
+            return Ok(());
+        }
+        Commands::Projects { sub } => {
+            match sub {
+                ProjectsCmd::Add { path } => {
+                    let n = deploy_client::register_from_pirate_toml_dir(path.as_path())?;
+                    println!("registered: {}", n);
+                }
+                ProjectsCmd::List => {
+                    let m = deploy_client::list_projects()?;
+                    println!("{}", serde_json::to_string_pretty(&m).unwrap_or_default());
+                }
+                ProjectsCmd::Remove { name } => {
+                    if !deploy_client::remove_project_registry(name)? {
+                        eprintln!("no project named {:?} in registry", name);
+                        std::process::exit(1);
+                    }
                 }
             }
             return Ok(());

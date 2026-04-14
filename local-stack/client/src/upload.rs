@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::task::Poll;
 use tonic::Request;
 
-use crate::ops::{build_chunks, build_server_stack_chunks};
+use crate::ops::{build_chunks_with_manifest, build_server_stack_chunks};
 
 /// Stream a packed artifact to deploy-server. When `signing_key` is set, request is authenticated.
 pub async fn upload_artifact(
@@ -31,9 +31,41 @@ pub async fn upload_artifact(
     chunk_size: usize,
     signing_key: Option<&SigningKey>,
 ) -> Result<DeployResponse, tonic::Status> {
+    upload_artifact_with_manifest(
+        endpoint,
+        artifact,
+        version,
+        project_id,
+        chunk_size,
+        signing_key,
+        None,
+        "tar_gz",
+    )
+    .await
+}
+
+/// Same as [`upload_artifact`] with optional `pirate.toml` body on last chunk (UTF-8).
+pub async fn upload_artifact_with_manifest(
+    endpoint: &str,
+    artifact: &[u8],
+    version: &str,
+    project_id: &str,
+    chunk_size: usize,
+    signing_key: Option<&SigningKey>,
+    manifest_toml: Option<&str>,
+    artifact_kind: &str,
+) -> Result<DeployResponse, tonic::Status> {
     let digest = Sha256::digest(artifact);
     let sha256_hex = hex::encode(digest);
-    let chunks = build_chunks(artifact, version, project_id, &sha256_hex, chunk_size);
+    let chunks = build_chunks_with_manifest(
+        artifact,
+        version,
+        project_id,
+        &sha256_hex,
+        chunk_size,
+        manifest_toml,
+        artifact_kind,
+    );
 
     let mut client = DeployServiceClient::connect(endpoint.to_string())
         .await
@@ -50,6 +82,7 @@ pub async fn upload_artifact(
 }
 
 /// Pack directory, hash, upload. `dir` must exist and be a directory.
+/// If `pirate.toml` exists in `dir`, its contents are sent as `manifest_toml` on the last chunk.
 pub async fn deploy_directory(
     endpoint: &str,
     dir: &Path,
@@ -66,20 +99,31 @@ pub async fn deploy_directory(
     }
     crate::ops::validate_version(version).map_err(|e| e.to_string())?;
     deploy_core::validate_project_id(project_id).map_err(|e| e.to_string())?;
+    let manifest_path = dir.join("pirate.toml");
+    let manifest_toml = std::fs::read_to_string(&manifest_path).ok();
     let artifact = crate::ops::pack_directory(&dir).map_err(|e| e.to_string())?;
     let artifact_bytes = artifact.len() as u64;
     let cs = chunk_size.max(1);
     let chunk_count = (artifact.len() + cs - 1) / cs;
-    let response = upload_artifact(endpoint, &artifact, version, project_id, chunk_size, signing_key)
-        .await
-        .map_err(|s| {
-            let m = s.message();
-            if m.is_empty() {
-                format!("{s:?}")
-            } else {
-                m.to_string()
-            }
-        })?;
+    let response = upload_artifact_with_manifest(
+        endpoint,
+        &artifact,
+        version,
+        project_id,
+        chunk_size,
+        signing_key,
+        manifest_toml.as_deref(),
+        "tar_gz",
+    )
+    .await
+    .map_err(|s| {
+        let m = s.message();
+        if m.is_empty() {
+            format!("{s:?}")
+        } else {
+            m.to_string()
+        }
+    })?;
     Ok(DeploySummary {
         response,
         artifact_bytes,
