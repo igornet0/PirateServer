@@ -5,13 +5,19 @@ set -euo pipefail
 API="${CONTROL_API_DIRECT:-http://control-api:8080}"
 NGINX="${nginx_public:-http://nginx:80}"
 GRPC="${GRPC_ENDPOINT:-http://deploy-server:50051}"
+EXP_PUB="${E2E_EXPECT_CONTROL_API_PUBLIC:-http://nginx:80}"
+EXP_DIR="${E2E_EXPECT_CONTROL_API_DIRECT:-http://control-api:8080}"
 
 chmod +x /fixtures/minimal-app/run.sh 2>/dev/null || true
 
+# Prefer static bearer (bearer-override CI) over JWT from login.
+E2E_ACCESS_TOKEN=""
 curl_api() {
   local opts=(-sf)
   if [[ -n "${DOCKER_E2E_API_TOKEN:-}" ]]; then
     opts+=(-H "Authorization: Bearer ${DOCKER_E2E_API_TOKEN}")
+  elif [[ -n "${E2E_ACCESS_TOKEN:-}" ]]; then
+    opts+=(-H "Authorization: Bearer ${E2E_ACCESS_TOKEN}")
   fi
   curl "${opts[@]}" "$@"
 }
@@ -27,6 +33,40 @@ fi
 
 echo "==> health (direct control-api)"
 curl -sf "$API/health" | grep -q ok
+
+# JWT login (CONTROL_API_JWT_SECRET + seeded admin in Postgres). Skipped when using static DOCKER_E2E_API_TOKEN only.
+if [[ -z "${DOCKER_E2E_API_TOKEN:-}" ]]; then
+  echo "==> auth/login (direct) — JWT for subsequent /api/v1/* calls"
+  LOGIN_JSON=$(curl -sf -X POST "$API/api/v1/auth/login" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"testpass"}') || {
+    echo "login failed (check CONTROL_API_JWT_SECRET + deploy-server admin seed)"
+    exit 1
+  }
+  E2E_ACCESS_TOKEN=$(echo "$LOGIN_JSON" | jq -r '.access_token // empty')
+  if [[ -z "$E2E_ACCESS_TOKEN" || "$E2E_ACCESS_TOKEN" == "null" ]]; then
+    echo "$LOGIN_JSON"
+    echo "expected .access_token from login"
+    exit 1
+  fi
+  echo "==> auth/login (via nginx)"
+  NGX_LOGIN=$(curl -sf -X POST "$NGINX/api/v1/auth/login" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"testpass"}')
+  echo "$NGX_LOGIN" | jq -e --arg t "$E2E_ACCESS_TOKEN" '(.access_token == $t)' >/dev/null
+fi
+
+echo "==> grpc GetStatus — control_api_http_url / control_api_http_url_direct (desktop hints)"
+GRPC_ADDR="${GRPC#http://}"
+GRPC_ADDR="${GRPC_ADDR#https://}"
+GS=$(grpcurl -plaintext \
+  -import-path /proto \
+  -proto deploy.proto \
+  -d '{"projectId":"default"}' \
+  "$GRPC_ADDR" \
+  deploy.DeployService/GetStatus)
+echo "$GS" | jq -e --arg p "$EXP_PUB" --arg d "$EXP_DIR" \
+  '(.controlApiHttpUrl == $p) and (.controlApiHttpUrlDirect == $d)' >/dev/null
 
 echo "==> status (direct)"
 curl_api "$API/api/v1/status"

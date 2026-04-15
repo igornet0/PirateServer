@@ -49,6 +49,9 @@ services:
       DEPLOY_ALLOW_SERVER_STACK_UPDATE: "true"
       # Shown in dashboard “local client” JSON (host browser → published gRPC port).
       DEPLOY_GRPC_PUBLIC_URL: "http://127.0.0.1:${DOCKER_E2E_GRPC_PORT:-50051}"
+      # GetStatus: URLs for desktop / HTTP clients (inside the compose network).
+      DEPLOY_CONTROL_API_PUBLIC_URL: "http://nginx:80"
+      DEPLOY_CONTROL_API_DIRECT_URL: "http://control-api:8080"
       # Optional tunnel registry + admission (add a `redis` service and set DEPLOY_REDIS_URL):
       # DEPLOY_REDIS_URL: redis://redis:6379
       # DEPLOY_PROXY_MAX_CONCURRENT_TUNNELS: "32"
@@ -114,16 +117,22 @@ services:
   e2e:
     profiles:
       - e2e
-    image: pirate-test-runtime
+    build:
+      context: ../..
+      target: runtime-bench
+    image: pirate-test-runtime-bench
     pull_policy: never
     command: ["bash", "-lc", "bash /e2e/e2e-docker.sh"]
     volumes:
       - ../../scripts/e2e-docker.sh:/e2e/e2e-docker.sh:ro
       - ../../tests/fixtures:/fixtures:ro
+      - ../../proto:/proto:ro
     environment:
       - nginx_public=http://nginx:80
       - GRPC_ENDPOINT=http://deploy-server:50051
       - CONTROL_API_DIRECT=http://control-api:8080
+      - E2E_EXPECT_CONTROL_API_PUBLIC=http://nginx:80
+      - E2E_EXPECT_CONTROL_API_DIRECT=http://control-api:8080
       - DOCKER_E2E_API_TOKEN=${DOCKER_E2E_API_TOKEN-}
     depends_on:
       nginx:

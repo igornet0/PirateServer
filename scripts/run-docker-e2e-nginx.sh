@@ -8,6 +8,7 @@ COMPOSE=(docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/
 "${COMPOSE[@]}" up -d --build
 bash "${ROOT}/scripts/print-docker-connection.sh"
 "${COMPOSE[@]}" --profile e2e run --rm -e NGINX_E2E_TESTS=1 e2e
+bash "${ROOT}/scripts/e2e-docker-host-smoke.sh"
 
 if [[ "${1:-}" == "--down" ]]; then
   "${COMPOSE[@]}" down -v

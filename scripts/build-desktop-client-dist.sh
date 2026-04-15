@@ -202,6 +202,52 @@ bundle_linux_deb_dir() {
   echo "$CARGO_TARGET_DIR/$target/release/bundle/deb"
 }
 
+# Same `pirate` CLI as `cargo build -p deploy-client --bin pirate` (local-stack/client).
+pirate_cli_release_path() {
+  local target="$1"
+  if [[ "$target" == *-pc-windows-* ]]; then
+    echo "$CARGO_TARGET_DIR/$target/release/pirate.exe"
+  else
+    echo "$CARGO_TARGET_DIR/$target/release/pirate"
+  fi
+}
+
+build_pirate_cli_release() {
+  local target="$1"
+  echo "==> cargo build pirate CLI (deploy-client --bin pirate) target=$target"
+  echo "    diag: CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-<unset>} PROFILE=release (must match next tauri/cargo step)"
+  ( cd "$REPO_ROOT" && cargo build -p deploy-client --bin pirate --release --target "$target" )
+  local bin
+  bin="$(pirate_cli_release_path "$target")"
+  if [[ -f "$bin" ]]; then
+    echo "    diag: pirate CLI size $(wc -c <"$bin" | tr -d ' ') bytes at $bin"
+  else
+    echo "error: expected pirate binary missing: $bin" >&2
+    exit 1
+  fi
+}
+
+build_pirate_cli_release_win_cross() {
+  local target="$1"
+  echo "==> cargo xwin build pirate CLI (deploy-client --bin pirate) target=$target"
+  ( cd "$REPO_ROOT" && cargo xwin build -p deploy-client --bin pirate --release --target "$target" )
+}
+
+stage_bundle_extra_pirate_for_deb() {
+  local target="$1"
+  local extra="$DESKTOP_UI/src-tauri/bundle-extra"
+  local bin
+  bin="$(pirate_cli_release_path "$target")"
+  rm -rf "$extra"
+  mkdir -p "$extra"
+  cp -f "$bin" "$extra/pirate"
+  chmod +x "$extra/pirate"
+}
+
+cleanup_bundle_extra() {
+  rm -rf "$DESKTOP_UI/src-tauri/bundle-extra"
+}
+
 mkdir -p "$DIST_DIR"
 export VITE_APP_RELEASE="$REL"
 
@@ -214,8 +260,13 @@ case "$MODE" in
     TARGET="$(rust_triple_linux)"
     rustup_target_add "$TARGET"
     ensure_npm_deps
+    trap cleanup_bundle_extra EXIT
+    build_pirate_cli_release "$TARGET"
+    stage_bundle_extra_pirate_for_deb "$TARGET"
     echo "==> tauri build (deb) target=$TARGET version=$REL"
     run_tauri_build "$TARGET" --bundles deb
+    cleanup_bundle_extra
+    trap - EXIT
     DEB_DIR="$(bundle_linux_deb_dir "$TARGET")"
     DEB_PATH="$(find "$DEB_DIR" -maxdepth 1 -name '*.deb' -print | head -n 1 || true)"
     if [[ -z "$DEB_PATH" || ! -f "$DEB_PATH" ]]; then
@@ -226,6 +277,7 @@ case "$MODE" in
     rm -f "$OUT_TGZ"
     tar -czf "$OUT_TGZ" -C "$(dirname "$DEB_PATH")" "$(basename "$DEB_PATH")"
     echo "Done: $OUT_TGZ"
+    echo "note: after dpkg -i, PATH includes pirate (CLI) and pirate-client (Tauri)."
     ;;
 
   macos-tgz)
@@ -236,6 +288,7 @@ case "$MODE" in
     TARGET="$(rust_triple_mac)"
     rustup_target_add "$TARGET"
     ensure_npm_deps
+    build_pirate_cli_release "$TARGET"
     echo "==> tauri build (app) target=$TARGET version=$REL"
     run_tauri_build "$TARGET" --bundles app
     MAC_DIR="$(bundle_macos_app_dir "$TARGET")"
@@ -247,8 +300,17 @@ case "$MODE" in
     OUT_TGZ="$DIST_DIR/${DIST_ARTIFACT_PREFIX}-macos-${ARCH_N}-${REL}-${DATE_TAG}.tar.gz"
     rm -f "$OUT_TGZ"
     export COPYFILE_DISABLE=1
-    tar -czf "$OUT_TGZ" -C "$(dirname "$APP_PATH")" "$(basename "$APP_PATH")"
+    STAGE="$(mktemp -d "${TMPDIR:-/tmp}/pirate-client-macos-stage.XXXXXX")"
+    trap 'rm -rf "$STAGE"' EXIT
+    cp -R "$APP_PATH" "$STAGE/"
+    mkdir -p "$STAGE/bin"
+    cp -f "$(pirate_cli_release_path "$TARGET")" "$STAGE/bin/pirate"
+    chmod +x "$STAGE/bin/pirate"
+    tar -czf "$OUT_TGZ" -C "$STAGE" "$(basename "$APP_PATH")" bin
+    rm -rf "$STAGE"
+    trap - EXIT
     echo "Done: $OUT_TGZ"
+    echo "note: add bin/ to PATH (or symlink bin/pirate) to run pirate in the terminal."
     ;;
 
   macos-dmg)
@@ -259,6 +321,7 @@ case "$MODE" in
     TARGET="$(rust_triple_mac)"
     rustup_target_add "$TARGET"
     ensure_npm_deps
+    build_pirate_cli_release "$TARGET"
     echo "==> tauri build (dmg) target=$TARGET version=$REL"
     run_tauri_build "$TARGET" --bundles dmg
     DMG_DIR="$(bundle_macos_dmg_dir "$TARGET")"
@@ -278,11 +341,13 @@ case "$MODE" in
     rustup_target_add "$TARGET"
     ensure_npm_deps
     if is_windows_shell; then
+      build_pirate_cli_release "$TARGET"
       echo "==> tauri build (nsis → zip) target=$TARGET version=$REL"
       run_tauri_build "$TARGET" --bundles nsis
     elif host_unix_for_win_cross; then
-      echo "==> tauri cross-build (cargo-xwin + NSIS → zip) target=$TARGET version=$REL"
       prepare_windows_cross_nsis_build
+      build_pirate_cli_release_win_cross "$TARGET"
+      echo "==> tauri cross-build (cargo-xwin + NSIS → zip) target=$TARGET version=$REL"
       run_tauri_build_win_cross "$TARGET" --bundles nsis
     else
       echo "error: Windows installer ZIP — run on Windows, macOS, or Linux." >&2
@@ -290,6 +355,11 @@ case "$MODE" in
     fi
     OUT_ZIP="$DIST_DIR/${DIST_ARTIFACT_PREFIX}-windows-${ARCH_N}-${REL}-${DATE_TAG}.zip"
     package_win_nsis_or_exe_into_zip "$TARGET" "$OUT_ZIP"
+    PIRATE_WIN="$(pirate_cli_release_path "$TARGET")"
+    if [[ -f "$PIRATE_WIN" ]]; then
+      zip -uj "$OUT_ZIP" "$PIRATE_WIN"
+      echo "note: zip also contains pirate.exe (CLI); add its folder to PATH or copy next to the installer output."
+    fi
     echo "Done: $OUT_ZIP"
     ;;
 
@@ -298,6 +368,7 @@ case "$MODE" in
     rustup_target_add "$TARGET"
     ensure_npm_deps
     if is_windows_shell; then
+      build_pirate_cli_release "$TARGET"
       echo "==> tauri build (msi) target=$TARGET version=$REL"
       run_tauri_build "$TARGET" --bundles msi
       MSI_DIR="$(bundle_win_msi_dir "$TARGET")"
@@ -309,14 +380,25 @@ case "$MODE" in
       OUT_MSI="$DIST_DIR/${DIST_ARTIFACT_PREFIX}-windows-${ARCH_N}-${REL}-${DATE_TAG}.msi"
       rm -f "$OUT_MSI"
       cp -f "$MSI_SRC" "$OUT_MSI"
+      PIRATE_WIN="$(pirate_cli_release_path "$TARGET")"
+      if [[ -f "$PIRATE_WIN" ]]; then
+        OUT_PIRATE_EXE="$DIST_DIR/${DIST_ARTIFACT_PREFIX}-pirate-cli-windows-${ARCH_N}-${REL}-${DATE_TAG}.exe"
+        cp -f "$PIRATE_WIN" "$OUT_PIRATE_EXE"
+        echo "note: pirate CLI (for PATH): $OUT_PIRATE_EXE"
+      fi
       echo "Done: $OUT_MSI"
     elif host_unix_for_win_cross; then
       echo "note: WiX .msi is only produced on Windows (WiX Toolset)." >&2
       echo "      On this host we build the NSIS installer via cargo-xwin instead." >&2
       prepare_windows_cross_nsis_build
+      build_pirate_cli_release_win_cross "$TARGET"
       run_tauri_build_win_cross "$TARGET" --bundles nsis
       OUT_ZIP="$DIST_DIR/${DIST_ARTIFACT_PREFIX}-windows-${ARCH_N}-${REL}-${DATE_TAG}-nsis.zip"
       package_win_nsis_or_exe_into_zip "$TARGET" "$OUT_ZIP"
+      PIRATE_WIN="$(pirate_cli_release_path "$TARGET")"
+      if [[ -f "$PIRATE_WIN" ]]; then
+        zip -uj "$OUT_ZIP" "$PIRATE_WIN"
+      fi
       echo "Done (NSIS zip, not MSI): $OUT_ZIP"
     else
       echo "error: windows-msi — unsupported host OS" >&2
