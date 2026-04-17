@@ -1,6 +1,9 @@
 //! Shared deployment root layout, version validation, and [`AppState`] for the deploy service.
 
 pub mod display_stream;
+pub mod host_service_requirements;
+pub use host_service_requirements::required_host_service_ids;
+pub mod nginx_snippet;
 pub mod pirate_project;
 pub mod process_manager;
 pub mod sandbox;
@@ -272,7 +275,9 @@ CONTROL_UI_ADMIN_USERNAME=admin
 CONTROL_UI_ADMIN_PASSWORD=pw
 "#;
         assert!(pirate_deploy_env_dashboard_enabled(s));
-        assert!(!pirate_deploy_env_dashboard_enabled("CONTROL_API_JWT_SECRET=\nCONTROL_UI_ADMIN_USERNAME=a\nCONTROL_UI_ADMIN_PASSWORD=b"));
+        assert!(!pirate_deploy_env_dashboard_enabled(
+            "CONTROL_API_JWT_SECRET=\nCONTROL_UI_ADMIN_USERNAME=a\nCONTROL_UI_ADMIN_PASSWORD=b"
+        ));
     }
 
     #[test]
@@ -287,10 +292,8 @@ CONTROL_UI_ADMIN_PASSWORD=pw
     #[cfg(unix)]
     fn status_display_uses_symlink_over_idle_label() {
         use std::os::unix::fs::symlink;
-        let root = std::env::temp_dir().join(format!(
-            "deploy-core-status-test-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("deploy-core-status-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(releases_dir(&root).join("v9")).unwrap();
         symlink(Path::new("releases").join("v9"), root.join("current")).unwrap();

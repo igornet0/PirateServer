@@ -124,10 +124,8 @@ impl DisplayStreamConfig {
     /// `data:application/json;base64,<standard base64 JSON>`
     pub fn to_data_url(&self) -> Result<String, serde_json::Error> {
         let json = self.to_json_string()?;
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            json.as_bytes(),
-        );
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, json.as_bytes());
         Ok(format!("{DATA_URL_PREFIX}{b64}"))
     }
 
@@ -135,11 +133,9 @@ impl DisplayStreamConfig {
     pub fn from_data_url_or_json(s: &str) -> Result<Self, String> {
         let t = s.trim();
         if let Some(rest) = t.strip_prefix(DATA_URL_PREFIX) {
-            let bytes = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                rest.trim(),
-            )
-            .map_err(|e| e.to_string())?;
+            let bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, rest.trim())
+                    .map_err(|e| e.to_string())?;
             let json = String::from_utf8(bytes).map_err(|e| e.to_string())?;
             let c: Self = serde_json::from_str(&json).map_err(|e| e.to_string())?;
             c.validate()?;
