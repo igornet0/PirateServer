@@ -117,12 +117,13 @@ cp "$REPO_ROOT/server-stack/deploy/ubuntu/install.sh" "$STAGE/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/Makefile" "$STAGE/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/uninstall.sh" "$STAGE/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/purge-pirate-data.sh" "$STAGE/"
-cp "$REPO_ROOT/server-stack/deploy/ubuntu/pirate-apply-stack-bundle.sh" "$STAGE/lib/pirate/"
 shopt -s nullglob
-for _f in "$REPO_ROOT/server-stack/deploy/ubuntu"/pirate-smb-*.sh "$REPO_ROOT/server-stack/deploy/ubuntu"/install-*.sh; do
+# install-*.sh + remove-*.sh: pirate-host-service.sh dispatches install/remove; remove-* must ship or "remove node" fails with ENOENT.
+for _f in "$REPO_ROOT/server-stack/deploy/ubuntu"/pirate-*.sh "$REPO_ROOT/server-stack/deploy/ubuntu"/install-*.sh "$REPO_ROOT/server-stack/deploy/ubuntu"/remove-*.sh; do
   cp "$_f" "$STAGE/lib/pirate/"
 done
 shopt -u nullglob
+cp "$REPO_ROOT/server-stack/deploy/ubuntu/99-pirate-smb.sudoers.fragment" "$STAGE/lib/pirate/"
 
 chmod +x "$REPO_ROOT/scripts/write-server-stack-manifest.sh"
 "$REPO_ROOT/scripts/write-server-stack-manifest.sh" "$STAGE" "$TARGET_TRIPLE" "$REPO_ROOT" "$UI_BUILD"

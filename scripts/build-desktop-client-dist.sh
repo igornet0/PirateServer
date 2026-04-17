@@ -12,6 +12,12 @@
 #   WIN_EXE — Windows exe name for NSIS fallback zip (default: pirate-client.exe), e.g. deploy-dashboard-desktop.exe
 # Windows cross (Darwin/Linux): clang + cargo-xwin + NSIS (makensis). Real WiX .msi only on Windows;
 #   windows-msi on Unix builds NSIS → dist/<prefix>-windows-<arch>-<ver>-<date>-nsis.zip
+#   cargo-xwin defaults to clang-cl (/imsvc); we set XWIN_CROSS_COMPILER=clang before every cargo xwin
+#   so C deps (e.g. ring) that invoke plain clang get compatible -I flags (see scripts/windows-bundle-build.sh).
+#
+# Linux .deb (linux-tgz) on macOS: Docker runs the same build inside Linux (dpkg-deb / Tauri deb).
+#   Requires Docker; image: PIRATE_LINUX_DESKTOP_BUILD_IMAGE (default rust:bookworm).
+#   Disable: PIRATE_LINUX_BUILD_NO_DOCKER=1 (then you need a Linux host).
 #
 set -euo pipefail
 
@@ -114,11 +120,36 @@ ensure_makensis_for_win_cross() {
   exit 1
 }
 
+# tauri-winres embeds the Windows icon/manifest via a .rc file; on non-Windows hosts it uses llvm-rc.
+ensure_llvm_rc_for_win_cross() {
+  if command -v llvm-rc >/dev/null 2>&1; then
+    return 0
+  fi
+  local p
+  for p in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+    if [[ -x "$p/llvm-rc" ]]; then
+      export PATH="$p:$PATH"
+      return 0
+    fi
+  done
+  echo "error: llvm-rc not in PATH — required for Windows resources (tauri-winres) when cross-building." >&2
+  echo "  macOS: brew install llvm" >&2
+  echo "         then: export PATH=\"/opt/homebrew/opt/llvm/bin:\$PATH\"   # Apple Silicon" >&2
+  echo "               export PATH=\"/usr/local/opt/llvm/bin:\$PATH\"     # Intel" >&2
+  echo "  Linux: sudo apt install llvm  (or llvm-N; ensure llvm-rc is on PATH)" >&2
+  exit 1
+}
+
 prepare_windows_cross_nsis_build() {
   ensure_clang_for_client_win_cross
+  ensure_llvm_rc_for_win_cross
   rustup component add llvm-tools >/dev/null 2>&1 || true
   ensure_cargo_xwin_client
   ensure_makensis_for_win_cross
+  # cargo-xwin's default is clang-cl (MSVC /imsvc in CFLAGS). Crates like ring call plain `clang` for
+  # aarch64-pc-windows-msvc; `/imsvc` is only valid for clang-cl. Apply before *every* `cargo xwin`
+  # (pirate CLI build runs before tauri and previously missed this — ring failed with `/imsvc`).
+  export XWIN_CROSS_COMPILER="${XWIN_CROSS_COMPILER:-clang}"
 }
 
 run_tauri_build_win_cross() {
@@ -248,13 +279,84 @@ cleanup_bundle_extra() {
   rm -rf "$DESKTOP_UI/src-tauri/bundle-extra"
 }
 
+# Map host path under REPO_ROOT to /work/... for bind-mount builds.
+host_path_to_work() {
+  local abs="$1"
+  local root="$2"
+  if [[ "$abs" == "$root" ]]; then
+    echo "/work"
+    return 0
+  fi
+  if [[ "$abs" == "$root"/* ]]; then
+    echo "/work/${abs#$root/}"
+    return 0
+  fi
+  echo "error: path must be under REPO_ROOT ($root): $abs" >&2
+  return 1
+}
+
+# Container platform matches target ARCH (arm64 → linux/arm64, amd64 → linux/amd64).
+docker_linux_platform_for_arch() {
+  case "$ARCH_N" in
+    amd64) echo "linux/amd64" ;;
+    arm64) echo "linux/arm64" ;;
+  esac
+}
+
+# Run the Linux-native linux-tgz path inside Docker (macOS host).
+linux_tgz_via_docker() {
+  local platform image work_desktop host_desktop
+  platform="$(docker_linux_platform_for_arch)"
+  image="${PIRATE_LINUX_DESKTOP_BUILD_IMAGE:-rust:bookworm}"
+  host_desktop="${DESKTOP_UI:-$REPO_ROOT/local-stack/desktop-ui}"
+  work_desktop="$(host_path_to_work "$host_desktop" "$REPO_ROOT")" || exit 1
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: Linux .deb bundle on macOS needs Docker (install Docker Desktop, or build on Linux)." >&2
+    exit 1
+  fi
+
+  echo "==> Linux desktop build on macOS: Docker image=$image --platform=$platform (ARCH=$ARCH_N)"
+  docker run --rm -i \
+    --platform "$platform" \
+    -v "$REPO_ROOT:/work" \
+    -w /work \
+    -e ARCH="$ARCH_N" \
+    -e UI_BUILD="$UI_BUILD" \
+    -e CARGO_TARGET_DIR=/work/target \
+    -e DESKTOP_UI="$work_desktop" \
+    -e DIST_ARTIFACT_PREFIX="$DIST_ARTIFACT_PREFIX" \
+    -e WIN_EXE="$WIN_EXE" \
+    "$image" \
+    bash -s <<'DOCKER_BOOTSTRAP'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+  curl ca-certificates gnupg git \
+  libwebkit2gtk-4.1-dev build-essential wget file \
+  libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf \
+  libxdo-dev \
+  dpkg-dev \
+  pkg-config
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y --no-install-recommends nodejs
+chmod +x scripts/build-desktop-client-dist.sh scripts/read-version.sh
+./scripts/build-desktop-client-dist.sh linux-tgz
+DOCKER_BOOTSTRAP
+}
+
 mkdir -p "$DIST_DIR"
 export VITE_APP_RELEASE="$REL"
 
 case "$MODE" in
   linux-tgz)
+    if is_darwin && [[ -z "${PIRATE_LINUX_BUILD_NO_DOCKER:-}" ]]; then
+      linux_tgz_via_docker
+      exit 0
+    fi
     is_linux || {
-      echo "error: Linux .deb bundle — run on Linux (dpkg-deb / Tauri deb target)." >&2
+      echo "error: Linux .deb bundle — run on Linux (dpkg-deb / Tauri deb target), or on macOS with Docker (unset PIRATE_LINUX_BUILD_NO_DOCKER)." >&2
       exit 1
     }
     TARGET="$(rust_triple_linux)"
@@ -348,7 +450,9 @@ case "$MODE" in
       prepare_windows_cross_nsis_build
       build_pirate_cli_release_win_cross "$TARGET"
       echo "==> tauri cross-build (cargo-xwin + NSIS → zip) target=$TARGET version=$REL"
-      run_tauri_build_win_cross "$TARGET" --bundles nsis
+      # Do not pass --bundles nsis: on macOS/Linux the CLI only lists host bundle kinds (ios/app/dmg or deb/appimage)
+      # and rejects nsis before applying --target. Default bundle set for a Windows target still produces NSIS.
+      run_tauri_build_win_cross "$TARGET"
     else
       echo "error: Windows installer ZIP — run on Windows, macOS, or Linux." >&2
       exit 1
@@ -392,7 +496,7 @@ case "$MODE" in
       echo "      On this host we build the NSIS installer via cargo-xwin instead." >&2
       prepare_windows_cross_nsis_build
       build_pirate_cli_release_win_cross "$TARGET"
-      run_tauri_build_win_cross "$TARGET" --bundles nsis
+      run_tauri_build_win_cross "$TARGET"
       OUT_ZIP="$DIST_DIR/${DIST_ARTIFACT_PREFIX}-windows-${ARCH_N}-${REL}-${DATE_TAG}-nsis.zip"
       package_win_nsis_or_exe_into_zip "$TARGET" "$OUT_ZIP"
       PIRATE_WIN="$(pirate_cli_release_path "$TARGET")"
