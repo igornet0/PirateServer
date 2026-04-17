@@ -9,6 +9,8 @@ COPY proto proto
 COPY wire-protocol wire-protocol
 COPY server-stack/server server-stack/server
 COPY server-stack/control-api server-stack/control-api
+# control-api embeds server-stack/deploy/ubuntu/env.example (include_str! in main.rs).
+COPY server-stack/deploy server-stack/deploy
 COPY server-stack/deploy-auth server-stack/deploy-auth
 COPY server-stack/deploy-control server-stack/deploy-control
 COPY server-stack/deploy-db server-stack/deploy-db

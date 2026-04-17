@@ -1,7 +1,7 @@
 # PirateServer / deploy workspace — build, install artifacts, test.
 # Usage: `make` or `make help`
 
-.PHONY: help all build build-release check test test-unit test-e2e protocol-bench redis-tunnel-docker protocol-load protocol-fuzz protocol-soak protocol-abuse clippy fmt clean \
+.PHONY: help all build build-release check test test-unit test-e2e test-anti-ddos protocol-bench redis-tunnel-docker protocol-load protocol-fuzz protocol-soak protocol-abuse clippy fmt clean \
 	client client-release pirate pirate-release server server-release control-api control-api-release \
 	local-agent local-agent-release \
 	rust rust-release frontend frontend-install ui \
@@ -14,7 +14,7 @@
 	dist-desktop-linux dist-desktop-macos dist-desktop-macos-dmg dist-desktop-windows \
 	install install-release dist-server \
 	bootstrap bootstrap-phase6 e2e local-e2e docker-client-help build-desktop-ui \
-	test-dist-arm64-docker-install up-version
+	test-dist-arm64-docker-install up-version server-stack-ota server-stack-ota-upload
 
 CARGO       ?= cargo
 NPM         ?= npm
@@ -52,6 +52,8 @@ help:
 	@echo "Bundles:\n -Server stack:"
 	@echo "  make dist                                                     - rust-release + frontend + dist/release-manifest.json (see VERSION)"
 	@echo "  make dist-linux [ARCH=amd64|arm64] [UI_BUILD=1]               - Linux tar.gz (pirate-linux-<ARCH>-<VERSION>-<date>.tar.gz)"
+	@echo "  make server-stack-ota DEPLOY_URL=http://host:50051 [ARCH=arm64] [UI_BUILD=0]  - dist-linux + pirate update (OTA)"
+	@echo "  make server-stack-ota-upload DEPLOY_URL=...  — same upload, skip rebuild (use newest dist/*.tar.gz)"
 	@echo "    macOS: uses Docker (rust:bookworm) for Rust link; LINUX_BUNDLE_HOST_BUILD=1 forces host cargo/zigbuild"
 	@echo "  make dist-macos [ARCH=amd64|arm64] [UI_BUILD=1]               - macOS tar.gz (pirate-macos-<ARCH>-<VERSION>-<date>.tar.gz)"
 	@echo "  make dist-macos-dmg [ARCH=amd64|arm64] [UI_BUILD=1]           - macOS DMG (pirate-macos-<ARCH>-<VERSION>-<date>.dmg)"
@@ -59,14 +61,14 @@ help:
 	@echo "  make dist-only-windows                                         - all server Windows zips (amd64/arm64 × UI_BUILD 1/0); no server MSI"
 	@echo "  make dist-windows-msi [ARCH=amd64|arm64] [UI_BUILD=1]         - server MSI: not implemented (use dist-windows); desktop MSI: dist-client-windows-msi"
 	@echo "Bundles:\n -Client stack:"
-	@echo "  make dist-client-linux [ARCH=amd64|arm64] [UI_BUILD=1]        - Linux bundle (pirate-client-linux-<ARCH>-<VERSION>-<date>.tar.gz)"
+	@echo "  make dist-client-linux [ARCH=amd64|arm64] [UI_BUILD=1]        - Linux bundle (pirate-client-linux-<ARCH>-<VERSION>-<date>.tar.gz; macOS: Docker)"
 	@echo "  make dist-client-macos [ARCH=amd64|arm64] [UI_BUILD=1]        - macOS bundle (pirate-client-macos-<ARCH>-<VERSION>-<date>.tar.gz)"
 	@echo "  make dist-client-macos-dmg [ARCH=amd64|arm64] [UI_BUILD=1]    - macOS DMG (pirate-client-macos-<ARCH>-<VERSION>-<date>.dmg)"
 	@echo "  make dist-client-windows [ARCH=amd64|arm64] [UI_BUILD=1]      - Windows bundle (pirate-client-windows-<ARCH>-<VERSION>-<date>.zip)"
 	@echo "  make dist-client-windows-msi [ARCH=amd64|arm64] [UI_BUILD=1]  - Windows: WiX MSI (.msi); macOS/Linux: NSIS cross → *-nsis.zip (clang + cargo-xwin + makensis)"
 	@echo "  note: UI_BUILD=0 — без статики дашборда, архив с .bundle-no-ui (установка UI недоступна)"
 	@echo "Bundles:\n -Deploy dashboard desktop (server-stack/desktop-ui Tauri):"
-	@echo "  make dist-desktop-linux [ARCH=amd64|arm64] [UI_BUILD=1]       - Linux (deploy-dashboard-desktop-linux-<ARCH>-<VERSION>-<date>.tar.gz; .deb inside; host: Linux)"
+	@echo "  make dist-desktop-linux [ARCH=amd64|arm64] [UI_BUILD=1]       - Linux (deploy-dashboard-desktop-linux-<ARCH>-<VERSION>-<date>.tar.gz; .deb inside; host: Linux or macOS+Docker)"
 	@echo "  make dist-desktop-macos [ARCH=amd64|arm64] [UI_BUILD=1]       - macOS app tarball (deploy-dashboard-desktop-macos-<ARCH>-<VERSION>-<date>.tar.gz; host: macOS)"
 	@echo "  make dist-desktop-macos-dmg [ARCH=amd64|arm64] [UI_BUILD=1]   - macOS DMG (deploy-dashboard-desktop-macos-<ARCH>-<VERSION>-<date>.dmg; host: macOS)"
 	@echo "  make dist-desktop-windows [ARCH=amd64|arm64] [UI_BUILD=1]     - Windows zip (deploy-dashboard-desktop-windows-<ARCH>-<VERSION>-<date>.zip)"
@@ -101,6 +103,7 @@ help:
 	@echo "  make test           - unit tests (cargo) + E2E script"
 	@echo "  make test-unit      - cargo test --workspace"
 	@echo "  make test-e2e | e2e | local-e2e - scripts/local-e2e.sh"
+	@echo "  make test-anti-ddos URL=http://host - L7 Anti-DDoS harness (burst/constant/concurrency/slow; scripts/test-anti-ddos.sh)"
 	@echo "  make protocol-bench - Docker: gRPC + ProxyTunnel/wire throughput + security matrix (see scripts/run-protocol-bench.sh)"
 	@echo "  make redis-tunnel-docker - Docker: Redis + DEPLOY_REDIS_URL + metrics + ProxyTunnel smoke (scripts/run-redis-tunnel-docker-tests.sh)"
 	@echo "  make protocol-load  - Docker: latency p50/p95/p99 + RPS burst + /metrics (scripts/run-protocol-load.sh)"
@@ -223,6 +226,18 @@ dist-manifest:
 dist-linux:
 	@chmod +x scripts/build-linux-bundle.sh scripts/linux-bundle-build.sh scripts/linux-bundle-build-rust-in-docker.sh scripts/linux-bundle-rust-docker-entry.sh scripts/read-version.sh scripts/write-server-stack-manifest.sh
 	UI_BUILD=$(UI_BUILD) ARCH=$(ARCH) ./scripts/build-linux-bundle.sh
+
+# Build Linux server bundle and push to deploy-server (gRPC URL). Requires network to DEPLOY_URL.
+# Example: make server-stack-ota DEPLOY_URL=http://192.168.0.30:50051 ARCH=arm64 UI_BUILD=0
+server-stack-ota: dist-linux
+	@chmod +x scripts/pirate-server-stack-update.sh
+	@test -n "$(DEPLOY_URL)" || (echo "Set DEPLOY_URL, e.g. DEPLOY_URL=http://192.168.0.30:50051" >&2; exit 1)
+	ARCH="$(ARCH)" ./scripts/pirate-server-stack-update.sh "$(DEPLOY_URL)"
+
+server-stack-ota-upload:
+	@chmod +x scripts/pirate-server-stack-update.sh
+	@test -n "$(DEPLOY_URL)" || (echo "Set DEPLOY_URL, e.g. DEPLOY_URL=http://192.168.0.30:50051" >&2; exit 1)
+	ARCH="$(ARCH)" ./scripts/pirate-server-stack-update.sh "$(DEPLOY_URL)"
 
 dist-macos:
 	@chmod +x scripts/macos-bundle-build.sh scripts/read-version.sh scripts/write-server-stack-manifest.sh
@@ -451,6 +466,15 @@ local-e2e:
 
 
 test: test-unit test-e2e
+
+# L7 Anti-DDoS harness (curl + hey/wrk/ab when available). Публичные хосты: CONFIRM_PUBLIC=yes.
+#   make test-anti-ddos URL=http://192.168.0.30
+#   make test-anti-ddos URL=https://example.com CONFIRM_PUBLIC=yes INSECURE=1
+#   REPORT_JSON=/tmp/report.json make test-anti-ddos URL=http://127.0.0.1:8080
+test-anti-ddos:
+	@chmod +x scripts/test-anti-ddos.sh 2>/dev/null || true
+	@if [ -z "$(strip $(URL))" ]; then echo "Usage: make test-anti-ddos URL=http://host[:port]   (optional: PATH_SUFFIX BURST_N BURST_CONC CONSTANT_RPS DURATION_SEC HIGH_CONCURRENCY HIGH_DURATION_SEC CONFIRM_PUBLIC REPORT_JSON SKIP_INSTALL FORCE_CURL)"; exit 1; fi
+	@URL="$(URL)" PATH_SUFFIX="$(PATH_SUFFIX)" PARALLEL="$(PARALLEL)" BURST_N="$(BURST_N)" BURST_CONC="$(BURST_CONC)" CONSTANT_RPS="$(CONSTANT_RPS)" DURATION_SEC="$(DURATION_SEC)" HIGH_CONCURRENCY="$(HIGH_CONCURRENCY)" HIGH_DURATION_SEC="$(HIGH_DURATION_SEC)" SLOW_CONNECTIONS="$(SLOW_CONNECTIONS)" INSECURE="$(INSECURE)" SKIP_SLOW="$(SKIP_SLOW)" CONFIRM_PUBLIC="$(CONFIRM_PUBLIC)" REPORT_JSON="$(REPORT_JSON)" SKIP_INSTALL="$(SKIP_INSTALL)" FORCE_CURL="$(FORCE_CURL)" ./scripts/test-anti-ddos.sh
 
 # --- Quality ---
 

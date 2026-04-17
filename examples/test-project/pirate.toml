@@ -1,27 +1,68 @@
 [project]
 name = "test-project"
+version = "0.1.2"
+deploy_project_id = "p-e0270a56f7d34d3c9f8899135ee34a08"
 
 [runtime]
-type = "node"
+type = "docker"
 version = "18"
 
 [build]
-cmd = "npm install && npm run build"
+cmd = "rm -rf .release && mkdir -p .release && cp index.html styles.css server.mjs package.json .release/ && npm install --omit=dev --prefix .release"
+output_path = ".release"
+output_paths = []
 
 [test]
 cmd = "npm test"
+output_path = ""
+output_paths = []
 
 [start]
-cmd = "npm start"
+# Build output lives under `.release/` (see [build].output_path); process cwd is the release root.
+cmd = "cd .release && npm start"
+output_path = ""
+output_paths = []
+
+# Require Node.js on the deploy host (inventory / «Сервисы»), not only inside the Docker image.
+[services.server]
+node = "latest"
 
 [services]
-postgres = true
-redis = true
+postgres = false
+redis = false
+mysql = false
+mongodb = false
+
+[services.web]
+type = "http"
+port = 3000
+source = "Dockerfile:EXPOSE"
+confidence = 0.8999999761581421
 
 [proxy]
 type = "nginx"
 port = 3000
 domain = ""
+enabled = false
+backend = ""
+
+[network]
+mode = "private"
+
+[network.access]
+allowed_ips = []
+public = false
+domain = ""
+
+[network.tls]
+https = false
+provider = "letsencrypt"
+email = ""
+auto_renew = true
+
+[network.firewall]
+managed = false
+open_ports = []
 
 [process]
 manager = "internal"

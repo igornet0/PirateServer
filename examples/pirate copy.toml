@@ -1,0 +1,48 @@
+[project]
+name = "test-project"
+version = "0.1.0"
+deploy_project_id = "p-e0270a56f7d34d3c9f8899135ee34a08"
+
+[runtime]
+type = "docker"
+version = "18"
+
+[build]
+cmd = "rm -rf .release && mkdir -p .release && cp index.html styles.css server.mjs package.json .release/ && npm install --omit=dev --prefix .release"
+output_path = ".release"
+
+[test]
+cmd = "npm test"
+
+[start]
+cmd = "npm start"
+
+[services]
+postgres = false
+redis = false
+mysql = false
+mongodb = false
+
+[proxy]
+type = "nginx"
+nginx_conf_path = "./pirate-nginx-snippet.conf"
+port = 3000
+domain = ""
+
+[process]
+manager = "internal"
+restart = "on-fail"
+cpu_limit_percent = 100
+memory_limit_mb = 512
+
+[docker]
+enabled = true
+
+[env]
+NODE_ENV = "production"
+
+[health]
+kind = "http"
+path = "/"
+port = 3000
+timeout_ms = 5000

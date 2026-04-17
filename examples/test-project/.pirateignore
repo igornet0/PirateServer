@@ -1,0 +1,8 @@
+node_modules/
+Dockerfile
+Makefile
+package-lock.json
+pirate-nginx-snippet.conf
+run.sh
+*.log
+.git/
