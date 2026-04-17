@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "PirateClient",
-        "width": 800,
-        "height": 600,
+        "width": 1200,
+        "height": 800,
         "resizable": true
       }
     ],
@@ -32,6 +32,16 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": [
+      "bundled/cli/pirate"
+    ],
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/bin/pirate": "bundle-extra/pirate"
+        }
+      }
+    }
   }
 }

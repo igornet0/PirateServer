@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
   AlertCircle,
+  ChevronDown,
+  ChevronUp,
   Cpu,
   Flame,
   HardDrive,
@@ -17,6 +19,8 @@ import {
   type HostStatsSnapshot,
 } from "./host-stats-types";
 import { NetworkHostSeriesModal } from "./NetworkHostSeriesModal";
+import { useI18n } from "./i18n";
+import { ModalDialog } from "./ui/ModalDialog";
 
 const btnBase =
   "inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050204] active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50";
@@ -85,7 +89,7 @@ function memoryUsagePct(data: HostStatsSnapshot): number {
 
 function statusRing(s: StatusLevel): string {
   if (s === "crit") return "ring-rose-500/50 border-rose-700/40 bg-rose-950/25";
-  if (s === "warn") return "ring-amber-500/40 border-amber-700/35 bg-amber-950/20";
+  if (s === "warn") return "ring-red-600/35 border-red-800/35 bg-red-950/22";
   return "ring-emerald-500/30 border-white/10 bg-black/20";
 }
 
@@ -96,7 +100,7 @@ function ProgressBarMini({ ratio }: { ratio: number }) {
   return (
     <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-black/30">
       <div
-        className="h-full rounded-full bg-gradient-to-r from-red-700 via-amber-600 to-red-600"
+        className="h-full rounded-full bg-gradient-to-r from-red-800 via-orange-600 to-red-700"
         style={{ width: `${w}%` }}
       />
     </div>
@@ -121,6 +125,9 @@ export function HostMetricsPanel({
   endpoint: string | null;
   seriesBaseUrl: string | null;
 }) {
+  const { language, t } = useI18n();
+  const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
+    const [metricsExpanded, setMetricsExpanded] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailTitle, setDetailTitle] = useState("");
   const [detailLoading, setDetailLoading] = useState(false);
@@ -152,14 +159,17 @@ export function HostMetricsPanel({
   }, []);
 
   const openTempSnapshot = useCallback((m: HostStatsSnapshot) => {
-    setDetailTitle("Temperature");
+    setDetailTitle(t("auto.HostMetricsPanel_tsx.1"));
     setDetailOpen(true);
     setDetailErr(null);
     setDetailBody({
       temperature_current_celsius: m.temperature_current_celsius,
       temperature_avg_celsius: m.temperature_avg_celsius,
       note:
-        "Snapshot from GetHostStats. History charts (CONTROL_API_HOST_STATS_SERIES) and live stream (CONTROL_API_HOST_STATS_STREAM) are served by control-api HTTP, not this gRPC client.",
+        tr(
+          "Снимок из GetHostStats. Исторические графики (CONTROL_API_HOST_STATS_SERIES) и live stream (CONTROL_API_HOST_STATS_STREAM) отдаются по HTTP control-api, не через этот gRPC клиент.",
+          "Snapshot from GetHostStats. History charts (CONTROL_API_HOST_STATS_SERIES) and live stream (CONTROL_API_HOST_STATS_STREAM) are served by control-api HTTP, not this gRPC client.",
+        ),
     });
     setDetailLoading(false);
   }, []);
@@ -182,12 +192,12 @@ export function HostMetricsPanel({
         processes: HOST_STATS_DETAIL_KIND.PROCESSES,
       };
       const titles: Record<CardKind, string> = {
-        cpu: "CPU detail",
-        memory: "Memory detail",
-        disk: "Disk detail",
-        network: "Network detail",
-        processes: "Processes",
-        temp: "Temperature",
+        cpu: t("auto.HostMetricsPanel_tsx.2"),
+        memory: t("auto.HostMetricsPanel_tsx.3"),
+        disk: t("auto.HostMetricsPanel_tsx.4"),
+        network: t("auto.HostMetricsPanel_tsx.5"),
+        processes: t("auto.HostMetricsPanel_tsx.6"),
+        temp: t("auto.HostMetricsPanel_tsx.7"),
       };
       void openDetailGrpc(titles[k], map[k as Exclude<CardKind, "temp" | "network">]);
     },
@@ -213,49 +223,74 @@ export function HostMetricsPanel({
       >
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <h2 id="metrics-heading" className="text-lg font-semibold text-slate-100">
-            Remote host metrics
+            {t("auto.HostMetricsPanel_tsx.8")}
           </h2>
-          <button
-            type="button"
-            disabled={metricsLoading || !endpoint}
-            onClick={() => onLoad()}
-            className={`${btnBase} bg-gradient-to-r from-amber-700 to-red-700 text-sm text-white shadow-md shadow-red-950/30 hover:brightness-110 disabled:opacity-40`}
-          >
-            {metricsLoading ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Activity className="h-4 w-4" />
-            )}
-            Load / refresh
-          </button>
-        </div>
-        <p className="mb-3 text-xs text-slate-500">
-          Overview from <code className="text-amber-200/80">GetHostStats</code>; click a card for{" "}
-          <code className="text-amber-200/80">GetHostStatsDetail</code>. Series/stream env vars apply to
-          control-api HTTP, not gRPC.
-        </p>
-        {useMockMetrics && metrics ? (
-          <p className="mb-3 text-xs text-amber-300/90">Showing demo data (connection error or no server).</p>
-        ) : null}
-        {metricsErr && !useMockMetrics ? (
-          <p className="mb-3 flex items-center gap-2 text-sm text-rose-300">
-            <AlertCircle className="h-4 w-4 shrink-0" />
-            {metricsErr}
-          </p>
-        ) : null}
-
-        {metricsLoading ? (
-          <div className="grid gap-4 sm:grid-cols-2" aria-busy="true">
-            {[1, 2, 3, 4, 5, 6].map((i) => (
-              <div
-                key={i}
-                className="relative h-36 animate-pulse rounded-2xl border border-white/10 bg-black/20"
-              />
-            ))}
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={metricsLoading || !endpoint}
+              onClick={() => onLoad()}
+              className={`${btnBase} bg-gradient-to-r from-red-800 to-red-900 text-sm text-white shadow-md shadow-red-950/30 hover:brightness-110 disabled:opacity-40`}
+            >
+              {metricsLoading ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Activity className="h-4 w-4" />
+              )}
+              {t("auto.HostMetricsPanel_tsx.9")}
+            </button>
+            <button
+              type="button"
+              onClick={() => setMetricsExpanded((v) => !v)}
+              className={`${btnBase} border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10`}
+              aria-expanded={metricsExpanded}
+              aria-controls="remote-host-metrics-body"
+            >
+              {metricsExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+              {metricsExpanded ? t("auto.HostMetricsPanel_tsx.10") : t("auto.HostMetricsPanel_tsx.11")}
+            </button>
           </div>
-        ) : metrics ? (
-          <div className="space-y-6">
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        </div>
+        {metricsExpanded ? (
+          <div id="remote-host-metrics-body">
+            <p className="mb-3 text-xs text-slate-500">
+              {t("auto.HostMetricsPanel_tsx.12")}
+              <code className="text-orange-200/85">GetHostStats</code>; {t("auto.HostMetricsPanel_tsx.13")}
+              <code className="text-orange-200/85">GetHostStatsDetail</code>.{" "}
+              {t("auto.HostMetricsPanel_tsx.14")}
+            </p>
+            {useMockMetrics && metrics ? (
+              <p className="mb-3 text-xs text-orange-300/90">
+                {t("auto.HostMetricsPanel_tsx.15")}
+              </p>
+            ) : null}
+            {metricsErr && !useMockMetrics ? (
+              <p className="mb-3 flex items-center gap-2 text-sm text-rose-300">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                {metricsErr}
+              </p>
+            ) : null}
+
+            {metricsLoading ? (
+              <div className="grid gap-4 sm:grid-cols-2" aria-busy="true">
+                {[1, 2, 3, 4, 5, 6].map((i) => (
+                  <div
+                    key={i}
+                    className="relative h-36 animate-pulse rounded-2xl border border-white/10 bg-black/20"
+                  />
+                ))}
+              </div>
+            ) : metrics ? (
+              <div className="space-y-6">
+            <div
+              className={`relative grid gap-3 sm:grid-cols-2 xl:grid-cols-3 ${useMockMetrics ? "opacity-[0.88]" : ""}`}
+              aria-label={useMockMetrics ? tr("Демо-метрики (не реальные данные)", "Demo metrics (not live data)") : undefined}
+            >
+              {useMockMetrics ? (
+                <span className="pointer-events-none absolute right-1 top-1 z-10 rounded border border-orange-500/35 bg-black/55 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-orange-200/95">
+                  Mock
+                </span>
+              ) : null}
               <MetricCard
                 kicker="CPU"
                 metric={`${metrics.cpu_usage_percent.toFixed(1)}%`}
@@ -267,7 +302,7 @@ export function HostMetricsPanel({
                 onClick={() => onCardClick("cpu", metrics)}
               />
               <MetricCard
-                kicker="Memory"
+                kicker={t("auto.HostMetricsPanel_tsx.16")}
                 metric={formatBytes(metrics.memory_used_bytes)}
                 sub={`${formatBytes(metrics.memory_total_bytes)} total · ${memoryUsagePct(metrics).toFixed(0)}%`}
                 status={pctStatus(memoryUsagePct(metrics))}
@@ -277,7 +312,7 @@ export function HostMetricsPanel({
                 onClick={() => onCardClick("memory", metrics)}
               />
               <MetricCard
-                kicker="Disk"
+                kicker={t("auto.HostMetricsPanel_tsx.17")}
                 metric={formatBytes(metrics.disk_free_bytes)}
                 sub={`${metrics.disk_mount_path || "?"} · ${diskUsagePct(metrics).toFixed(0)}% used`}
                 status={pctStatus(diskUsagePct(metrics))}
@@ -287,9 +322,9 @@ export function HostMetricsPanel({
                 onClick={() => onCardClick("disk", metrics)}
               />
               <MetricCard
-                kicker="Network"
+                kicker={t("auto.HostMetricsPanel_tsx.18")}
                 metric={`↓ ${formatRateBps(sumNetRxTx(metrics).rx)} · ↑ ${formatRateBps(sumNetRxTx(metrics).tx)}`}
-                sub={`${metrics.network_interfaces.length} iface(s)`}
+                sub={tr(`${metrics.network_interfaces.length} интерфейс(ов)`, `${metrics.network_interfaces.length} iface(s)`)}
                 status="ok"
                 showBar={false}
                 barRatio={0}
@@ -297,7 +332,7 @@ export function HostMetricsPanel({
                 onClick={() => onCardClick("network", metrics)}
               />
               <MetricCard
-                kicker="Temperature"
+                kicker={t("auto.HostMetricsPanel_tsx.19")}
                 metric={
                   metrics.temperature_current_celsius != null
                     ? `${metrics.temperature_current_celsius.toFixed(1)} °C`
@@ -307,8 +342,8 @@ export function HostMetricsPanel({
                 }
                 sub={
                   metrics.temperature_current_celsius != null || metrics.temperature_avg_celsius != null
-                    ? "current / avg"
-                    : "no sensors"
+                    ? t("auto.HostMetricsPanel_tsx.20")
+                    : t("auto.HostMetricsPanel_tsx.21")
                 }
                 status={tempStatus(metrics.temperature_current_celsius ?? metrics.temperature_avg_celsius)}
                 showBar={false}
@@ -322,9 +357,9 @@ export function HostMetricsPanel({
                 onClick={() => onCardClick("temp", metrics)}
               />
               <MetricCard
-                kicker="Processes"
+                kicker={t("auto.HostMetricsPanel_tsx.22")}
                 metric={String(metrics.process_count)}
-                sub="total"
+                sub={t("auto.HostMetricsPanel_tsx.23")}
                 status="ok"
                 showBar={false}
                 barRatio={0}
@@ -335,15 +370,15 @@ export function HostMetricsPanel({
 
             {metrics.disk_mounts.length > 0 ? (
               <div>
-                <h3 className="mb-2 text-sm font-semibold text-slate-300">Disk mounts</h3>
+                <h3 className="mb-2 text-sm font-semibold text-slate-300">{t("auto.HostMetricsPanel_tsx.24")}</h3>
                 <div className="max-h-48 overflow-auto rounded-xl border border-white/10">
                   <table className="w-full text-left text-xs">
                     <thead className="sticky top-0 bg-black/40 text-slate-400">
                       <tr>
-                        <th className="p-2">Path</th>
-                        <th className="p-2">Free</th>
-                        <th className="p-2">Total</th>
-                        <th className="p-2">Used %</th>
+                        <th className="p-2">{t("auto.HostMetricsPanel_tsx.25")}</th>
+                        <th className="p-2">{t("auto.HostMetricsPanel_tsx.26")}</th>
+                        <th className="p-2">{t("auto.HostMetricsPanel_tsx.27")}</th>
+                        <th className="p-2">{t("auto.HostMetricsPanel_tsx.28")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -370,17 +405,17 @@ export function HostMetricsPanel({
             {metrics.network_interfaces.length > 0 ? (
               <div>
                 <h3 className="mb-2 text-sm font-semibold text-slate-300">
-              Network interfaces{" "}
-              <span className="font-normal text-slate-500">(click row for throughput chart)</span>
+              {t("auto.HostMetricsPanel_tsx.29")}{" "}
+              <span className="font-normal text-slate-500">{t("auto.HostMetricsPanel_tsx.30")}</span>
             </h3>
                 <div className="max-h-48 overflow-auto rounded-xl border border-white/10">
                   <table className="w-full text-left text-xs">
                     <thead className="sticky top-0 bg-black/40 text-slate-400">
                       <tr>
-                        <th className="p-2">Name</th>
+                        <th className="p-2">{t("auto.HostMetricsPanel_tsx.31")}</th>
                         <th className="p-2">RX/s</th>
                         <th className="p-2">TX/s</th>
-                        <th className="p-2">err in/out</th>
+                        <th className="p-2">{t("auto.HostMetricsPanel_tsx.32")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -418,21 +453,25 @@ export function HostMetricsPanel({
 
             {metrics.log_tail.length > 0 ? (
               <div>
-                <h3 className="mb-2 text-sm font-semibold text-slate-300">Log tail</h3>
+                <h3 className="mb-2 text-sm font-semibold text-slate-300">{t("auto.HostMetricsPanel_tsx.33")}</h3>
                 <ul className="max-h-40 space-y-1 overflow-auto rounded-xl border border-white/10 bg-black/25 p-3 font-mono text-[11px] text-slate-300">
                   {metrics.log_tail.map((line, i) => (
                     <li key={`${line.ts_ms}-${i}`}>
-                      <span className="text-amber-200/70">{line.level}</span> {line.message}
+                      <span className="text-orange-200/75">{line.level}</span> {line.message}
                     </li>
                   ))}
                 </ul>
               </div>
             ) : null}
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">
+                {t("auto.HostMetricsPanel_tsx.34")}<strong>{t("auto.HostMetricsPanel_tsx.35")}</strong>.
+              </p>
+            )}
           </div>
         ) : (
-          <p className="text-sm text-slate-500">
-            Connect to a server, then press <strong>Load / refresh</strong>.
-          </p>
+          <p className="text-sm text-slate-500">{t("auto.HostMetricsPanel_tsx.36")}</p>
         )}
       </section>
 
@@ -445,23 +484,24 @@ export function HostMetricsPanel({
       />
 
       {detailOpen ? (
-        <div
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
+        <ModalDialog
+          open
+          zClassName="z-modal"
+          onClose={closeDetail}
+          panelClassName="w-full max-w-3xl max-h-[85vh] min-h-0"
           aria-labelledby="host-detail-title"
-          onClick={(e) => e.target === e.currentTarget && closeDetail()}
         >
-          <div className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-2xl border border-white/10 bg-surface p-0 shadow-2xl">
+          <div className="flex max-h-[85vh] w-full flex-col rounded-2xl border border-white/10 bg-surface p-0 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/10 px-5 py-3">
               <h3 id="host-detail-title" className="text-lg font-semibold text-slate-100">
                 {detailTitle}
               </h3>
               <button
                 type="button"
+                data-modal-initial-focus
                 onClick={closeDetail}
                 className={`${btnBase} border border-white/10 bg-white/5 p-2`}
-                aria-label="Close"
+                aria-label={t("auto.HostMetricsPanel_tsx.37")}
               >
                 <X className="h-4 w-4" />
               </button>
@@ -470,16 +510,16 @@ export function HostMetricsPanel({
               {detailLoading ? (
                 <div className="flex items-center gap-2 text-slate-400">
                   <Loader2 className="h-5 w-5 animate-spin" />
-                  Loading…
+                  {t("auto.HostMetricsPanel_tsx.38")}
                 </div>
               ) : detailErr ? (
                 <p className="text-sm text-rose-300">{detailErr}</p>
               ) : detailBody != null ? (
-                <DetailRenderer data={detailBody} />
+                <DetailRenderer data={detailBody} tr={tr} t={t} />
               ) : null}
             </div>
           </div>
-        </div>
+        </ModalDialog>
       ) : null}
     </>
   );
@@ -521,7 +561,15 @@ function MetricCard({
   );
 }
 
-function DetailRenderer({ data }: { data: unknown }) {
+function DetailRenderer({
+  data,
+  tr,
+  t,
+}: {
+  data: unknown;
+  tr: (ru: string, en: string) => string;
+  t: (key: string) => string;
+}) {
   if (data == null || typeof data !== "object") {
     return <pre className="whitespace-pre-wrap break-all text-xs text-slate-300">{String(data)}</pre>;
   }
@@ -536,7 +584,7 @@ function DetailRenderer({ data }: { data: unknown }) {
       <div className="space-y-4 text-sm">
         {d.loadavg != null && typeof d.loadavg === "object" ? (
           <p className="text-slate-300">
-            Load avg:{" "}
+            {t("auto.HostMetricsPanel_tsx.39")}:{" "}
             <code className="text-amber-200">
               {JSON.stringify(d.loadavg)}
             </code>
@@ -544,12 +592,12 @@ function DetailRenderer({ data }: { data: unknown }) {
         ) : null}
         {d.times != null ? (
           <p className="text-slate-300">
-            Times: <code className="text-amber-200">{JSON.stringify(d.times)}</code>
+            {t("auto.HostMetricsPanel_tsx.40")}: <code className="text-amber-200">{JSON.stringify(d.times)}</code>
           </p>
         ) : null}
         {d.series_hint != null ? (
           <p className="text-xs text-slate-500">
-            Series hint (ranges for control-api charts):{" "}
+            {t("auto.HostMetricsPanel_tsx.41")}:{" "}
             <code>{JSON.stringify(d.series_hint)}</code>
           </p>
         ) : null}
@@ -558,7 +606,7 @@ function DetailRenderer({ data }: { data: unknown }) {
             <thead className="text-slate-400">
               <tr>
                 <th className="p-1 text-left">PID</th>
-                <th className="p-1 text-left">Name</th>
+                <th className="p-1 text-left">{t("auto.HostMetricsPanel_tsx.42")}</th>
                 <th className="p-1 text-right">CPU %</th>
               </tr>
             </thead>
@@ -600,7 +648,7 @@ function DetailRenderer({ data }: { data: unknown }) {
             <thead className="text-slate-400">
               <tr>
                 <th className="p-1 text-left">PID</th>
-                <th className="p-1 text-left">Name</th>
+                <th className="p-1 text-left">{t("auto.HostMetricsPanel_tsx.43")}</th>
                 <th className="p-1 text-right">RSS</th>
               </tr>
             </thead>
@@ -635,9 +683,9 @@ function DetailRenderer({ data }: { data: unknown }) {
           <table className="w-full text-xs">
             <thead className="text-slate-400">
               <tr>
-                <th className="p-1 text-left">Path</th>
-                <th className="p-1 text-right">Free</th>
-                <th className="p-1 text-right">Total</th>
+                <th className="p-1 text-left">{t("auto.HostMetricsPanel_tsx.44")}</th>
+                <th className="p-1 text-right">{t("auto.HostMetricsPanel_tsx.45")}</th>
+                <th className="p-1 text-right">{t("auto.HostMetricsPanel_tsx.46")}</th>
               </tr>
             </thead>
             <tbody>
@@ -662,9 +710,9 @@ function DetailRenderer({ data }: { data: unknown }) {
             <thead className="text-slate-400">
               <tr>
                 <th className="p-1 text-left">PID</th>
-                <th className="p-1 text-left">Name</th>
-                <th className="p-1 text-right">Read</th>
-                <th className="p-1 text-right">Write</th>
+                <th className="p-1 text-left">{t("auto.HostMetricsPanel_tsx.47")}</th>
+                <th className="p-1 text-right">{t("auto.HostMetricsPanel_tsx.48")}</th>
+                <th className="p-1 text-right">{t("auto.HostMetricsPanel_tsx.49")}</th>
               </tr>
             </thead>
             <tbody>
@@ -701,7 +749,7 @@ function DetailRenderer({ data }: { data: unknown }) {
           <table className="w-full text-xs">
             <thead className="text-slate-400">
               <tr>
-                <th className="p-1 text-left">Iface</th>
+                <th className="p-1 text-left">{t("auto.HostMetricsPanel_tsx.50")}</th>
                 <th className="p-1 text-right">RX/s</th>
                 <th className="p-1 text-right">TX/s</th>
               </tr>
@@ -734,7 +782,7 @@ function DetailRenderer({ data }: { data: unknown }) {
       <div className="space-y-2 text-sm">
         {d.total != null ? (
           <p className="text-slate-400">
-            Total: <span className="text-slate-200">{String(d.total)}</span>
+            {t("auto.HostMetricsPanel_tsx.51")}: <span className="text-slate-200">{String(d.total)}</span>
           </p>
         ) : null}
         {procs.length > 0 ? (
@@ -743,7 +791,7 @@ function DetailRenderer({ data }: { data: unknown }) {
               <thead className="sticky top-0 bg-surface text-slate-400">
                 <tr>
                   <th className="p-1 text-left">PID</th>
-                  <th className="p-1 text-left">Name</th>
+                  <th className="p-1 text-left">{t("auto.HostMetricsPanel_tsx.52")}</th>
                   <th className="p-1 text-right">CPU%</th>
                   <th className="p-1 text-right">Mem</th>
                 </tr>

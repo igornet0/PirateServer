@@ -7,14 +7,17 @@
  * - `refresh_grpc_status` / `connect_grpc_bundle` / `clear_grpc_connection` — соединение
  * - `fetch_remote_host_stats` / `fetch_remote_host_stats_detail` — метрики хоста (gRPC)
  * - `list_server_bookmarks` / `add_server_bookmark` / `delete_server_bookmark` / `activate_server_bookmark` / `rename_server_bookmark`
- * - `pick_deploy_directory` / `set_active_project` / `deploy_from_directory`
+ * - `pick_deploy_directory` / `set_active_project` / `deploy_from_directory` / `rollback_deploy`
+ * - `projects_preflight` — проверки перед деплоем (JSON)
+ * - `list_registered_projects` / `register_project_from_directory` / `remove_registered_project` — локальный реестр папок
+ * - `deploy_upload_cancel` / `server_stack_upload_cancel` — прерывание потока чанков (best-effort)
  * - `pick_server_stack_tar_gz` / `apply_server_stack_update` / `fetch_server_stack_info_cmd` (OTA host bundle)
  * - `start_display_ingest` / `display_ingest_base` / `display_ingest_export_consumer_config` — display stream receive
  * - `get_display_stream_prefs` / `set_display_stream_prefs` — local stream send/receive flags
  * - `internet_proxy_start` / `internet_proxy_stop` / `internet_proxy_status` — локальный CONNECT-прокси
  * - `load_client_settings_json` / `save_client_settings_json` / `apply_default_rules_preset_cmd` — settings.json и пресеты правил
  *
- * Вкладки: «Обзор», «Соединение», «Интернет» (прокси и правила как у `pirate board`).
+ * Вкладки: «Обзор», «Проекты», «Соединение», «Интернет» (прокси и правила как у `pirate board`).
  *
  * Примеры будущих расширений (закомментируйте и подключите при необходимости):
  * // await invoke("get_metrics");
@@ -24,32 +27,44 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  Activity,
   AlertCircle,
   Check,
   Copy,
   FileArchive,
   FolderOpen,
-  LayoutDashboard,
-  Link2,
   Loader2,
-  Globe,
-  Pencil,
   Plus,
   RefreshCw,
   Server,
+  Settings,
+  Terminal,
   Trash2,
   X,
 } from "lucide-react";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { Toaster } from "sonner";
+import { AppShell } from "./AppShell";
 import { DisplayStreamPanel } from "./DisplayStreamPanel";
 import { InternetTrafficPanel } from "./InternetTrafficPanel";
 import { HostMetricsPanel } from "./HostMetricsPanel";
+import { OverviewContextPanel } from "./OverviewContextPanel";
+import { ProjectSwitcher } from "./ProjectSwitcher";
+import { ProjectsPanel } from "./ProjectsPanel";
+import { ServerProjectsOverview } from "./ServerProjectsOverview";
+import { ServerBookmarkSettingsModal } from "./ServerBookmarkSettingsModal";
+import { SidebarNav, type MainTab } from "./SidebarNav";
+import pirateAppIcon from "../src-tauri/icons/icon.png";
+import { useI18n } from "./i18n";
+import type { HostServicesCompatSummary } from "./projects-preflight-types";
+import type { ToolchainReport } from "./toolchain-types";
 import {
   MOCK_HOST_STATS,
   parseHostStatsSnapshot,
   type HostStatsSnapshot,
 } from "./host-stats-types";
+import { suggestControlApiFromGrpcUrl } from "./controlApiUrl";
+import { ModalDialog } from "./ui/ModalDialog";
 
 // -----------------------------------------------------------------------------
 // Types & mock data (used when Tauri is unavailable or for Storybook-style preview)
@@ -58,7 +73,12 @@ import {
 type GrpcConnectResult = {
   endpoint: string;
   currentVersion: string;
+  projectVersion: string;
   state: string;
+  /** HTTP base from server (nginx/public); matches Rust `control_api_http_url`. */
+  controlApiHttpUrl?: string;
+  /** Direct control-api base; matches Rust `control_api_http_url_direct`. */
+  controlApiHttpUrlDirect?: string;
 };
 
 type ServerBookmark = {
@@ -114,6 +134,64 @@ function formatMaybe(value: unknown): string {
   return String(value);
 }
 
+/** Typical control-api HTTP base from deploy-server gRPC URL (best-effort). */
+/** Prefer public URL from GetStatus; fall back to direct (same logic as desktop `connection`). */
+function controlApiHintFromGrpcLive(live: GrpcConnectResult): string | null {
+  const pub = live.controlApiHttpUrl?.trim();
+  if (pub) return pub;
+  const direct = live.controlApiHttpUrlDirect?.trim();
+  if (direct) return direct;
+  return null;
+}
+
+/** `GetStatus.current_version` when no app release: `stack@…` is host bundle label, not a deploy version. */
+function isServerStackIdleLabel(version: string): boolean {
+  return version.trim().startsWith("stack@");
+}
+
+function formatDeployedVersionForUi(version: string): { label: string; value: string } {
+  const v = version.trim();
+  if (!v) return { label: "", value: "" };
+  return isServerStackIdleLabel(v)
+    ? { label: "сервер (bundle)", value: v }
+    : { label: "активный релиз", value: v };
+}
+
+/** Tone for deploy-server managed **app process** (`running` | `stopped` | `error`), not gRPC connectivity. */
+function grpcProcessToneFromState(stateRaw: string | undefined): {
+  text: string;
+  dot: string;
+  badge: string;
+} {
+  const s = (stateRaw ?? "").toLowerCase();
+  if (s === "running") {
+    return {
+      text: "text-orange-400",
+      dot: "bg-orange-500 shadow-[0_0_10px_rgba(249,115,22,0.55)]",
+      badge: "bg-orange-500/15 text-orange-200 ring-1 ring-orange-500/45",
+    };
+  }
+  if (s === "error") {
+    return {
+      text: "text-rose-300",
+      dot: "bg-rose-500",
+      badge: "bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/35",
+    };
+  }
+  if (s === "stopped") {
+    return {
+      text: "text-red-300/90",
+      dot: "bg-red-500",
+      badge: "bg-red-950/40 text-red-200 ring-1 ring-red-600/35",
+    };
+  }
+  return {
+    text: "text-slate-300",
+    dot: "bg-slate-400",
+    badge: "bg-slate-500/15 text-slate-200 ring-1 ring-slate-500/35",
+  };
+}
+
 // -----------------------------------------------------------------------------
 // UI primitives
 // -----------------------------------------------------------------------------
@@ -132,7 +210,7 @@ function ProgressBar({
       className={`h-2.5 w-full overflow-hidden rounded-full bg-black/25 dark:bg-white/10 ${className}`}
     >
       <div
-        className="h-full rounded-full bg-gradient-to-r from-red-700 via-amber-600 to-red-600 shadow-[0_0_14px_rgba(220,38,38,0.45)] transition-[width] duration-500 ease-out"
+        className="h-full rounded-full bg-gradient-to-r from-red-800 via-orange-600 to-red-700 shadow-flame transition-[width] duration-500 ease-out"
         style={{ width: `${w}%` }}
       />
     </div>
@@ -146,10 +224,10 @@ const btnBase =
 // Dashboard
 // -----------------------------------------------------------------------------
 
-type MainTab = "overview" | "connection" | "internet";
-
 export function Dashboard() {
-  const [mainTab, setMainTab] = useState<MainTab>("overview");
+  const { language, setLanguage, t } = useI18n();
+  const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
+    const [mainTab, setMainTab] = useState<MainTab>("projects");
 
   const [endpoint, setEndpoint] = useState<string | null>(null);
   const [grpcLive, setGrpcLive] = useState<GrpcConnectResult | null>(null);
@@ -165,7 +243,6 @@ export function Dashboard() {
 
   const [deployDir, setDeployDir] = useState<string | null>(null);
   const [deployVersion, setDeployVersion] = useState("v1.0.0");
-  const [deployProject, setDeployProject] = useState("default");
   const [deploying, setDeploying] = useState(false);
   const [deployProgress, setDeployProgress] = useState(0);
   const [deployMsg, setDeployMsg] = useState<string | null>(null);
@@ -173,6 +250,29 @@ export function Dashboard() {
 
   const [paasMsg, setPaasMsg] = useState<string | null>(null);
   const [paasBusy, setPaasBusy] = useState(false);
+
+  const [registryRefreshKey, setRegistryRefreshKey] = useState(0);
+  const bumpRegistryRefresh = useCallback(() => {
+    setRegistryRefreshKey((k) => k + 1);
+  }, []);
+
+  const [toolchainReport, setToolchainReport] = useState<ToolchainReport | null>(null);
+  const [toolchainLoading, setToolchainLoading] = useState(true);
+  const [toolchainErr, setToolchainErr] = useState<string | null>(null);
+
+  const refreshToolchain = useCallback(async () => {
+    setToolchainLoading(true);
+    setToolchainErr(null);
+    try {
+      const r = await invoke<ToolchainReport>("probe_local_toolchain");
+      setToolchainReport(r);
+    } catch (e) {
+      setToolchainErr(String(e));
+      setToolchainReport(null);
+    } finally {
+      setToolchainLoading(false);
+    }
+  }, []);
 
   const [stackPath, setStackPath] = useState<string | null>(null);
   const [stackVersion, setStackVersion] = useState("stack-1.0.0");
@@ -185,23 +285,49 @@ export function Dashboard() {
   const [stackTargetLabel, setStackTargetLabel] = useState<string | null>(null);
 
   const [modalConnectOpen, setModalConnectOpen] = useState(false);
+  /** When true, connect modal shows guided title (same form as «Change…»). */
+  const [connectionWizardMode, setConnectionWizardMode] = useState(false);
   const [modalAddServerOpen, setModalAddServerOpen] = useState(false);
   const [bundleInput, setBundleInput] = useState("");
   const [addUrlInput, setAddUrlInput] = useState("");
   const [modalErr, setModalErr] = useState<string | null>(null);
 
   const [removeId, setRemoveId] = useState<string | null>(null);
+  const hostSvcResolverRef = useRef<((v: boolean) => void) | null>(null);
+  const [hostSvcPromptMessage, setHostSvcPromptMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   const [connectionSwitching, setConnectionSwitching] = useState(false);
 
-  const [renameOpen, setRenameOpen] = useState(false);
-  const [renameId, setRenameId] = useState<string | null>(null);
-  const [renameLabel, setRenameLabel] = useState("");
-  const [renameErr, setRenameErr] = useState<string | null>(null);
+  const [serverSettingsBookmark, setServerSettingsBookmark] = useState<ServerBookmark | null>(null);
+
+  const [pirateCliPromptOpen, setPirateCliPromptOpen] = useState(false);
+  const [pirateCliInstallBusy, setPirateCliInstallBusy] = useState(false);
+  const [pirateCliInstallResult, setPirateCliInstallResult] = useState<string | null>(null);
+  const [pirateCliInstallResultErr, setPirateCliInstallResultErr] = useState(false);
 
   /** HTTP control-api base for `/api/v1/host-stats/series` (not gRPC :50051). */
   const [controlApiInput, setControlApiInput] = useState("");
+
+  const commitGrpcLive = useCallback((live: GrpcConnectResult) => {
+    setGrpcLive(live);
+    const hint = controlApiHintFromGrpcLive(live);
+    if (hint) {
+      setControlApiInput((prev) => {
+        const p = normalizeGrpcUrl(prev);
+        const h = normalizeGrpcUrl(hint);
+        if (p === h) return prev;
+        return hint;
+      });
+      return;
+    }
+    const inferred = suggestControlApiFromGrpcUrl(live.endpoint);
+    if (!inferred) return;
+    setControlApiInput((prev) => {
+      if (prev.trim() !== "") return prev;
+      return inferred;
+    });
+  }, []);
 
   const loadBookmarks = useCallback(async () => {
     try {
@@ -213,13 +339,21 @@ export function Dashboard() {
     }
   }, []);
 
+  useEffect(() => {
+    setServerSettingsBookmark((prev) => {
+      if (!prev) return null;
+      const next = bookmarks.find((b) => b.id === prev.id);
+      return next ?? null;
+    });
+  }, [bookmarks]);
+
   const refreshServer = useCallback(async () => {
     setServerLoading(true);
     setGrpcErr(null);
     try {
       // await invoke<GrpcConnectResult>("refresh_grpc_status");
       const r = await invoke<GrpcConnectResult>("refresh_grpc_status");
-      setGrpcLive(r);
+      commitGrpcLive(r);
       setEndpoint(r.endpoint);
     } catch (e) {
       setGrpcErr(String(e));
@@ -227,7 +361,7 @@ export function Dashboard() {
     } finally {
       setServerLoading(false);
     }
-  }, []);
+  }, [commitGrpcLive]);
 
   const init = useCallback(async () => {
     try {
@@ -242,7 +376,7 @@ export function Dashboard() {
       if (ep) {
         try {
           const r = await invoke<GrpcConnectResult>("refresh_grpc_status");
-          setGrpcLive(r);
+          commitGrpcLive(r);
           setGrpcErr(null);
         } catch (e) {
           setGrpcLive(null);
@@ -253,11 +387,54 @@ export function Dashboard() {
       setEndpoint(null);
     }
     await loadBookmarks();
-  }, [loadBookmarks]);
+  }, [loadBookmarks, commitGrpcLive]);
 
   useEffect(() => {
     void init();
   }, [init]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setToolchainLoading(true);
+      setToolchainErr(null);
+      try {
+        const r = await invoke<ToolchainReport>("probe_local_toolchain");
+        if (!cancelled) setToolchainReport(r);
+      } catch (e) {
+        if (!cancelled) {
+          setToolchainErr(String(e));
+          setToolchainReport(null);
+        }
+      } finally {
+        if (!cancelled) setToolchainLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (localStorage.getItem("pirateDesktop.pirateCliPromptDismissed") === "1") {
+          return;
+        }
+        const available = await invoke<boolean>("is_pirate_cli_available");
+        if (cancelled || available) return;
+        setPirateCliInstallResult(null);
+        setPirateCliInstallResultErr(false);
+        setPirateCliPromptOpen(true);
+      } catch {
+        /* Tauri unavailable (browser dev) or command missing */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -282,6 +459,20 @@ export function Dashboard() {
     setCopied(true);
     window.setTimeout(() => setCopied(false), 2000);
   }, [endpoint]);
+
+  const resolveHostSvcPrompt = useCallback((v: boolean) => {
+    const fn = hostSvcResolverRef.current;
+    hostSvcResolverRef.current = null;
+    setHostSvcPromptMessage(null);
+    fn?.(v);
+  }, []);
+
+  const waitHostSvcConfirm = useCallback((message: string) => {
+    return new Promise<boolean>((resolve) => {
+      hostSvcResolverRef.current = resolve;
+      setHostSvcPromptMessage(message);
+    });
+  }, []);
 
   const loadMetrics = useCallback(async () => {
     setMetricsErr(null);
@@ -312,11 +503,28 @@ export function Dashboard() {
       // await invoke<GrpcConnectResult>("connect_grpc_bundle", { bundle });
       const r = await invoke<GrpcConnectResult>("connect_grpc_bundle", { bundle });
       setEndpoint(r.endpoint);
-      setGrpcLive(r);
+      commitGrpcLive(r);
       setGrpcErr(null);
       setModalConnectOpen(false);
+      setConnectionWizardMode(false);
       setBundleInput("");
       await loadBookmarks();
+      toast.message(
+        tr(
+          "Следующий шаг: HTTP Control API",
+          "Next step: HTTP Control API",
+        ),
+        {
+          description: tr(
+            "Вкладка «Соединение» → шестерёнка у сервера → войдите в control-api для графиков и REST.",
+            "Connection tab → gear next to the server → sign in to control-api for charts and REST.",
+          ),
+          action: {
+            label: tr("Открыть «Соединение»", "Open Connection"),
+            onClick: () => setMainTab("connection"),
+          },
+        },
+      );
     } catch (e) {
       setModalErr(String(e));
     }
@@ -324,14 +532,13 @@ export function Dashboard() {
 
   const onAddServer = async () => {
     setModalErr(null);
-    const url = addUrlInput.trim();
-    if (!url) {
-      setModalErr("Enter a gRPC URL (http://…).");
+    const pasted = addUrlInput.trim();
+    if (!pasted) {
+      setModalErr(t("auto.Dashboard_tsx.1"));
       return;
     }
     try {
-      // await invoke<ServerBookmark>("add_server_bookmark", { url });
-      await invoke<ServerBookmark>("add_server_bookmark", { url });
+      await invoke<ServerBookmark>("add_server_bookmark", { url: pasted });
       setModalAddServerOpen(false);
       setAddUrlInput("");
       await loadBookmarks();
@@ -349,7 +556,7 @@ export function Dashboard() {
     try {
       const r = await invoke<GrpcConnectResult>("activate_server_bookmark", { url });
       setEndpoint(r.endpoint);
-      setGrpcLive(r);
+      commitGrpcLive(r);
       await loadBookmarks();
     } catch (e) {
       setGrpcErr(String(e));
@@ -361,25 +568,6 @@ export function Dashboard() {
   const onSavedConnectionSelect = (value: string) => {
     if (!value) return;
     void onUseBookmark(value);
-  };
-
-  const onRenameSubmit = async () => {
-    if (!renameId) return;
-    setRenameErr(null);
-    const label = renameLabel.trim();
-    if (!label) {
-      setRenameErr("Enter a label.");
-      return;
-    }
-    try {
-      await invoke("rename_server_bookmark", { id: renameId, label });
-      setRenameOpen(false);
-      setRenameId(null);
-      setRenameLabel("");
-      await loadBookmarks();
-    } catch (e) {
-      setRenameErr(String(e));
-    }
   };
 
   const onRemoveBookmark = async () => {
@@ -408,15 +596,6 @@ export function Dashboard() {
     }
   };
 
-  const saveControlApiBase = useCallback(async () => {
-    setGrpcErr(null);
-    try {
-      await invoke("set_control_api_base", { url: controlApiInput.trim() });
-    } catch (e) {
-      setGrpcErr(String(e));
-    }
-  }, [controlApiInput]);
-
   const onPickFolder = async () => {
     try {
       // await invoke<string | null>("pick_deploy_directory");
@@ -428,10 +607,73 @@ export function Dashboard() {
     }
   };
 
+  useEffect(() => {
+    let cancelled = false;
+    if (!deployDir?.trim()) return;
+    void (async () => {
+      try {
+        const v = await invoke<string>("read_release_version_from_manifest", {
+          directory: deployDir,
+        });
+        if (!cancelled && v.trim()) {
+          setDeployVersion(v.trim());
+        }
+      } catch {
+        // keep manually entered/default version when manifest is missing/invalid
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [deployDir]);
+
   const onDeploy = async () => {
     if (!deployDir || !deployVersion.trim()) {
       setDeployMsg("Choose a folder and enter a version.");
       return;
+    }
+    try {
+      await invoke<string>("ensure_deploy_project_id_for_deploy", { path: deployDir });
+    } catch (e) {
+      setDeployMsg(String(e));
+      return;
+    }
+    try {
+      const analysis = await invoke<{ hostServices: HostServicesCompatSummary }>("analyze_network_access", {
+        directory: deployDir,
+      });
+      const hs = analysis.hostServices;
+      if (hs.status === "checked" && hs.missingHostServiceIds.length > 0) {
+        const list = hs.missingHostServiceIds.join(", ");
+        const ok = await waitHostSvcConfirm(
+          tr(
+            `На сервере не установлены пакеты: ${list}. Установите их через закладку сервера → «Сервисы». Продолжить деплой?`,
+            `Missing host packages: ${list}. Install via Server bookmark → Services tab. Deploy anyway?`,
+          ),
+        );
+        if (!ok) {
+          setDeployMsg(
+            tr("Деплой отменён (хост-сервисы).", "Deploy cancelled (host services)."),
+          );
+          return;
+        }
+      } else if (hs.status === "skipped" && hs.requiredHostServiceIds.length > 0) {
+        const list = hs.requiredHostServiceIds.join(", ");
+        const ok = await waitHostSvcConfirm(
+          tr(
+            `Проект требует на хосте: ${list}. Не удалось проверить без входа в control-api. Продолжить деплой?`,
+            `Project requires on host: ${list}. Could not verify without control-api login. Deploy anyway?`,
+          ),
+        );
+        if (!ok) {
+          setDeployMsg(
+            tr("Деплой отменён (хост-сервисы).", "Deploy cancelled (host services)."),
+          );
+          return;
+        }
+      }
+    } catch {
+      /* proceed with deploy if analysis fails */
     }
     setDeploying(true);
     setDeployProgress(0);
@@ -441,7 +683,6 @@ export function Dashboard() {
       setDeployProgress((p) => Math.min(92, p + 6));
     }, 220);
     try {
-      await invoke("set_active_project", { project_id: deployProject });
       // await invoke<DeployOutcome>("deploy_from_directory", { directory, version, chunkSize: null });
       const r = await invoke<DeployOutcome>("deploy_from_directory", {
         directory: deployDir,
@@ -450,20 +691,26 @@ export function Dashboard() {
       });
       if (deployCancelRequested) {
         setDeployMsg("Deploy finished on server; cancel only stopped local UI wait.");
+        toast.message(t("auto.Dashboard_tsx.2"), {
+          description: t("auto.Dashboard_tsx.3"),
+        });
       } else {
         setDeployMsg(
           `OK: ${r.status} → ${r.deployedVersion} (${r.artifactBytes} bytes, ${r.chunkCount} chunks)`,
         );
+        toast.success(t("auto.Dashboard_tsx.4"), { description: r.deployedVersion });
       }
       setDeployProgress(100);
       try {
         const live = await invoke<GrpcConnectResult>("refresh_grpc_status");
-        setGrpcLive(live);
+        commitGrpcLive(live);
       } catch {
         /* ignore */
       }
     } catch (e) {
-      setDeployMsg(String(e));
+      const msg = String(e);
+      setDeployMsg(msg);
+      toast.error(t("auto.Dashboard_tsx.5"), { description: msg });
     } finally {
       window.clearInterval(steps);
       setDeploying(false);
@@ -472,7 +719,11 @@ export function Dashboard() {
   };
 
   const paasPath = deployDir;
-  const runPaas = async (label: string, fn: () => Promise<void>) => {
+  const runPaas = async (
+    label: string,
+    fn: () => Promise<string | void>,
+    opts?: { onSuccess?: () => void },
+  ) => {
     if (!paasPath) {
       setPaasMsg("Choose a project folder first (same as Deploy).");
       return;
@@ -480,12 +731,82 @@ export function Dashboard() {
     setPaasBusy(true);
     setPaasMsg(`${label}…`);
     try {
-      await fn();
+      const out = await fn();
+      setPaasMsg(typeof out === "string" ? out : `${label} ${t("auto.Dashboard_tsx.6")}`);
+      opts?.onSuccess?.();
     } catch (e) {
       setPaasMsg(String(e));
     } finally {
       setPaasBusy(false);
     }
+  };
+
+  const onDeployCancelRequest = () => {
+    setDeployCancelRequested(true);
+    setDeployMsg(t("auto.Dashboard_tsx.7"));
+  };
+
+  const onPipelineFull = async () => {
+    if (!deployDir || !deployVersion.trim()) {
+      setPaasMsg(t("auto.Dashboard_tsx.8"));
+      return;
+    }
+    try {
+      await invoke<string>("ensure_deploy_project_id_for_deploy", { path: deployDir });
+    } catch (e) {
+      setPaasMsg(String(e));
+      return;
+    }
+    try {
+      const analysis = await invoke<{ hostServices: HostServicesCompatSummary }>("analyze_network_access", {
+        directory: deployDir,
+      });
+      const hs = analysis.hostServices;
+      if (hs.status === "checked" && hs.missingHostServiceIds.length > 0) {
+        const list = hs.missingHostServiceIds.join(", ");
+        const ok = await waitHostSvcConfirm(
+          tr(
+            `На сервере не установлены пакеты: ${list}. Установите их через закладку сервера → «Сервисы». Продолжить pipeline?`,
+            `Missing host packages: ${list}. Install via Server bookmark → Services tab. Continue pipeline?`,
+          ),
+        );
+        if (!ok) {
+          setPaasMsg(tr("Pipeline отменён (хост-сервисы).", "Pipeline cancelled (host services)."));
+          return;
+        }
+      } else if (hs.status === "skipped" && hs.requiredHostServiceIds.length > 0) {
+        const list = hs.requiredHostServiceIds.join(", ");
+        const ok = await waitHostSvcConfirm(
+          tr(
+            `Проект требует на хосте: ${list}. Не удалось проверить без входа в control-api. Продолжить pipeline?`,
+            `Project requires on host: ${list}. Could not verify without control-api login. Continue pipeline?`,
+          ),
+        );
+        if (!ok) {
+          setPaasMsg(tr("Pipeline отменён (хост-сервисы).", "Pipeline cancelled (host services)."));
+          return;
+        }
+      }
+    } catch {
+      /* continue */
+    }
+    await runPaas("Pipeline", async () => {
+      const s = await invoke<string>("paas_pipeline", {
+        path: deployDir,
+        doInit: false,
+        name: null,
+        skipTestLocal: true,
+        version: deployVersion.trim(),
+        chunkSize: null,
+      });
+      try {
+        const live = await invoke<GrpcConnectResult>("refresh_grpc_status");
+        commitGrpcLive(live);
+      } catch {
+        /* ignore */
+      }
+      return s;
+    });
   };
 
   const onPickStackTar = async () => {
@@ -533,7 +854,7 @@ export function Dashboard() {
       setStackProgress(100);
       try {
         const live = await invoke<GrpcConnectResult>("refresh_grpc_status");
-        setGrpcLive(live);
+        commitGrpcLive(live);
       } catch {
         setStackMsg(
           `${msg} — gRPC may drop briefly while deploy-server restarts; refresh status in a few seconds.`,
@@ -562,8 +883,16 @@ export function Dashboard() {
     setStackModalOpen(true);
   };
 
-  const liveState = grpcLive?.state?.toLowerCase() ?? "";
-  const isRunning = liveState === "running";
+  const grpcProcessTone = useMemo(
+    () => grpcProcessToneFromState(grpcLive?.state),
+    [grpcLive?.state],
+  );
+
+  const deployedVersionUi = useMemo(() => {
+    const raw = grpcLive?.currentVersion?.trim();
+    if (!raw) return null;
+    return formatDeployedVersionForUi(raw);
+  }, [grpcLive?.currentVersion]);
 
   const selectedBookmarkUrl = useMemo(() => {
     if (!endpoint) return "";
@@ -571,6 +900,11 @@ export function Dashboard() {
     const hit = bookmarks.find((b) => normalizeGrpcUrl(b.url) === n);
     return hit ? hit.url : "";
   }, [endpoint, bookmarks]);
+
+  const removeBookmarkEntry = useMemo(
+    () => (removeId ? bookmarks.find((b) => b.id === removeId) ?? null : null),
+    [bookmarks, removeId],
+  );
 
   const parsedStackInfo = useMemo(() => {
     if (!stackInfo) return null;
@@ -590,630 +924,694 @@ export function Dashboard() {
     }
   }, [parsedStackInfo]);
 
+  const stackUiBundled = useMemo(() => {
+    const raw = parsedManifest?.dashboard_ui_bundled;
+    if (typeof raw === "boolean") return raw;
+    if (typeof raw === "number") return raw !== 0;
+    if (typeof raw === "string") {
+      const t = raw.trim().toLowerCase();
+      if (t === "0" || t === "false" || t === "no" || t === "off") return false;
+      if (t === "1" || t === "true" || t === "yes" || t === "on") return true;
+    }
+    return null;
+  }, [parsedManifest]);
+
+  const serverSettingsHostUiBundled = useMemo(() => {
+    if (!serverSettingsBookmark || !endpoint) return null;
+    const same = normalizeGrpcUrl(serverSettingsBookmark.url) === normalizeGrpcUrl(endpoint);
+    return same ? stackUiBundled : null;
+  }, [serverSettingsBookmark, endpoint, stackUiBundled]);
+
+  /** Anchor for modals that should dim only the workspace column (not the left sidebar). */
+  const [workspacePortalEl, setWorkspacePortalEl] = useState<HTMLDivElement | null>(null);
+
   return (
-    <div className="min-h-screen bg-gradient-to-b from-deep via-[#100408] to-deep pb-16 text-slate-100">
-      <div className="mx-auto max-w-[1600px] px-4 pt-8 sm:px-6 sm:pt-10 lg:px-10">
-        <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-          <nav
-            className="inline-flex rounded-2xl border border-white/10 bg-black/25 p-1 shadow-inner"
-            aria-label="Разделы приложения"
-          >
-            <button
-              type="button"
-              onClick={() => setMainTab("overview")}
-              className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
-                mainTab === "overview"
-                  ? "bg-gradient-to-r from-red-800/90 to-red-950/90 text-white shadow-md"
-                  : "text-slate-400 hover:text-slate-100"
-              }`}
-            >
-              <LayoutDashboard className="h-4 w-4" aria-hidden />
-              Обзор
-            </button>
-            <button
-              type="button"
-              onClick={() => setMainTab("connection")}
-              className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
-                mainTab === "connection"
-                  ? "bg-gradient-to-r from-red-800/90 to-red-950/90 text-white shadow-md"
-                  : "text-slate-400 hover:text-slate-100"
-              }`}
-            >
-              <Link2 className="h-4 w-4" aria-hidden />
-              Соединение
-            </button>
-            <button
-              type="button"
-              onClick={() => setMainTab("internet")}
-              className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
-                mainTab === "internet"
-                  ? "bg-gradient-to-r from-red-800/90 to-red-950/90 text-white shadow-md"
-                  : "text-slate-400 hover:text-slate-100"
-              }`}
-            >
-              <Globe className="h-4 w-4" aria-hidden />
-              Интернет
-            </button>
-          </nav>
-        </header>
-
-        <div className="grid grid-cols-1 gap-6 xl:grid-cols-2 xl:gap-8 xl:items-start">
-          {/* Слева: на «Обзоре» — краткий статус gRPC + метрики; на «Соединении» — полная панель deploy-server; «Интернет» — локальный прокси */}
-          <div className="flex flex-col gap-6">
-            {mainTab === "internet" ? (
-              <InternetTrafficPanel />
-            ) : (
-              <>
-            {mainTab === "overview" ? (
-              <section
-                className="rounded-2xl border border-white/10 bg-surface/90 p-4 shadow-card backdrop-blur"
-                aria-labelledby="conn-summary-heading"
-              >
-                <h2
-                  id="conn-summary-heading"
-                  className="text-xs font-medium uppercase tracking-wide text-slate-500"
-                >
-                  Deploy-server (gRPC)
-                </h2>
-                <div className="mt-2 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="min-w-0 flex-1">
-                    {endpoint ? (
-                      <code className="block truncate rounded-lg bg-black/40 px-2 py-1.5 text-sm text-amber-100/90">
-                        {endpoint}
-                      </code>
-                    ) : (
-                      <p className="text-sm text-slate-400">Не подключено к deploy-server.</p>
-                    )}
-                    <p className="mt-1 text-xs text-slate-500">
-                      Статус:{" "}
-                      <span className={isRunning ? "text-emerald-400" : "text-rose-300"}>
-                        {grpcLive?.state ?? "—"}
-                      </span>
-                      {grpcLive?.currentVersion ? (
-                        <span className="text-slate-500">
-                          {" "}
-                          · версия{" "}
-                          <span className="text-slate-300">{grpcLive.currentVersion}</span>
-                        </span>
-                      ) : null}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setMainTab("connection")}
-                    className={`${btnBase} shrink-0 border border-red-600/50 bg-red-950/40 text-red-100 hover:bg-red-950/60`}
-                  >
-                    Настройка соединения
-                  </button>
+    <>
+      <Toaster
+        position="top-right"
+        theme="dark"
+        richColors
+        closeButton
+        toastOptions={{
+          classNames: {
+            toast: "border border-red-900/50 bg-zinc-950/95 text-slate-100 shadow-glow backdrop-blur-sm",
+            error: "border-rose-900/60",
+            success: "border-emerald-900/50",
+          },
+        }}
+      />
+      <AppShell
+        sidebar={
+          <aside className="relative flex w-[272px] shrink-0 flex-col border-r border-red-950/40 bg-panel shadow-[inset_-1px_0_0_rgba(127,29,29,0.15)]">
+            <div className="border-b border-border-subtle px-3 py-3">
+              <div className="flex items-center gap-3">
+                <img
+                  src={pirateAppIcon}
+                  alt=""
+                  width={44}
+                  height={44}
+                  className="h-11 w-11 shrink-0 rounded-full ring-2 ring-red-900/70 shadow-glow"
+                />
+                <div className="min-w-0">
+                  <h1 className="font-display text-xl leading-none tracking-wide text-red-400 drop-shadow-[0_0_12px_rgba(220,38,38,0.45)]">
+                    PirateClient
+                  </h1>
+                  <p className="mt-1 text-[10px] leading-snug text-slate-500">
+                    {t("auto.Dashboard_tsx.9")}
+                  </p>
                 </div>
-              </section>
-            ) : null}
-            {/* 1. Полная панель gRPC — только вкладка «Соединение» */}
-            {mainTab === "connection" ? (
-            <section
-              className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card backdrop-blur transition hover:shadow-glow"
-              aria-labelledby="server-heading"
-            >
-              <h2 id="server-heading" className="sr-only">
-                Server connection
-              </h2>
-              {bookmarks.length > 0 ? (
-                <div className="mb-4">
-                  <label
-                    htmlFor="saved-connection-select"
-                    className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-slate-500"
-                  >
-                    Saved connection
-                  </label>
-                  <select
-                    id="saved-connection-select"
-                    className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35 disabled:opacity-60"
-                    value={selectedBookmarkUrl}
-                    onChange={(e) => onSavedConnectionSelect(e.target.value)}
-                    disabled={connectionSwitching}
-                    aria-label="Saved gRPC connection"
-                  >
-                    <option value="">
-                      {endpoint && !selectedBookmarkUrl
-                        ? "Other connection (see endpoint below)"
-                        : "— Choose —"}
-                    </option>
-                    {bookmarks.map((b) => (
-                      <option key={b.id} value={b.url}>
-                        {b.label}
-                      </option>
-                    ))}
-                  </select>
-                  {connectionSwitching ? (
-                    <p className="mt-1.5 text-xs text-slate-500">Switching…</p>
-                  ) : null}
-                </div>
-              ) : null}
-              {!endpoint ? (
-                <p className="text-sm text-slate-400">Not connected. Use Change to add an endpoint.</p>
-              ) : (
-                <div className="space-y-4">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Server className="h-5 w-5 text-red-400" aria-hidden />
-                    <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                      Endpoint
-                    </span>
-                    <code className="max-w-full truncate rounded-lg bg-black/40 px-2 py-1 text-sm text-amber-100/90">
-                      {endpoint}
-                    </code>
-                    <button
-                      type="button"
-                      onClick={copyEndpoint}
-                      className={`${btnBase} shrink-0 border border-white/10 bg-white/5 p-2`}
-                      title="Copy endpoint"
-                    >
-                      {copied ? (
-                        <Check className="h-4 w-4 text-emerald-400" />
-                      ) : (
-                        <Copy className="h-4 w-4" />
-                      )}
-                    </button>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-3">
-                    <span
-                      className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium ${
-                        isRunning
-                          ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/40"
-                          : "bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/35"
-                      }`}
-                    >
-                      <span
-                        className={`h-2.5 w-2.5 rounded-full ${
-                          isRunning ? "bg-emerald-400 shadow-[0_0_8px_#34d399]" : "bg-rose-500"
-                        }`}
-                        aria-hidden
-                      />
-                      Live: {grpcLive?.state ?? "—"}
-                    </span>
-                    <span className="text-sm text-slate-400">
-                      version{" "}
-                      <strong className="text-slate-200">
-                        {grpcLive?.currentVersion || "—"}
-                      </strong>
-                    </span>
-                  </div>
-                  <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-3">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                      Control API (HTTP) — network charts
-                    </p>
-                    <p className="mt-1 text-xs text-slate-500">
-                      gRPC deploy-server (e.g. :50051) does not serve REST. Enter the URL where{" "}
-                      <code className="text-amber-200/70">control-api</code> listens (often :8080 or
-                      nginx :443).
-                    </p>
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      <input
-                        type="url"
-                        value={controlApiInput}
-                        onChange={(e) => setControlApiInput(e.target.value)}
-                        placeholder="http://192.168.0.30:8080"
-                        className="min-w-[12rem] flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-amber-600/50 focus:outline-none"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => void saveControlApiBase()}
-                        className={`${btnBase} border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10`}
-                      >
-                        Save
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-              <div className="mt-5 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  disabled={serverLoading || !endpoint}
-                  onClick={() => void refreshServer()}
-                  className={`${btnBase} bg-gradient-to-r from-red-700 to-red-900 text-white shadow-lg shadow-red-950/40 hover:brightness-110 disabled:opacity-40`}
-                >
-                  {serverLoading ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <RefreshCw className="h-4 w-4" />
-                  )}
-                  Refresh status
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setModalConnectOpen(true);
-                    setModalErr(null);
-                  }}
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  Change…
-                </button>
-                <button
-                  type="button"
-                  disabled={!endpoint}
-                  onClick={() => void onDisconnect()}
-                  className={`${btnBase} border border-rose-500/40 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20`}
-                >
-                  Disconnect
-                </button>
               </div>
-              {grpcErr ? (
-                <p className="mt-3 flex items-start gap-2 text-sm text-rose-300">
-                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                  {grpcErr}
-                </p>
-              ) : null}
-            </section>
-            ) : null}
-
-            {/* 2. Remote host metrics — только «Обзор» */}
-            {mainTab === "overview" ? (
-              <>
-            <HostMetricsPanel
-              metrics={metrics}
-              metricsLoading={metricsLoading}
-              metricsErr={metricsErr}
-              useMockMetrics={useMockMetrics}
-              onLoad={() => void loadMetrics()}
-              endpoint={endpoint}
-              seriesBaseUrl={controlApiInput.trim() || null}
+            </div>
+            <SidebarNav mainTab={mainTab} onTab={setMainTab} />
+            <ProjectSwitcher
+              refreshKey={registryRefreshKey}
+              currentDeployDir={deployDir}
+              onSelectPath={(path) => setDeployDir(path)}
+              onRegistryChanged={bumpRegistryRefresh}
             />
-
-            <DisplayStreamPanel />
-              </>
-            ) : null}
-              </>
-            )}
-          </div>
-
-          {/* Справа: на «Соединении» — закладки; на «Обзоре» — деплой и stack */}
-          {mainTab !== "internet" ? (
-          <div className="flex flex-col gap-6">
-            {/* 3. Saved servers — только «Соединение» */}
-            {mainTab === "connection" ? (
-            <section
-              className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card"
-              aria-labelledby="bookmarks-heading"
-            >
-              <h2 id="bookmarks-heading" className="text-lg font-semibold text-slate-100">
-                Saved servers
-              </h2>
-              <ul className="mt-4 space-y-3">
-                {bookmarks.length === 0 ? (
-                  <li className="rounded-xl border border-dashed border-white/10 p-4 text-center text-sm text-slate-500">
-                    No saved servers yet.
-                  </li>
-                ) : (
-                  bookmarks.map((b) => {
-                    const isActive =
-                      endpoint !== null && normalizeGrpcUrl(b.url) === normalizeGrpcUrl(endpoint);
-                    return (
-                      <li
-                        key={b.id}
-                        aria-current={isActive ? "true" : undefined}
-                        className={`flex flex-col gap-3 rounded-xl border p-3 transition sm:flex-row sm:items-center sm:justify-between ${
-                          isActive
-                            ? "border-red-600/40 bg-red-950/30 ring-1 ring-red-500/50"
-                            : "border-white/10 bg-black/20 hover:border-red-600/35"
-                        }`}
-                      >
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-medium text-slate-200">
-                            {b.label}
-                          </div>
-                          <code className="break-all text-xs text-amber-200/80">{b.url}</code>
-                        </div>
-                        <div className="flex shrink-0 flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={() => void onUseBookmark(b.url)}
-                            disabled={isActive || connectionSwitching}
-                            className={`${btnBase} border border-red-600/45 bg-red-950/40 px-3 py-2 text-red-100 hover:bg-red-950/60 disabled:pointer-events-none disabled:opacity-40`}
-                          >
-                            Use
-                          </button>
-                          <button
-                            type="button"
-                            disabled={connectionSwitching}
-                            onClick={() => void onOpenStackUpdate(b)}
-                            className={`${btnBase} border border-amber-700/45 bg-amber-950/30 px-3 py-2 text-amber-100 hover:bg-amber-900/40 disabled:pointer-events-none disabled:opacity-40`}
-                          >
-                            <FileArchive className="h-4 w-4" />
-                            Update
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setRenameId(b.id);
-                              setRenameLabel(b.label);
-                              setRenameErr(null);
-                              setRenameOpen(true);
-                            }}
-                            className={`${btnBase} border border-white/10 bg-white/5 px-3 py-2 text-slate-300 hover:bg-white/10`}
-                            title="Rename"
-                          >
-                            <Pencil className="h-4 w-4" />
-                            <span className="sr-only">Rename</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setRemoveId(b.id)}
-                            className={`${btnBase} border border-white/10 bg-white/5 px-3 py-2 text-rose-300 hover:bg-rose-500/10`}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                            <span className="sr-only">Remove</span>
-                          </button>
-                        </div>
-                      </li>
-                    );
-                  })
-                )}
-              </ul>
-              <button
-                type="button"
-                onClick={() => {
-                  setModalAddServerOpen(true);
-                  setModalErr(null);
-                }}
-                className={`${btnBase} mt-4 w-full border border-dashed border-white/20 bg-transparent text-slate-300 hover:border-red-600/50 hover:bg-red-950/30`}
-              >
-                <Plus className="h-4 w-4" />
-                Add server
-              </button>
-            </section>
-            ) : null}
-
-            {mainTab === "overview" ? (
-            <>
-            {/* PaaS: init / build / test / docker / pipeline */}
-            <section
-              className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card"
-              aria-labelledby="paas-heading"
-            >
-              <h2 id="paas-heading" className="text-lg font-semibold text-slate-100">
-                Project pipeline
-              </h2>
-              <p className="mt-2 text-sm text-slate-400">
-                Uses <code className="rounded bg-black/40 px-1 text-amber-200/90">pirate.toml</code> in the
-                selected folder. Run{" "}
-                <strong className="text-slate-300">Init</strong> once, then{" "}
-                <strong className="text-slate-300">Build &amp; deploy</strong> for the full pipeline.
-              </p>
-              <div className="mt-4 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  disabled={paasBusy || !paasPath}
-                  onClick={() =>
-                    void runPaas("Init project", async () => {
-                      const s = await invoke<string>("paas_init_project", {
-                        path: paasPath,
-                        name: null,
-                      });
-                      setPaasMsg(`Created: ${s}`);
-                    })
-                  }
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  Init project
-                </button>
-                <button
-                  type="button"
-                  disabled={paasBusy || !paasPath}
-                  onClick={() =>
-                    void runPaas("Scan", async () => {
-                      const s = await invoke<string>("paas_scan_project", {
-                        path: paasPath,
-                        dryRun: false,
-                      });
-                      setPaasMsg(s);
-                    })
-                  }
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  Scan
-                </button>
-                <button
-                  type="button"
-                  disabled={paasBusy || !paasPath}
-                  onClick={() =>
-                    void runPaas("Build", async () => {
-                      const s = await invoke<string>("paas_project_build", { path: paasPath });
-                      setPaasMsg(s);
-                    })
-                  }
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  Build
-                </button>
-                <button
-                  type="button"
-                  disabled={paasBusy || !paasPath}
-                  onClick={() =>
-                    void runPaas("Test", async () => {
-                      const s = await invoke<string>("paas_project_test", { path: paasPath });
-                      setPaasMsg(s);
-                    })
-                  }
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  Test
-                </button>
-                <button
-                  type="button"
-                  disabled={paasBusy || !paasPath}
-                  onClick={() =>
-                    void runPaas("Test locally", async () => {
-                      const s = await invoke<string>("paas_test_local", {
-                        path: paasPath,
-                        image: null,
-                      });
-                      setPaasMsg(s);
-                    })
-                  }
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  Test locally
-                </button>
-                <button
-                  type="button"
-                  disabled={paasBusy || !paasPath}
-                  onClick={() =>
-                    void runPaas("Apply gen", async () => {
-                      await invoke("paas_apply_gen", { path: paasPath });
-                      setPaasMsg("Generated run.sh / compose sidecars.");
-                    })
-                  }
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  Apply gen
-                </button>
-                <button
-                  type="button"
-                  disabled={paasBusy || !deployDir || !deployVersion.trim()}
-                  onClick={() =>
-                    void runPaas("Pipeline", async () => {
-                      await invoke("set_active_project", { project_id: deployProject });
-                      const s = await invoke<string>("paas_pipeline", {
-                        path: paasPath,
-                        doInit: false,
-                        name: null,
-                        skipTestLocal: true,
-                        version: deployVersion.trim(),
-                        chunkSize: null,
-                      });
-                      setPaasMsg(s);
-                      try {
-                        const live = await invoke<GrpcConnectResult>("refresh_grpc_status");
-                        setGrpcLive(live);
-                      } catch {
-                        /* ignore */
-                      }
-                    })
-                  }
-                  className={`${btnBase} bg-gradient-to-r from-red-900 to-amber-950 text-white shadow-md shadow-black/40 hover:brightness-110`}
-                >
-                  {paasBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  Build &amp; deploy
-                </button>
-              </div>
-              {paasMsg ? (
-                <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-all text-xs text-slate-400">
-                  {paasMsg}
-                </pre>
-              ) : null}
-            </section>
-
-            {/* 4. Deploy artifact */}
-            <section
-              className="rounded-2xl border border-white/10 bg-surface/90 p-5 shadow-card"
-              aria-labelledby="deploy-heading"
-            >
-              <h2 id="deploy-heading" className="text-lg font-semibold text-slate-100">
-                Deploy artifact
-              </h2>
-              <p className="mt-2 text-sm text-slate-400">
-                Packs the folder as tar.gz and uploads over gRPC (same as CLI{" "}
-                <code className="rounded bg-black/40 px-1 text-amber-200/90">
-                  client deploy
-                </code>
-                ).
-              </p>
-              {deployDir ? (
-                <p className="mt-3 break-all text-sm text-emerald-300/90">
-                  <FolderOpen className="mr-1 inline h-4 w-4" />
-                  {deployDir}
-                </p>
-              ) : (
-                <p className="mt-3 text-sm text-slate-500">No folder selected.</p>
-              )}
-              <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                <label className="block text-xs font-medium text-slate-500">
-                  Version label
-                  <input
-                    value={deployVersion}
-                    onChange={(e) => setDeployVersion(e.target.value)}
-                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35"
-                    placeholder="v1.2.0"
-                  />
-                </label>
-                <label className="block text-xs font-medium text-slate-500">
-                  Project id
-                  <input
-                    value={deployProject}
-                    onChange={(e) => setDeployProject(e.target.value)}
-                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35"
-                    placeholder="default"
-                  />
-                </label>
-              </div>
-              <div className="mt-4 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  disabled={deploying}
-                  onClick={() => void onPickFolder()}
-                  className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
-                >
-                  <FolderOpen className="h-4 w-4" />
-                  Choose folder…
-                </button>
-                <button
-                  type="button"
-                  disabled={deploying || !deployDir}
-                  onClick={() => void onDeploy()}
-                  className={`${btnBase} bg-gradient-to-r from-red-800 to-amber-900 text-white shadow-md shadow-black/40 hover:brightness-110`}
-                >
-                  {deploying ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  Deploy
-                </button>
-                {deploying ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDeployCancelRequested(true);
-                      setDeployMsg("Cancel requested — if upload already started, it may still complete.");
-                    }}
-                    className={`${btnBase} border border-rose-500/40 text-rose-200 hover:bg-rose-500/10`}
+          </aside>
+        }
+        workspace={
+          <div
+            ref={setWorkspacePortalEl}
+            className="relative flex min-h-0 flex-1 flex-col bg-app"
+          >
+            <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border-subtle bg-panel/95 px-4 py-2.5 backdrop-blur-sm">
+              <div className="min-w-0 flex flex-wrap items-center gap-3">
+                {endpoint ? (
+                  <code
+                    title={endpoint}
+                    className="max-w-[min(100%,28rem)] truncate rounded border border-red-900/35 bg-black/40 px-2 py-1 font-mono text-xs text-orange-200/90 shadow-[inset_0_0_0_1px_rgba(220,38,38,0.12)]"
                   >
-                    <X className="h-4 w-4" />
-                    Cancel
-                  </button>
+                    {endpoint}
+                  </code>
+                ) : (
+                  <span className="text-xs text-slate-500">
+                    {t("dashboard.serverDisconnected")}
+                  </span>
+                )}
+                {grpcLive ? (
+                  <span className={`text-xs ${grpcProcessTone.text}`}>{t("auto.Dashboard_tsx.10")}: {grpcLive.state ?? "—"}</span>
                 ) : null}
               </div>
-              {deploying ? (
-                <div className="mt-4">
-                  <div className="mb-1 flex justify-between text-xs text-slate-500">
-                    <span>Progress</span>
-                    <span>{Math.round(deployProgress)}%</span>
-                  </div>
-                  <ProgressBar ratio={deployProgress / 100} />
+              <div className="flex items-center gap-2">
+                <div className="inline-flex rounded-lg border border-border-subtle bg-black/20 p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setLanguage("ru")}
+                    className={`rounded px-2 py-1 text-[11px] font-semibold ${
+                      language === "ru" ? "bg-red-900/60 text-white" : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    {t("lang.ru")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLanguage("en")}
+                    className={`rounded px-2 py-1 text-[11px] font-semibold ${
+                      language === "en" ? "bg-red-900/60 text-white" : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    {t("lang.en")}
+                  </button>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setMainTab("connection")}
+                  className={`${btnBase} shrink-0 border border-red-900/40 bg-red-950/30 px-3 py-1.5 text-xs text-red-100 hover:bg-red-950/50 hover:shadow-glow`}
+                >
+                  {t("dashboard.connection")}
+                </button>
+              </div>
+            </header>
+            <div
+              className={`flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row ${connectionSwitching ? "cursor-wait" : ""}`}
+              aria-busy={connectionSwitching}
+            >
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                {mainTab === "projects" ? (
+                  <ProjectsPanel
+                    deployDir={deployDir}
+                    deployVersion={deployVersion}
+                    deploying={deploying}
+                    deployProgress={deployProgress}
+                    deployMsg={deployMsg}
+                    deployCancelRequested={deployCancelRequested}
+                    paasBusy={paasBusy}
+                    paasMsg={paasMsg}
+                    endpoint={endpoint}
+                    onSetDeployVersion={setDeployVersion}
+                    onPickFolder={() => void onPickFolder()}
+                    onDeploy={() => void onDeploy()}
+                    onDeployCancelRequest={onDeployCancelRequest}
+                    onPipelineFull={() => {
+                      void onPipelineFull();
+                    }}
+                    onAfterRollback={() => {
+                      void refreshServer();
+                    }}
+                    runPaas={runPaas}
+                    onSelectProjectPath={(path) => setDeployDir(path)}
+                    registryRefreshKey={registryRefreshKey}
+                    onRegistryChanged={bumpRegistryRefresh}
+                    toolchainReport={toolchainReport}
+                    toolchainLoading={toolchainLoading}
+                    toolchainErr={toolchainErr}
+                    onRefreshToolchain={() => {
+                      void refreshToolchain();
+                    }}
+                  />
+                ) : (
+                  <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 md:px-6">
+                    <div
+                      className={mainTab === "overview" ? "contents" : "hidden"}
+                      aria-hidden={mainTab !== "overview"}
+                    >
+                      <section
+                        className="rounded-lg border border-border-subtle bg-panel p-4 shadow-card"
+                        aria-labelledby="conn-summary-heading"
+                      >
+                        <h2
+                          id="conn-summary-heading"
+                          className="text-xs font-medium uppercase tracking-wide text-slate-500"
+                        >
+                          Deploy-server (gRPC)
+                        </h2>
+                        <div className="mt-2 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0 flex-1">
+                            {endpoint ? (
+                              <code className="block truncate rounded-lg border border-border-subtle bg-black/30 px-2 py-1.5 text-sm text-orange-200/90">
+                                {endpoint}
+                              </code>
+                            ) : (
+                              <p className="text-sm text-slate-400">{t("auto.Dashboard_tsx.11")}</p>
+                            )}
+                            <div className="mt-1 space-y-1 text-xs text-slate-500">
+                              {endpoint ? (
+                                grpcLive ? (
+                                  <p>
+                                    <span className="text-orange-400/95">{t("auto.Dashboard_tsx.12")}</span>
+                                  </p>
+                                ) : (
+                                  <p className="text-slate-500">{t("auto.Dashboard_tsx.13")}</p>
+                                )
+                              ) : null}
+                              {grpcLive ? (
+                                <p>
+                                  {t("auto.Dashboard_tsx.14")}:{" "}
+                                  <span className={grpcProcessTone.text}>
+                                    {grpcLive.state ?? "—"}
+                                  </span>
+                                  {deployedVersionUi ? (
+                                    <span className="text-slate-500">
+                                      {" "}
+                                      · {deployedVersionUi.label}{" "}
+                                      <span className="text-slate-300">{deployedVersionUi.value}</span>
+                                    </span>
+                                  ) : null}
+                                  {grpcLive.projectVersion?.trim() ? (
+                                    <span className="text-slate-500">
+                                      {" "}
+                                      · {t("auto.Dashboard_tsx.15")}{" "}
+                                      <span className="text-slate-300">
+                                        {grpcLive.projectVersion.trim()}
+                                      </span>
+                                    </span>
+                                  ) : null}
+                                </p>
+                              ) : null}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setMainTab("connection")}
+                            className={`${btnBase} shrink-0 border border-red-900/50 bg-red-950/40 text-orange-100 hover:bg-red-950/55`}
+                          >
+                            {t("auto.Dashboard_tsx.16")}
+                          </button>
+                        </div>
+                      </section>
+                      <ServerProjectsOverview
+                        grpcEndpoint={endpoint}
+                        controlApiBase={controlApiInput}
+                        serverControlApiPublic={grpcLive?.controlApiHttpUrl?.trim() || null}
+                        serverControlApiDirect={grpcLive?.controlApiHttpUrlDirect?.trim() || null}
+                        modalPortalEl={workspacePortalEl}
+                        onOpenConnectionSettings={() => setMainTab("connection")}
+                        onOpenProjectDeploy={() => setMainTab("projects")}
+                      />
+                    </div>
+                    {mainTab === "internet" ? <InternetTrafficPanel /> : null}
+                    {mainTab === "overview" ? (
+                      <div className="mt-6 flex flex-col gap-6">
+                        <HostMetricsPanel
+                          metrics={metrics}
+                          metricsLoading={metricsLoading}
+                          metricsErr={metricsErr}
+                          useMockMetrics={useMockMetrics}
+                          onLoad={() => void loadMetrics()}
+                          endpoint={endpoint}
+                          seriesBaseUrl={controlApiInput.trim() || null}
+                        />
+                        <DisplayStreamPanel />
+                      </div>
+                    ) : null}
+                    {mainTab === "connection" ? (
+                      <section
+                        className="rounded-lg border border-border-subtle bg-panel p-5 shadow-card transition"
+                        aria-labelledby="server-heading"
+                      >
+                        <h2 id="server-heading" className="sr-only">
+                          {tr("Соединение с сервером", "Server connection")}
+                        </h2>
+                        {bookmarks.length > 0 ? (
+                          <div className="mb-4">
+                            <label
+                              htmlFor="saved-connection-select"
+                              className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-slate-500"
+                            >
+                              {t("auto.Dashboard_tsx.17")}
+                            </label>
+                            <select
+                              id="saved-connection-select"
+                              className="w-full rounded-lg border border-border-subtle bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35 disabled:opacity-60"
+                              value={selectedBookmarkUrl}
+                              onChange={(e) => onSavedConnectionSelect(e.target.value)}
+                              disabled={connectionSwitching}
+                              aria-label={t("auto.Dashboard_tsx.18")}
+                            >
+                              <option value="">
+                                {endpoint && !selectedBookmarkUrl
+                                  ? t("auto.Dashboard_tsx.19")
+                                  : t("auto.Dashboard_tsx.20")}
+                              </option>
+                              {bookmarks.map((b) => (
+                                <option key={b.id} value={b.url}>
+                                  {b.label}
+                                </option>
+                              ))}
+                            </select>
+                            {connectionSwitching ? (
+                              <p className="mt-1.5 text-xs text-slate-500">{t("auto.Dashboard_tsx.21")}</p>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        {!endpoint ? (
+                          <p className="text-sm text-slate-400">{t("auto.Dashboard_tsx.22")}</p>
+                        ) : (
+                          <div className="space-y-4">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Server className="h-5 w-5 text-red-500/90" aria-hidden />
+                              <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                                {t("auto.Dashboard_tsx.23")}
+                              </span>
+                              <code className="max-w-full truncate rounded-lg border border-border-subtle bg-black/40 px-2 py-1 text-sm text-orange-200/90">
+                                {endpoint}
+                              </code>
+                              <button
+                                type="button"
+                                onClick={copyEndpoint}
+                                className={`${btnBase} shrink-0 border border-border-subtle bg-panel-raised p-2`}
+                                title={t("auto.Dashboard_tsx.24")}
+                              >
+                                {copied ? (
+                                  <Check className="h-4 w-4 text-orange-400" />
+                                ) : (
+                                  <Copy className="h-4 w-4" />
+                                )}
+                              </button>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-3">
+                              <span
+                                className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium ${grpcProcessTone.badge}`}
+                              >
+                                <span
+                                  className={`h-2.5 w-2.5 rounded-full ${grpcProcessTone.dot}`}
+                                  aria-hidden
+                                />
+                                {t("auto.Dashboard_tsx.25")}: {grpcLive?.state ?? "—"}
+                              </span>
+                              <span className="text-sm text-slate-400">
+                                {deployedVersionUi ? (
+                                  <>
+                                    {deployedVersionUi.label}{" "}
+                                    <strong className="text-slate-200">{deployedVersionUi.value}</strong>
+                                  </>
+                                ) : (
+                                  <>
+                                    {t("auto.Dashboard_tsx.26")}{" "}
+                                    <strong className="text-slate-200">
+                                      {grpcLive?.currentVersion || "—"}
+                                    </strong>
+                                  </>
+                                )}
+                              </span>
+                              {grpcLive?.projectVersion?.trim() ? (
+                                <span className="text-sm text-slate-400">
+                                  · pirate.toml{" "}
+                                  <strong className="text-slate-200">{grpcLive.projectVersion.trim()}</strong>
+                                </span>
+                              ) : null}
+                            </div>
+                          </div>
+                        )}
+                        <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              disabled={serverLoading || !endpoint}
+                              onClick={() => void refreshServer()}
+                              className={`${btnBase} bg-red-800 text-white shadow-glow hover:bg-red-700 disabled:opacity-40`}
+                            >
+                              {serverLoading ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <RefreshCw className="h-4 w-4" />
+                              )}
+                              {t("auto.Dashboard_tsx.27")}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConnectionWizardMode(false);
+                                setModalConnectOpen(true);
+                                setModalErr(null);
+                              }}
+                              className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200 hover:bg-white/[0.06]`}
+                            >
+                              {t("auto.Dashboard_tsx.28")}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConnectionWizardMode(true);
+                                setModalConnectOpen(true);
+                                setModalErr(null);
+                              }}
+                              className={`${btnBase} border border-red-900/45 bg-red-950/35 text-orange-100`}
+                            >
+                              {t("auto.Dashboard_tsx.29")}
+                            </button>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!endpoint}
+                            onClick={() => void onDisconnect()}
+                            title={tr("Сбросить gRPC-сессию на этом компьютере", "Clear gRPC session on this machine")}
+                            className={`${btnBase} shrink-0 border border-rose-500/40 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20`}
+                          >
+                            {t("auto.Dashboard_tsx.30")}
+                          </button>
+                        </div>
+                        {grpcErr ? (
+                          <p className="mt-3 flex items-start gap-2 text-sm text-rose-300">
+                            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                            {grpcErr}
+                          </p>
+                        ) : null}
+                      </section>
+                    ) : null}
+                    {mainTab === "connection" ? (
+                      <section
+                        className="mt-6 rounded-lg border border-border-subtle bg-panel p-5 shadow-card"
+                        aria-labelledby="bookmarks-heading"
+                      >
+                        <h2 id="bookmarks-heading" className="text-lg font-semibold text-slate-100">
+                          {t("auto.Dashboard_tsx.31")}
+                        </h2>
+                        <ul className="mt-4 divide-y divide-border-subtle rounded-lg border border-border-subtle">
+                          {bookmarks.length === 0 ? (
+                            <li className="p-4 text-center">
+                              <p className="text-sm text-slate-500">{t("auto.Dashboard_tsx.32")}</p>
+                              <p className="mt-2 text-xs text-slate-600">
+                                {tr(
+                                  "Добавьте URL из install JSON или вставьте gRPC-адрес сервера.",
+                                  "Add a URL from install JSON or paste the server gRPC address.",
+                                )}
+                              </p>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setModalAddServerOpen(true);
+                                  setModalErr(null);
+                                }}
+                                className={`${btnBase} mt-3 border border-red-900/50 bg-red-950/40 px-4 py-2 text-xs text-orange-100 hover:bg-red-950/55`}
+                              >
+                                <Plus className="h-4 w-4" />
+                                {t("auto.Dashboard_tsx.38")}
+                              </button>
+                            </li>
+                          ) : (
+                            bookmarks.map((b) => {
+                              const isActive =
+                                endpoint !== null && normalizeGrpcUrl(b.url) === normalizeGrpcUrl(endpoint);
+                              return (
+                                <li
+                                  key={b.id}
+                                  aria-current={isActive ? "true" : undefined}
+                                  className={`flex flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between ${
+                                    isActive ? "bg-red-950/25" : ""
+                                  }`}
+                                >
+                                  <div className="min-w-0">
+                                    <div className="truncate text-sm font-medium text-slate-200">{b.label}</div>
+                                    <code className="break-all text-xs text-orange-200/80">{b.url}</code>
+                                  </div>
+                                  <div className="flex shrink-0 flex-wrap gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => void onUseBookmark(b.url)}
+                                      disabled={isActive || connectionSwitching}
+                                      className={`${btnBase} border border-red-900/50 bg-red-950/40 px-3 py-1.5 text-xs text-orange-100 disabled:pointer-events-none disabled:opacity-40`}
+                                    >
+                                      {t("auto.Dashboard_tsx.33")}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={connectionSwitching}
+                                      onClick={() => void onOpenStackUpdate(b)}
+                                      className={`${btnBase} border border-red-900/45 bg-red-950/30 px-3 py-1.5 text-xs text-orange-100 disabled:pointer-events-none disabled:opacity-40`}
+                                    >
+                                      <FileArchive className="h-4 w-4" />
+                                      {t("auto.Dashboard_tsx.34")}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={connectionSwitching}
+                                      onClick={() => setServerSettingsBookmark(b)}
+                                      className={`${btnBase} border border-border-subtle bg-panel-raised px-3 py-1.5 text-xs text-slate-200 disabled:pointer-events-none disabled:opacity-40`}
+                                      title={t("auto.Dashboard_tsx.35")}
+                                    >
+                                      <Settings className="h-4 w-4" />
+                                      <span className="sr-only">{t("auto.Dashboard_tsx.36")}</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setRemoveId(b.id)}
+                                      className={`${btnBase} border border-border-subtle bg-panel-raised px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-500/10`}
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                      <span className="sr-only">{t("auto.Dashboard_tsx.37")}</span>
+                                    </button>
+                                  </div>
+                                </li>
+                              );
+                            })
+                          )}
+                        </ul>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setModalAddServerOpen(true);
+                            setModalErr(null);
+                          }}
+                          className={`${btnBase} mt-4 w-full border border-dashed border-border-subtle bg-transparent text-slate-300 hover:border-orange-500/45 hover:bg-red-950/25`}
+                        >
+                          <Plus className="h-4 w-4" />
+                          {t("auto.Dashboard_tsx.38")}
+                        </button>
+                      </section>
+                    ) : null}
+                  </div>
+                )}
+              </div>
+              {mainTab !== "projects" ? (
+                <OverviewContextPanel
+                  endpoint={endpoint}
+                  grpcErr={grpcErr}
+                  processBadgeClass={grpcProcessTone.badge}
+                  processDotClass={grpcProcessTone.dot}
+                  processStateLabel={grpcLive?.state ?? "—"}
+                  deployedLabel={deployedVersionUi?.label ?? null}
+                  deployedValue={
+                    deployedVersionUi?.value ?? grpcLive?.currentVersion?.trim() ?? ""
+                  }
+                  projectVersion={grpcLive?.projectVersion?.trim() ?? null}
+                  tab={mainTab === "overview" ? "overview" : mainTab === "connection" ? "connection" : "internet"}
+                  onOpenConnection={() => setMainTab("connection")}
+                />
               ) : null}
-              {deployMsg ? (
-                <p className="mt-3 text-sm text-slate-400">{deployMsg}</p>
-              ) : null}
-              {/* Tauri: invoke('deploy_from_directory', { directory, version, chunkSize }) */}
-            </section>
-
-            </>
-            ) : null}
+            </div>
           </div>
-        ) : null}
-        </div>
-      </div>
+        }
+      />
+
+      {/* In-app confirm instead of window.confirm for host services (deploy / pipeline) */}
+      {hostSvcPromptMessage ? (
+        <ModalDialog
+          open
+          zClassName="z-modalConfirm"
+          onClose={() => resolveHostSvcPrompt(false)}
+          panelClassName="w-full max-w-md"
+          role="alertdialog"
+          aria-labelledby="host-svc-confirm-title"
+        >
+          <div className="rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+            <h3 id="host-svc-confirm-title" className="text-lg font-semibold text-slate-100">
+              {tr("Проверка хост-сервисов", "Host services")}
+            </h3>
+            <p className="mt-2 break-words text-sm text-slate-400">{hostSvcPromptMessage}</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                data-modal-initial-focus
+                onClick={() => resolveHostSvcPrompt(false)}
+                className={`${btnBase} border border-white/10 bg-white/5`}
+              >
+                {tr("Отмена", "Cancel")}
+              </button>
+              <button
+                type="button"
+                onClick={() => resolveHostSvcPrompt(true)}
+                className={`${btnBase} bg-gradient-to-r from-red-700 to-red-950 text-white shadow-md shadow-red-950/50`}
+              >
+                {tr("Продолжить", "Continue")}
+              </button>
+            </div>
+          </div>
+        </ModalDialog>
+      ) : null}
+
+      {/* Modal: pirate CLI missing from PATH */}
+      {pirateCliPromptOpen ? (
+        <ModalDialog
+          open
+          zClassName="z-modalElevated"
+          onClose={() => setPirateCliPromptOpen(false)}
+          aria-labelledby="pirate-cli-prompt-title"
+        >
+          <div className="rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-lg bg-orange-500/15 p-2 text-orange-200">
+                <Terminal className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 id="pirate-cli-prompt-title" className="text-lg font-semibold text-slate-100">
+                  Команда pirate не найдена в терминале
+                </h3>
+                <p className="mt-2 text-sm text-slate-400">
+                  {t("auto.Dashboard_tsx.39")}{" "}
+                  <code className="rounded bg-black/30 px-1">pirate auth</code> {t("auto.Dashboard_tsx.40")}{" "}
+                  <code className="rounded bg-black/30 px-1">pirate</code>{" "}
+                  {t("auto.Dashboard_tsx.41")}
+                </p>
+                {pirateCliInstallResult ? (
+                  <p
+                    className={`mt-3 rounded-xl border px-3 py-2 text-sm ${
+                      pirateCliInstallResultErr
+                        ? "border-rose-500/30 bg-rose-950/30 text-rose-100/90"
+                        : "border-orange-600/35 bg-orange-950/25 text-orange-100/90"
+                    }`}
+                  >
+                    {pirateCliInstallResult}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                disabled={pirateCliInstallBusy}
+                onClick={() => {
+                  setPirateCliInstallResult(null);
+                  setPirateCliInstallResultErr(false);
+                  setPirateCliInstallBusy(true);
+                  void (async () => {
+                    try {
+                      const msg = await invoke<string>("install_pirate_cli");
+                      setPirateCliInstallResultErr(false);
+                      setPirateCliInstallResult(msg);
+                      const ok = await invoke<boolean>("is_pirate_cli_available");
+                      if (ok) {
+                        setPirateCliPromptOpen(false);
+                      }
+                    } catch (e) {
+                      setPirateCliInstallResultErr(true);
+                      setPirateCliInstallResult(String(e));
+                    } finally {
+                      setPirateCliInstallBusy(false);
+                    }
+                  })();
+                }}
+                className={`${btnBase} bg-gradient-to-r from-red-700 to-red-950 text-white shadow-md shadow-red-950/50 disabled:opacity-60`}
+              >
+                {pirateCliInstallBusy ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Terminal className="h-4 w-4" />
+                )}
+                {tr("Установить pirate в PATH", "Install pirate to PATH")}
+              </button>
+              <button
+                type="button"
+                disabled={pirateCliInstallBusy}
+                onClick={() => setPirateCliPromptOpen(false)}
+                className={`${btnBase} border border-white/10 bg-white/5`}
+              >
+                {tr("Позже", "Later")}
+              </button>
+              <button
+                type="button"
+                disabled={pirateCliInstallBusy}
+                onClick={() => {
+                  localStorage.setItem("pirateDesktop.pirateCliPromptDismissed", "1");
+                  setPirateCliPromptOpen(false);
+                }}
+                className={`${btnBase} border border-white/10 bg-white/5`}
+              >
+                {tr("Не напоминать", "Do not remind")}
+              </button>
+            </div>
+          </div>
+        </ModalDialog>
+      ) : null}
 
       {/* Modal: connect / change endpoint */}
       {modalConnectOpen ? (
-        <div
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
-          onClick={(e) => e.target === e.currentTarget && setModalConnectOpen(false)}
+        <ModalDialog
+          open
+          zClassName="z-modal"
+          onClose={() => {
+            setModalConnectOpen(false);
+            setConnectionWizardMode(false);
+          }}
         >
-          <div className="w-full max-w-lg rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
-            <h3 className="text-lg font-semibold text-slate-100">Connect to deploy-server</h3>
+          <div className="rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+            <h3 className="text-lg font-semibold text-slate-100">
+              {connectionWizardMode
+                ? tr("Мастер подключения", "Connection wizard")
+                : tr("Подключение к deploy-server", "Connect to deploy-server")}
+            </h3>
             <p className="mt-2 text-sm text-slate-400">
-              Paste install JSON or <code className="rounded bg-black/30 px-1">{"{ \"url\": \"http://…\" }"}</code>
+              {connectionWizardMode
+                ? tr(
+                    "Вставьте install JSON с сервера или минимальный JSON с полем url. HTTP control-api для графиков и REST задайте в настройках сервера (шестеренка в списке сохраненных серверов на вкладке «Соединение»).",
+                    "Paste install JSON from server or minimal JSON with url field. Set HTTP control-api for charts and REST in server settings (gear icon in saved servers list on Connection tab).",
+                  )
+                : tr("Вставьте install JSON или ", "Paste install JSON or ")}
+              {!connectionWizardMode ? (
+                <code className="rounded bg-black/30 px-1">{"{ \"url\": \"http://…\" }"}</code>
+              ) : null}
             </p>
             <textarea
               value={bundleInput}
@@ -1226,38 +1624,46 @@ export function Dashboard() {
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setModalConnectOpen(false)}
+                onClick={() => {
+                  setModalConnectOpen(false);
+                  setConnectionWizardMode(false);
+                }}
                 className={`${btnBase} border border-white/10 bg-white/5`}
               >
-                Cancel
+                {tr("Отмена", "Cancel")}
               </button>
               <button
                 type="button"
                 onClick={() => void onConnectSubmit()}
                 className={`${btnBase} bg-gradient-to-r from-red-700 to-red-950 text-white shadow-md shadow-red-950/50`}
               >
-                Connect
+                {connectionWizardMode ? tr("Подключить", "Connect") : tr("Подключить", "Connect")}
               </button>
             </div>
           </div>
-        </div>
+        </ModalDialog>
       ) : null}
 
       {/* Modal: add server */}
       {modalAddServerOpen ? (
-        <div
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
-          onClick={(e) => e.target === e.currentTarget && setModalAddServerOpen(false)}
-        >
-          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
-            <h3 className="text-lg font-semibold text-slate-100">Add server</h3>
-            <input
+        <ModalDialog open zClassName="z-modal" onClose={() => setModalAddServerOpen(false)}>
+          <div className="rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+            <h3 className="text-lg font-semibold text-slate-100">{t("auto.Dashboard_tsx.42")}</h3>
+            <p className="mt-2 text-sm text-slate-400">
+              {t("auto.Dashboard_tsx.43")} <code className="rounded bg-black/30 px-1">http://host:50051</code>,{" "}
+              {t("auto.Dashboard_tsx.44")}{" "}
+              <code className="rounded bg-black/30 px-1">url</code> {t("auto.Dashboard_tsx.45")} (
+              <code className="rounded bg-black/30 px-1">token</code>, <code className="rounded bg-black/30 px-1">
+                url
+              </code>
+              , <code className="rounded bg-black/30 px-1">pairing</code>) — {t("auto.Dashboard_tsx.46")}
+            </p>
+            <textarea
               value={addUrlInput}
               onChange={(e) => setAddUrlInput(e.target.value)}
-              className="mt-3 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35"
-              placeholder="http://192.168.0.30:50051"
+              rows={6}
+              className="mt-3 w-full resize-y rounded-xl border border-white/10 bg-black/40 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35"
+              placeholder={`http://192.168.0.30:50051\n\nили\n{"url":"http://192.168.0.30:50051"}`}
             />
             {modalErr ? <p className="mt-2 text-sm text-rose-400">{modalErr}</p> : null}
             <div className="mt-4 flex justify-end gap-2">
@@ -1266,128 +1672,99 @@ export function Dashboard() {
                 onClick={() => setModalAddServerOpen(false)}
                 className={`${btnBase} border border-white/10 bg-white/5`}
               >
-                Cancel
+                {t("auto.Dashboard_tsx.47")}
               </button>
               <button
                 type="button"
                 onClick={() => void onAddServer()}
                 className={`${btnBase} bg-gradient-to-r from-red-700 to-red-950 text-white shadow-md shadow-red-950/50`}
               >
-                Save
+                {t("auto.Dashboard_tsx.48")}
               </button>
             </div>
           </div>
-        </div>
+        </ModalDialog>
       ) : null}
 
-      {/* Modal: rename bookmark */}
-      {renameOpen ? (
-        <div
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="rename-bookmark-title"
-          onClick={(e) => e.target === e.currentTarget && setRenameOpen(false)}
-        >
-          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
-            <h3 id="rename-bookmark-title" className="text-lg font-semibold text-slate-100">
-              Rename server
-            </h3>
-            <label className="mt-3 block text-xs font-medium text-slate-500" htmlFor="rename-bookmark-input">
-              Label
-            </label>
-            <input
-              id="rename-bookmark-input"
-              value={renameLabel}
-              onChange={(e) => setRenameLabel(e.target.value)}
-              className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35"
-              placeholder="Production"
-            />
-            {renameErr ? <p className="mt-2 text-sm text-rose-400">{renameErr}</p> : null}
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setRenameOpen(false);
-                  setRenameId(null);
-                  setRenameErr(null);
-                }}
-                className={`${btnBase} border border-white/10 bg-white/5`}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void onRenameSubmit()}
-                className={`${btnBase} bg-gradient-to-r from-red-700 to-red-950 text-white shadow-md shadow-red-950/50`}
-              >
-                Save
-              </button>
-            </div>
-          </div>
-        </div>
+      {serverSettingsBookmark ? (
+        <ServerBookmarkSettingsModal
+          open
+          onClose={() => setServerSettingsBookmark(null)}
+          bookmark={serverSettingsBookmark}
+          activeEndpoint={endpoint}
+          savedControlApiBase={controlApiInput}
+          onBookmarkRenamed={loadBookmarks}
+          hostUiBundled={serverSettingsHostUiBundled}
+        />
       ) : null}
 
       {/* Modal: server stack update */}
       {stackModalOpen ? (
-        <div
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
+        <ModalDialog
+          open
+          zClassName="z-modal"
+          onClose={() => {
+            if (stackUploading) void invoke("server_stack_upload_cancel");
+            setStackModalOpen(false);
+          }}
+          panelClassName="w-full max-w-2xl max-h-[90vh] min-h-0"
           aria-labelledby="stack-update-title"
-          onClick={(e) => e.target === e.currentTarget && setStackModalOpen(false)}
         >
-          <div className="w-full max-w-2xl rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+          <div className="max-h-[90vh] overflow-y-auto rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <h3 id="stack-update-title" className="text-lg font-semibold text-slate-100">
-                  Server stack update
+                  {t("auto.Dashboard_tsx.49")}
                 </h3>
                 <p className="mt-1 text-sm text-slate-400">
                   {stackTargetLabel ? (
                     <>
-                      Target: <span className="text-slate-200">{stackTargetLabel}</span>
+                      {t("auto.Dashboard_tsx.50")}: <span className="text-slate-200">{stackTargetLabel}</span>
                     </>
                   ) : (
-                    "Update the currently connected server."
+                    t("auto.Dashboard_tsx.51")
                   )}
                 </p>
                 {stackTargetUrl ? (
-                  <code className="mt-2 block break-all rounded bg-black/40 px-2 py-1 text-xs text-amber-200/90">
+                  <code className="mt-2 block break-all rounded bg-black/40 px-2 py-1 text-xs text-orange-200/90">
                     {stackTargetUrl}
                   </code>
                 ) : null}
               </div>
               <button
                 type="button"
-                onClick={() => setStackModalOpen(false)}
+                onClick={() => {
+                  if (stackUploading) void invoke("server_stack_upload_cancel");
+                  setStackModalOpen(false);
+                }}
                 className={`${btnBase} border border-white/10 bg-white/5 p-2`}
-                title="Close"
+                title={t("auto.Dashboard_tsx.52")}
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
 
             <p className="mt-4 text-sm text-slate-400">
-              Upload the Linux bundle (e.g.{" "}
-              <code className="rounded bg-black/40 px-1 text-amber-200/90">pirate-linux-amd64*.tar.gz</code>{" "}
-              from <code className="rounded bg-black/40 px-1">build-linux-bundle.sh</code>). Requires{" "}
-              <code className="rounded bg-black/40 px-1">DEPLOY_ALLOW_SERVER_STACK_UPDATE=1</code> on the host.
+              {t("auto.Dashboard_tsx.53")}
+              <code className="rounded bg-black/40 px-1 text-orange-200/90">pirate-linux-amd64*.tar.gz</code>{" "}
+              {t("auto.Dashboard_tsx.54")}<code className="rounded bg-black/40 px-1">build-linux-bundle.sh</code>
+              {t("auto.Dashboard_tsx.55")}
+              <code className="rounded bg-black/40 px-1">DEPLOY_ALLOW_SERVER_STACK_UPDATE=1</code> {t("auto.Dashboard_tsx.56")}
             </p>
             <p className="mt-1 text-xs text-slate-500">
-              Local UI release (repo <code className="rounded bg-black/30 px-1">VERSION</code>):{" "}
+              {t("auto.Dashboard_tsx.57")}<code className="rounded bg-black/30 px-1">VERSION</code>):{" "}
               {import.meta.env.VITE_APP_RELEASE}
             </p>
             {stackPath ? (
-              <p className="mt-3 break-all text-sm text-emerald-300/90">
+              <p className="mt-3 break-all text-sm text-orange-300/90">
                 <FolderOpen className="mr-1 inline h-4 w-4" />
                 {stackPath}
               </p>
             ) : (
-              <p className="mt-3 text-sm text-slate-500">No bundle path selected.</p>
+              <p className="mt-3 text-sm text-slate-500">{t("auto.Dashboard_tsx.58")}</p>
             )}
             <label className="mt-4 block text-xs font-medium text-slate-500">
-              Stack version label
+              {t("auto.Dashboard_tsx.59")}
               <input
                 value={stackVersion}
                 onChange={(e) => setStackVersion(e.target.value)}
@@ -1409,10 +1786,10 @@ export function Dashboard() {
                 type="button"
                 disabled={stackUploading || !stackPath}
                 onClick={() => void onApplyServerStack()}
-                className={`${btnBase} bg-gradient-to-r from-amber-900 to-red-900 text-white shadow-md shadow-black/40 hover:brightness-110`}
+                className={`${btnBase} bg-gradient-to-r from-red-900 to-red-950 text-white shadow-md shadow-black/40 hover:brightness-110`}
               >
                 {stackUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                Apply stack
+                {t("auto.Dashboard_tsx.60")}
               </button>
               <button
                 type="button"
@@ -1421,16 +1798,23 @@ export function Dashboard() {
                 className={`${btnBase} border border-white/15 bg-white/5 hover:bg-white/10`}
               >
                 <RefreshCw className="h-4 w-4" />
-                Stack info
+                {t("auto.Dashboard_tsx.61")}
               </button>
             </div>
             {stackUploading ? (
               <div className="mt-4">
                 <div className="mb-1 flex justify-between text-xs text-slate-500">
-                  <span>Upload</span>
+                  <span>{t("auto.Dashboard_tsx.62")}</span>
                   <span>{Math.round(stackProgress)}%</span>
                 </div>
                 <ProgressBar ratio={stackProgress / 100} />
+                <button
+                  type="button"
+                  onClick={() => void invoke("server_stack_upload_cancel")}
+                  className={`${btnBase} mt-2 border border-rose-500/40 text-rose-200`}
+                >
+                  {tr("Отменить загрузку стека", "Cancel stack upload")}
+                </button>
               </div>
             ) : null}
             {stackInfo ? (
@@ -1438,39 +1822,39 @@ export function Dashboard() {
                 <div className="mt-3 space-y-3 rounded-xl border border-white/10 bg-black/25 p-3">
                   <div className="grid gap-2 sm:grid-cols-2">
                     <div className="rounded-lg border border-white/10 bg-black/30 p-2">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Bundle version</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{t("auto.Dashboard_tsx.63")}</p>
                       <p className="mt-1 break-all text-sm text-slate-200">
                         {formatMaybe(parsedStackInfo.bundleVersion)}
                       </p>
                     </div>
                     <div className="rounded-lg border border-white/10 bg-black/30 p-2">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Deploy-server binary</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{t("auto.Dashboard_tsx.64")}</p>
                       <p className="mt-1 break-all text-sm text-slate-200">
                         {formatMaybe(parsedStackInfo.deployServerBinaryVersion)}
                       </p>
                     </div>
                     <div className="rounded-lg border border-white/10 bg-black/30 p-2">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Host dashboard enabled</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{t("auto.Dashboard_tsx.65")}</p>
                       <p className="mt-1 text-sm text-slate-200">
                         {formatMaybe(parsedStackInfo.hostDashboardEnabled)}
                       </p>
                     </div>
                     <div className="rounded-lg border border-white/10 bg-black/30 p-2">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Nginx pirate site</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{t("auto.Dashboard_tsx.66")}</p>
                       <p className="mt-1 text-sm text-slate-200">
                         {formatMaybe(parsedStackInfo.hostNginxPirateSite)}
                       </p>
                     </div>
                     <div className="rounded-lg border border-white/10 bg-black/30 p-2">
                       <p className="text-[11px] uppercase tracking-wide text-slate-500">
-                        GUI detected at install
+                        {t("auto.Dashboard_tsx.67")}
                       </p>
                       <p className="mt-1 break-all text-sm text-slate-200">
                         {formatMaybe(parsedStackInfo.hostGuiDetectedAtInstall)}
                       </p>
                     </div>
                     <div className="rounded-lg border border-white/10 bg-black/30 p-2">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">GUI install json</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{t("auto.Dashboard_tsx.68")}</p>
                       <p className="mt-1 break-all text-sm text-slate-200">
                         {formatMaybe(parsedStackInfo.hostGuiInstallJson)}
                       </p>
@@ -1478,7 +1862,7 @@ export function Dashboard() {
                   </div>
                   {parsedManifest ? (
                     <div>
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Manifest</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{t("auto.Dashboard_tsx.69")}</p>
                       <div className="mt-1 max-h-44 overflow-auto rounded-lg bg-black/40 p-2">
                         {Object.entries(parsedManifest).map(([key, value]) => (
                           <div
@@ -1493,7 +1877,7 @@ export function Dashboard() {
                     </div>
                   ) : parsedStackInfo.manifestJson ? (
                     <div>
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Manifest (raw)</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{t("auto.Dashboard_tsx.70")}</p>
                       <pre className="mt-1 max-h-32 overflow-auto rounded-lg bg-black/40 p-2 text-xs text-slate-400">
                         {parsedStackInfo.manifestJson}
                       </pre>
@@ -1514,39 +1898,55 @@ export function Dashboard() {
                 onClick={() => setStackModalOpen(false)}
                 className={`${btnBase} border border-white/10 bg-white/5`}
               >
-                Close
+                {t("auto.Dashboard_tsx.71")}
               </button>
             </div>
           </div>
-        </div>
+        </ModalDialog>
       ) : null}
 
       {/* Confirm remove */}
       {removeId ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4" role="alertdialog">
-          <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
-            <h3 className="font-semibold text-slate-100">Remove server?</h3>
-            <p className="mt-2 text-sm text-slate-400">This cannot be undone.</p>
+        <ModalDialog
+          open
+          zClassName="z-modalConfirm"
+          onClose={() => setRemoveId(null)}
+          panelClassName="w-full max-w-sm"
+          role="alertdialog"
+          aria-labelledby="remove-bookmark-title"
+        >
+          <div className="rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+            <h3 id="remove-bookmark-title" className="font-semibold text-slate-100">
+              {t("auto.Dashboard_tsx.72")}
+            </h3>
+            <p className="mt-2 text-sm text-slate-400">{t("auto.Dashboard_tsx.73")}</p>
+            {removeBookmarkEntry ? (
+              <div className="mt-3 rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-left">
+                <p className="truncate text-sm font-medium text-slate-200">{removeBookmarkEntry.label}</p>
+                <code className="mt-1 block break-all text-xs text-orange-200/80">{removeBookmarkEntry.url}</code>
+              </div>
+            ) : null}
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
+                data-modal-initial-focus
                 onClick={() => setRemoveId(null)}
                 className={`${btnBase} border border-white/10 bg-white/5`}
               >
-                Cancel
+                {t("auto.Dashboard_tsx.74")}
               </button>
               <button
                 type="button"
                 onClick={() => void onRemoveBookmark()}
                 className={`${btnBase} bg-rose-600 text-white hover:bg-rose-500`}
               >
-                Remove
+                {t("auto.Dashboard_tsx.75")}
               </button>
             </div>
           </div>
-        </div>
+        </ModalDialog>
       ) : null}
-    </div>
+    </>
   );
 }
 

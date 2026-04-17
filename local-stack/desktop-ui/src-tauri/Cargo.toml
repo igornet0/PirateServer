@@ -1,6 +1,6 @@
 [package]
 name = "pirate-client"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Pirate Client — Tauri desktop shell"
 
@@ -20,3 +20,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 tracing-appender = "0.2"
 dirs = "5"
+open = "5"

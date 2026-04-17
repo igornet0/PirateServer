@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Globe, Loader2, Power, ScrollText, X } from "lucide-react";
 import React, { useCallback, useEffect, useState } from "react";
+import { useI18n } from "./i18n";
 
 type InternetProxyStatus = {
   running: boolean;
@@ -67,7 +68,12 @@ function linesToArr(s: string): string[] {
     .filter(Boolean);
 }
 
+type InternetUiMode = "basic" | "advanced";
+
 export function InternetTrafficPanel() {
+  const { language, t } = useI18n();
+  const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
+    const [internetMode, setInternetMode] = useState<InternetUiMode>("basic");
   const [status, setStatus] = useState<InternetProxyStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [settingsText, setSettingsText] = useState("");
@@ -225,7 +231,7 @@ export function InternetTrafficPanel() {
     setBusy(true);
     try {
       await invoke("save_client_settings_json", { text: settingsText });
-      setSettingsMsg("Сохранено в settings.json (как у CLI pirate).");
+      setSettingsMsg(t("auto.InternetTrafficPanel_tsx.1"));
     } catch (e) {
       setSettingsMsg(String(e));
     } finally {
@@ -241,7 +247,7 @@ export function InternetTrafficPanel() {
       await invoke("apply_default_rules_preset_cmd", { preset });
       await loadSettings();
       await loadRulesForm();
-      setSettingsMsg("Пресет применён (файлы default-rules перезаписаны).");
+      setSettingsMsg(t("auto.InternetTrafficPanel_tsx.2"));
     } catch (e) {
       setSettingsMsg(String(e));
     } finally {
@@ -254,13 +260,13 @@ export function InternetTrafficPanel() {
     setRulesMsg(null);
     setBusy(true);
     try {
-      const t = categoriesOurText.trim();
+      const categoriesText = categoriesOurText.trim();
       let categoriesOur: unknown = undefined;
-      if (t) {
+      if (categoriesText) {
         try {
-          categoriesOur = JSON.parse(t) as unknown;
+          categoriesOur = JSON.parse(categoriesText) as unknown;
         } catch {
-          setRulesMsg("categories_our: невалидный JSON");
+          setRulesMsg(t("auto.InternetTrafficPanel_tsx.3"));
           setBusy(false);
           return;
         }
@@ -270,7 +276,7 @@ export function InternetTrafficPanel() {
         our: { ...bundlesForm.our, categoriesOur },
       };
       await invoke("save_default_rules_bundles_form", { form });
-      setRulesMsg("Правила сохранены (user-*.json + пути в settings).");
+      setRulesMsg(t("auto.InternetTrafficPanel_tsx.4"));
       await loadSettings();
       await loadRulesForm();
     } catch (e) {
@@ -286,7 +292,7 @@ export function InternetTrafficPanel() {
     setBusy(true);
     try {
       await invoke("save_board_rules_form", { form: boardForm });
-      setBoardMsg("Настройки доски сохранены.");
+      setBoardMsg(t("auto.InternetTrafficPanel_tsx.5"));
       await loadSettings();
     } catch (e) {
       setBoardMsg(String(e));
@@ -317,25 +323,54 @@ export function InternetTrafficPanel() {
             id="internet-traffic-heading"
             className="text-sm font-semibold tracking-tight text-slate-100"
           >
-            Интернет-трафик через клиент
+            {t("auto.InternetTrafficPanel_tsx.6")}
           </h2>
           <p className="mt-1 text-xs leading-relaxed text-slate-500">
-            Локальный прокси HTTP CONNECT на этом Mac; трафик, отправляемый на сервер, идёт по
-            подписанному gRPC <code className="text-slate-400">ProxyTunnel</code>. Для HTTPS
-            правила смотрят только <strong className="text-slate-400">имя хоста</strong> из CONNECT,
-            не путь и не тело запроса.
+            {tr(
+              "Локальный прокси HTTP CONNECT на этом Mac; трафик к серверу идет через подписанный gRPC ",
+              "Local HTTP CONNECT proxy on this Mac; traffic sent to server goes via signed gRPC ",
+            )}
+            <code className="text-slate-400">ProxyTunnel</code>.{" "}
+            {tr(
+              "Для HTTPS правила анализируют только имя хоста из CONNECT, не путь и не тело запроса.",
+              "For HTTPS, rules inspect only host name from CONNECT, not path or request body.",
+            )}
           </p>
+          <div className="mt-3 inline-flex rounded-xl border border-white/10 p-0.5">
+            <button
+              type="button"
+              onClick={() => setInternetMode("basic")}
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium ${
+                internetMode === "basic"
+                  ? "bg-red-900/60 text-white"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              {t("auto.InternetTrafficPanel_tsx.7")}
+            </button>
+            <button
+              type="button"
+              onClick={() => setInternetMode("advanced")}
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium ${
+                internetMode === "advanced"
+                  ? "bg-red-900/60 text-white"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              {t("auto.InternetTrafficPanel_tsx.8")}
+            </button>
+          </div>
         </div>
       </div>
 
       <div className="mt-4 flex flex-wrap items-center gap-3">
-        <span className="text-xs uppercase tracking-wide text-slate-500">Статус</span>
+        <span className="text-xs uppercase tracking-wide text-slate-500">{t("auto.InternetTrafficPanel_tsx.9")}</span>
         <span
           className={`rounded-lg px-2 py-1 text-xs font-medium ${
             status?.running ? "bg-emerald-950/60 text-emerald-300" : "bg-black/30 text-slate-400"
           }`}
         >
-          {status?.running ? "Запущен" : "Остановлен"}
+          {status?.running ? t("auto.InternetTrafficPanel_tsx.10") : t("auto.InternetTrafficPanel_tsx.11")}
         </span>
         {status?.lastError ? (
           <span className="max-w-full truncate text-xs text-rose-300" title={status.lastError}>
@@ -356,7 +391,7 @@ export function InternetTrafficPanel() {
           }
         >
           {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
-          {status?.running ? "Остановить" : "Запустить"}
+          {status?.running ? t("auto.InternetTrafficPanel_tsx.12") : t("auto.InternetTrafficPanel_tsx.13")}
         </button>
         <button
           type="button"
@@ -365,28 +400,33 @@ export function InternetTrafficPanel() {
             void refreshProxyLogs();
           }}
           className={`${btnBase} shrink-0 border border-slate-600/50 bg-slate-900/50 text-slate-200 hover:bg-slate-900/70`}
-          title="Журнал CONNECT: откуда, правило, маршрут, OK/FAIL"
+          title={t("auto.InternetTrafficPanel_tsx.14")}
         >
           <ScrollText className="h-4 w-4" />
-          Логи прокси
+          {t("auto.InternetTrafficPanel_tsx.15")}
         </button>
       </div>
 
       <div className="mt-5 rounded-xl border border-white/10 bg-black/25 p-3 text-xs text-slate-400">
-        <p className="font-medium text-slate-300">Переменные окружения (терминал / приложения)</p>
-        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[11px] text-amber-100/80">
+        <p className="font-medium text-slate-300">{t("auto.InternetTrafficPanel_tsx.16")}</p>
+        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[11px] text-orange-100/85">
           {`export HTTPS_PROXY=${proxyUrl}
 export HTTP_PROXY=${proxyUrl}`}
         </pre>
         <p className="mt-2 text-slate-500">
-          В System Settings → Network → Details → Proxies можно задать веб-прокси на этот адрес.
+          {t("auto.InternetTrafficPanel_tsx.17")}
         </p>
       </div>
 
       <div className="mt-6 border-t border-white/10 pt-5">
         <h3 className="text-xs font-medium uppercase tracking-wide text-slate-500">
-          Пресеты правил (как server-stack/default-rules)
+          {t("auto.InternetTrafficPanel_tsx.18")}
         </h3>
+        {internetMode === "basic" ? (
+          <p className="mt-1 text-xs text-slate-500">
+            {t("auto.InternetTrafficPanel_tsx.19")}
+          </p>
+        ) : null}
         <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
           <select
             className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none sm:max-w-md"
@@ -406,19 +446,23 @@ export HTTP_PROXY=${proxyUrl}`}
             disabled={busy}
             className={`${btnBase} shrink-0 border border-red-600/50 bg-red-950/40 text-red-100 hover:bg-red-950/60`}
           >
-            Применить пресет
+            {t("auto.InternetTrafficPanel_tsx.20")}
           </button>
         </div>
         <p className="mt-2 text-xs text-slate-500">
-          Перезаписывает файлы в default-rules. Свои правила ниже сохраняются в user-*.json — после
-          пресета снова нажмите «Сохранить набор правил», если нужны свои файлы.
+          {tr(
+            "Перезаписывает файлы в default-rules. Свои правила ниже сохраняются в user-*.json — после пресета снова нажмите «Сохранить набор правил», если нужны свои файлы.",
+            "Overwrites files in default-rules. Custom rules below are saved to user-*.json — after applying preset press 'Save rule bundle' again if you need custom files.",
+          )}
         </p>
       </div>
 
+      {internetMode === "advanced" ? (
+        <>
       <div className="mt-6 border-t border-white/10 pt-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-xs font-medium uppercase tracking-wide text-slate-500">
-            Редактор наборов правил (block / pass / our)
+            {t("auto.InternetTrafficPanel_tsx.21")}
           </h3>
           <button
             type="button"
@@ -426,17 +470,22 @@ export HTTP_PROXY=${proxyUrl}`}
             disabled={busy}
             className={`${btnBase} border border-white/10 bg-black/30 px-3 py-1.5 text-xs text-slate-300`}
           >
-            Перечитать
+            {t("auto.InternetTrafficPanel_tsx.22")}
           </button>
         </div>
         <p className="mt-1 text-xs text-slate-500">
-          Одна строка — один домен или паттерн. Сохранение записывает user-block.json / user-pass.json
-          / user-our.json и обновляет пути в settings.
+          {tr(
+            "Одна строка — один домен или паттерн. Сохранение записывает user-block.json / user-pass.json / user-our.json и обновляет пути в settings.",
+            "One line = one domain or pattern. Saving writes user-block.json / user-pass.json / user-our.json and updates settings paths.",
+          )}
         </p>
         {ruleSource === "board" ? (
           <p className="mt-2 rounded-lg border border-amber-800/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-100/90">
-            Режим <code className="text-amber-200/90">board</code>: JSON-наборы ниже не участвуют в
-            маршрутизации — используются только списки на доске и глобальный bypass (см. раздел ниже).
+            {t("auto.InternetTrafficPanel_tsx.23")} <code className="text-orange-200/90">board</code>:{" "}
+            {tr(
+              "JSON-наборы ниже не участвуют в маршрутизации — используются только списки на доске и глобальный bypass (см. раздел ниже).",
+              "JSON bundles below are not used for routing — only board lists and global bypass are used (see section below).",
+            )}
           </p>
         ) : null}
         <div className="mt-3 inline-flex rounded-xl border border-white/10 p-0.5">
@@ -451,14 +500,14 @@ export HTTP_PROXY=${proxyUrl}`}
                   : "text-slate-400 hover:text-slate-200"
               }`}
             >
-              {tab === "block" ? "Блок" : tab === "pass" ? "Пропуск" : "Our / split"}
+              {tab === "block" ? t("auto.InternetTrafficPanel_tsx.24") : tab === "pass" ? t("auto.InternetTrafficPanel_tsx.25") : "Our / split"}
             </button>
           ))}
         </div>
         {curBundle ? (
           <div className="mt-3 grid gap-3 md:grid-cols-3">
             <label className="block text-xs text-slate-500">
-              Домены
+              {t("auto.InternetTrafficPanel_tsx.26")}
               <textarea
                 className="mt-1 min-h-[120px] w-full rounded-xl border border-white/10 bg-black/40 p-2 font-mono text-[11px] text-slate-200"
                 value={curBundle.domains.join("\n")}
@@ -469,7 +518,7 @@ export HTTP_PROXY=${proxyUrl}`}
               />
             </label>
             <label className="block text-xs text-slate-500">
-              Паттерны доменов
+              {t("auto.InternetTrafficPanel_tsx.27")}
               <textarea
                 className="mt-1 min-h-[120px] w-full rounded-xl border border-white/10 bg-black/40 p-2 font-mono text-[11px] text-slate-200"
                 value={curBundle.domainPatterns.join("\n")}
@@ -490,7 +539,7 @@ export HTTP_PROXY=${proxyUrl}`}
             </label>
           </div>
         ) : (
-          <p className="mt-2 text-xs text-slate-500">Загрузка…</p>
+              <p className="mt-2 text-xs text-slate-500">{t("auto.InternetTrafficPanel_tsx.28")}</p>
         )}
         {rulesTab === "our" ? (
           <label className="mt-3 block text-xs text-slate-500">
@@ -508,9 +557,9 @@ export HTTP_PROXY=${proxyUrl}`}
             type="button"
             onClick={() => void onSaveRulesBundles()}
             disabled={busy || !bundlesForm}
-            className={`${btnBase} border border-amber-700/50 bg-amber-950/40 text-amber-100 hover:bg-amber-950/60`}
+            className={`${btnBase} border border-red-800/45 bg-amber-950/40 text-amber-100 hover:bg-amber-950/60`}
           >
-            Сохранить набор правил
+            {t("auto.InternetTrafficPanel_tsx.29")}
           </button>
           {rulesMsg ? <span className="text-xs text-slate-400">{rulesMsg}</span> : null}
         </div>
@@ -519,7 +568,7 @@ export HTTP_PROXY=${proxyUrl}`}
       <div className="mt-6 border-t border-white/10 pt-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-xs font-medium uppercase tracking-wide text-slate-500">
-            Доска и bypass (settings.json)
+            {t("auto.InternetTrafficPanel_tsx.30")}
           </h3>
           <button
             type="button"
@@ -527,17 +576,19 @@ export HTTP_PROXY=${proxyUrl}`}
             disabled={busy}
             className={`${btnBase} border border-white/10 bg-black/30 px-3 py-1.5 text-xs text-slate-300`}
           >
-            Перечитать
+            {t("auto.InternetTrafficPanel_tsx.31")}
           </button>
         </div>
         <p className="mt-1 text-xs text-slate-500">
-          Активная доска <code className="text-slate-400">boardId</code>, глобальный и локальный
-          bypass, anti-adw, ru_block, not_ru_web — как в CLI.
+          {tr(
+            "Активная доска",
+            "Active board",
+          )} <code className="text-slate-400">boardId</code>, {t("auto.InternetTrafficPanel_tsx.32")}
         </p>
         {boardForm ? (
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <label className="block text-xs text-slate-500 sm:col-span-2">
-              Источник правил трафика{" "}
+              {t("auto.InternetTrafficPanel_tsx.33")}{" "}
               <span className="font-normal text-slate-600">(global.traffic_rule_source)</span>
               <select
                 className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100"
@@ -553,15 +604,17 @@ export HTTP_PROXY=${proxyUrl}`}
                   )
                 }
               >
-                <option value="merged">merged — JSON и доска (как раньше)</option>
-                <option value="bundles">bundles — только JSON default_rules + global.bypass</option>
-                <option value="board">board — только списки доски + global.bypass</option>
+                <option value="merged">{t("auto.InternetTrafficPanel_tsx.34")}</option>
+                <option value="bundles">{t("auto.InternetTrafficPanel_tsx.35")}</option>
+                <option value="board">{t("auto.InternetTrafficPanel_tsx.36")}</option>
               </select>
             </label>
             {ruleSource === "bundles" ? (
               <p className="text-xs text-slate-500 sm:col-span-2">
-                В режиме bundles поля anti-adw, ru_block и bypass доски не влияют на решение CONNECT —
-                их можно не заполнять.
+                {tr(
+                  "В режиме bundles поля anti-adw, ru_block и bypass доски не влияют на решение CONNECT — их можно не заполнять.",
+                  "In bundles mode, anti-adw, ru_block, and board bypass fields do not affect CONNECT decisions — they may stay empty.",
+                )}
               </p>
             ) : null}
             <label className="block text-xs text-slate-500">
@@ -575,7 +628,7 @@ export HTTP_PROXY=${proxyUrl}`}
               />
             </label>
             <label className="block text-xs text-slate-500">
-              board_id (редактируемая доска)
+              {t("auto.InternetTrafficPanel_tsx.37")}
               <input
                 className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100"
                 value={boardForm.boardId}
@@ -585,7 +638,7 @@ export HTTP_PROXY=${proxyUrl}`}
               />
             </label>
             <label className="block text-xs text-slate-500 sm:col-span-2">
-              Глобальный bypass (строки)
+              {t("auto.InternetTrafficPanel_tsx.38")}
               <textarea
                 className="mt-1 min-h-[72px] w-full rounded-xl border border-white/10 bg-black/40 p-2 font-mono text-[11px] text-slate-200"
                 value={boardForm.globalBypass.join("\n")}
@@ -599,7 +652,7 @@ export HTTP_PROXY=${proxyUrl}`}
             </label>
             {ruleSource !== "bundles" ? (
               <label className="block text-xs text-slate-500 sm:col-span-2">
-                Bypass доски
+                {t("auto.InternetTrafficPanel_tsx.39")}
                 <textarea
                   className="mt-1 min-h-[72px] w-full rounded-xl border border-white/10 bg-black/40 p-2 font-mono text-[11px] text-slate-200"
                   value={boardForm.bypass.join("\n")}
@@ -683,7 +736,7 @@ export HTTP_PROXY=${proxyUrl}`}
                 disabled={busy}
                 className={`${btnBase} border border-violet-700/50 bg-violet-950/40 text-violet-100 hover:bg-violet-950/60`}
               >
-                Сохранить доску и bypass
+                {t("auto.InternetTrafficPanel_tsx.40")}
               </button>
               {boardMsg ? (
                 <span className="ml-2 text-xs text-slate-400">{boardMsg}</span>
@@ -691,14 +744,14 @@ export HTTP_PROXY=${proxyUrl}`}
             </div>
           </div>
         ) : (
-          <p className="mt-2 text-xs text-slate-500">Загрузка…</p>
+          <p className="mt-2 text-xs text-slate-500">{t("auto.InternetTrafficPanel_tsx.41")}</p>
         )}
       </div>
 
       <div className="mt-6 border-t border-white/10 pt-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-xs font-medium uppercase tracking-wide text-slate-500">
-            settings.json (расширенный)
+            {t("auto.InternetTrafficPanel_tsx.42")}
           </h3>
           <button
             type="button"
@@ -706,7 +759,7 @@ export HTTP_PROXY=${proxyUrl}`}
             disabled={busy}
             className={`${btnBase} border border-white/10 bg-black/30 px-3 py-1.5 text-xs text-slate-300`}
           >
-            Перечитать
+            {t("auto.InternetTrafficPanel_tsx.43")}
           </button>
         </div>
         <textarea
@@ -722,17 +775,19 @@ export HTTP_PROXY=${proxyUrl}`}
             disabled={busy}
             className={`${btnBase} border border-red-600/50 bg-red-950/40 text-red-100 hover:bg-red-950/60`}
           >
-            Сохранить
+            {t("auto.InternetTrafficPanel_tsx.44")}
           </button>
           {settingsMsg ? (
             <span className="text-xs text-slate-400">{settingsMsg}</span>
           ) : null}
         </div>
       </div>
+        </>
+      ) : null}
 
       {logsOpen ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-modalConfirm flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
           role="dialog"
           aria-modal="true"
           aria-labelledby="proxy-logs-title"

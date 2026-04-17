@@ -10,6 +10,7 @@ import React, {
 } from "react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
+import { useI18n } from "./i18n";
 const btnBase =
   "inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050204] active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50";
 
@@ -58,7 +59,9 @@ export function NetworkHostSeriesModal({
   ifaceLabel: string | null;
   onOpenDetail: () => void;
 }) {
-  const [range, setRange] = useState("1h");
+  const { language, t } = useI18n();
+  const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
+    const [range, setRange] = useState("1h");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [payload, setPayload] = useState<string | null>(null);
@@ -68,7 +71,10 @@ export function NetworkHostSeriesModal({
   const load = useCallback(async () => {
     if (!baseUrl?.trim()) {
       setErr(
-        "Control API base URL is not set. In Server connection, enter the HTTP control-api address (not the gRPC port 50051), e.g. http://192.168.0.30:8080",
+        tr(
+          "Не задан base URL control-api. В разделе «Соединение» укажите HTTP control-api (не gRPC :50051), например http://192.168.0.30 (nginx :80) или http://192.168.0.30:8080 (прямой bind без nginx).",
+          "Control API base URL is not set. In Server connection, enter the HTTP control-api base (not gRPC :50051), e.g. http://192.168.0.30 (nginx on :80) or http://192.168.0.30:8080 (direct bind without nginx).",
+        ),
       );
       return;
     }
@@ -165,16 +171,28 @@ export function NetworkHostSeriesModal({
     }
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
   if (!open) return null;
 
   const title =
     ifaceLabel != null && ifaceLabel.length > 0
       ? `Network — ${ifaceLabel}`
-      : "Network throughput";
+      : t("auto.NetworkHostSeriesModal_tsx.1");
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-modalConfirm flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
       role="dialog"
       aria-modal="true"
       aria-labelledby="net-series-title"
@@ -187,11 +205,15 @@ export function NetworkHostSeriesModal({
               {title}
             </h3>
             <p className="mt-1 text-xs text-slate-500">
-              Uses HTTP control-api (not gRPC). History is host-wide. Set{" "}
-              <strong className="text-slate-400">Control API (HTTP)</strong> in Server connection
-              (e.g. <code className="text-amber-200/80">http://host:8080</code>, not port{" "}
-              <code className="text-amber-200/80">50051</code>). Enable{" "}
-              <code className="text-amber-200/80">CONTROL_API_HOST_STATS_SERIES=1</code>.
+              {t("auto.NetworkHostSeriesModal_tsx.2")}
+              <strong className="text-slate-400">Control API (HTTP)</strong>{" "}
+              {t("auto.NetworkHostSeriesModal_tsx.3")}
+              <code className="text-orange-200/85">http://host</code>
+              {t("auto.NetworkHostSeriesModal_tsx.4")}
+              <code className="text-orange-200/85">http://host:8080</code>
+              {t("auto.NetworkHostSeriesModal_tsx.5")}
+              <code className="text-orange-200/85">50051</code>. {t("auto.NetworkHostSeriesModal_tsx.6")}
+              <code className="text-orange-200/85">CONTROL_API_HOST_STATS_SERIES=1</code>.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -203,7 +225,7 @@ export function NetworkHostSeriesModal({
                   onClick={() => setRange(o.value)}
                   className={`rounded-md px-2.5 py-1 text-xs font-medium ${
                     range === o.value
-                      ? "bg-amber-700/80 text-white"
+                      ? "bg-red-800/85 text-white"
                       : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
                   }`}
                 >
@@ -216,13 +238,13 @@ export function NetworkHostSeriesModal({
               onClick={() => onOpenDetail()}
               className={`${btnBase} border border-white/15 bg-white/5 text-xs text-slate-200 hover:bg-white/10`}
             >
-              Detail (gRPC)
+              {t("auto.NetworkHostSeriesModal_tsx.7")}
             </button>
             <button
               type="button"
               onClick={onClose}
               className={`${btnBase} border border-white/10 bg-white/5 p-2`}
-              aria-label="Close"
+              aria-label={t("auto.NetworkHostSeriesModal_tsx.8")}
             >
               <X className="h-4 w-4" />
             </button>
@@ -232,19 +254,20 @@ export function NetworkHostSeriesModal({
           {loading ? (
             <div className="flex items-center gap-2 text-slate-400">
               <Loader2 className="h-5 w-5 animate-spin" />
-              Loading series…
+              {t("auto.NetworkHostSeriesModal_tsx.9")}
             </div>
           ) : err ? (
             <p className="text-sm text-rose-300">{err}</p>
           ) : payload && pointCount === 0 ? (
             <p className="text-sm text-slate-500">
-              No samples in this range yet (control-api must poll{" "}
-              <code className="text-amber-200/70">/api/v1/host-stats</code> with series enabled).
+              {t("auto.NetworkHostSeriesModal_tsx.10")}
+              <code className="text-orange-200/75">/api/v1/host-stats</code>
+              {t("auto.NetworkHostSeriesModal_tsx.11")}
             </p>
           ) : payload ? (
             <div ref={chartRef} className="w-full min-h-[220px]" />
           ) : (
-            <p className="text-sm text-slate-500">No data.</p>
+            <p className="text-sm text-slate-500">{t("auto.NetworkHostSeriesModal_tsx.12")}</p>
           )}
         </div>
       </div>
