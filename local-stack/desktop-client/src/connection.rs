@@ -22,7 +22,15 @@ use crate::desktop_store;
 pub struct GrpcConnectResult {
     pub endpoint: String,
     pub current_version: String,
+    /// `[project].version` from deployed `pirate.toml` (GetStatus).
+    pub project_version: String,
     pub state: String,
+    /// HTTP base for control-api from server (`DEPLOY_CONTROL_API_PUBLIC_URL` / nginx).
+    #[serde(default)]
+    pub control_api_http_url: String,
+    /// Direct control-api base from server (`DEPLOY_CONTROL_API_DIRECT_URL` or derived :8080).
+    #[serde(default)]
+    pub control_api_http_url_direct: String,
 }
 
 fn identity_path() -> PathBuf {
@@ -156,6 +164,39 @@ fn load_stored() -> Option<StoredConnection> {
     .ok()
 }
 
+fn apply_control_api_hint_from_status(r: &StatusResponse) {
+    let chosen_raw = r.control_api_http_url.trim();
+    let chosen_raw = if !chosen_raw.is_empty() {
+        chosen_raw
+    } else {
+        r.control_api_http_url_direct.trim()
+    };
+    if chosen_raw.is_empty() {
+        return;
+    }
+    let chosen = normalize_endpoint(chosen_raw);
+    if load_control_api_base()
+        .as_ref()
+        .map(|s| normalize_endpoint(s))
+        == Some(chosen.clone())
+    {
+        return;
+    }
+    let _ = set_control_api_base(&chosen);
+}
+
+fn grpc_connect_result(endpoint: String, r: StatusResponse) -> GrpcConnectResult {
+    apply_control_api_hint_from_status(&r);
+    GrpcConnectResult {
+        endpoint,
+        current_version: r.current_version,
+        project_version: r.project_version,
+        state: r.state,
+        control_api_http_url: r.control_api_http_url,
+        control_api_http_url_direct: r.control_api_http_url_direct,
+    }
+}
+
 fn use_signed_for_endpoint(endpoint: &str) -> bool {
     load_stored()
         .map(|s| {
@@ -205,11 +246,38 @@ pub fn verify_grpc_endpoint(endpoint: &str) -> Result<GrpcConnectResult, String>
             .await
             .map_err(|e| format!("GetStatus failed: {e}"))?
             .into_inner();
-        Ok(GrpcConnectResult {
-            endpoint,
-            current_version: r.current_version,
-            state: r.state,
-        })
+        Ok(grpc_connect_result(endpoint, r))
+    })
+}
+
+/// GetStatus for a specific deploy `project_id` (uses saved gRPC endpoint).
+pub fn verify_grpc_status_for_project(project_id: &str) -> Result<GrpcConnectResult, String> {
+    let endpoint = load_endpoint().ok_or_else(|| "no saved endpoint".to_string())?;
+    validate_endpoint(&endpoint)?;
+    let endpoint = normalize_endpoint(&endpoint);
+    let pid = deploy_core::normalize_project_id(project_id);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    rt.block_on(async move {
+        let mut client = DeployServiceClient::connect(endpoint.clone())
+            .await
+            .map_err(|e| format!("connect failed: {e}"))?;
+        let mut req = Request::new(StatusRequest {
+            project_id: pid.clone(),
+        });
+        if use_signed_for_endpoint(&endpoint) {
+            let sk = load_or_create_identity(&identity_path()).map_err(|e| e.to_string())?;
+            attach_auth_metadata(&mut req, &sk, "GetStatus", &pid, "").map_err(|e| e.to_string())?;
+        }
+        let r: StatusResponse = client
+            .get_status(req)
+            .await
+            .map_err(|e| format!("GetStatus failed: {e}"))?
+            .into_inner();
+        Ok(grpc_connect_result(endpoint, r))
     })
 }
 
@@ -269,18 +337,55 @@ pub fn load_control_api_base() -> Option<String> {
 }
 
 /// Persist control-api HTTP base (e.g. `http://192.168.0.30:8080`). Empty string clears.
+/// Changing the base URL clears a stored control-api JWT (session is host-specific).
 pub fn set_control_api_base(url: &str) -> Result<(), String> {
     let t = url.trim();
     if !t.is_empty() {
         validate_endpoint(t)?;
     }
+    let new_base = normalize_endpoint(t);
+    let old = load_control_api_base();
     let c = desktop_store::open().map_err(|e| e.to_string())?;
     c.execute(
         "UPDATE connection SET control_api_base_url = ?1 WHERE id = 1",
-        params![normalize_endpoint(t)],
+        params![new_base.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    if old.as_ref().map(|s| s.as_str()) != Some(new_base.as_str()) {
+        let _ = clear_control_api_jwt();
+    }
+    Ok(())
+}
+
+/// Stored JWT from control-api `POST /api/v1/auth/login` and absolute expiry (ms since epoch).
+pub(crate) fn save_control_api_jwt(token: &str, expires_at_ms: i64) -> Result<(), String> {
+    let c = desktop_store::open().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE connection SET control_api_jwt = ?1, control_api_jwt_expires_at_ms = ?2 WHERE id = 1",
+        params![token.trim(), expires_at_ms],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub(crate) fn clear_control_api_jwt() -> Result<(), String> {
+    let c = desktop_store::open().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE connection SET control_api_jwt = '', control_api_jwt_expires_at_ms = 0 WHERE id = 1",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn load_control_api_jwt() -> Option<(String, i64)> {
+    let c = desktop_store::open().ok()?;
+    c.query_row(
+        "SELECT control_api_jwt, control_api_jwt_expires_at_ms FROM connection WHERE id = 1",
+        [],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .ok()
 }
 
 /// Active deploy project id (persisted with the gRPC connection).
@@ -318,10 +423,28 @@ pub fn activate_bookmark_url(url: &str) -> Result<GrpcConnectResult, String> {
     verify_grpc_endpoint(&ep)
 }
 
+/// Add a saved server from a plain gRPC URL, minimal `{"url":…}` / `{"endpoint":…}`, `export GRPC_ENDPOINT=…`, or full install JSON with `token` + `url` (pairing pubkey stored on the bookmark).
+pub fn add_bookmark_from_input(raw: &str) -> Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("input is empty".into());
+    }
+    if t.starts_with('{') && install_json_has_token(t).map_err(|e| e.to_string())? {
+        let b = ConnectionBundle::parse(t).map_err(|e| e.to_string())?;
+        validate_endpoint(&b.url)?;
+        let url = normalize_endpoint(&b.url);
+        let id = crate::bookmarks::upsert_bookmark(&url, &url)?;
+        crate::bookmarks::set_bookmark_pairing(&url, b.server_pubkey_b64)?;
+        return Ok(id);
+    }
+    let url = parse_grpc_endpoint_from_bundle(raw)?;
+    crate::bookmarks::upsert_bookmark(&url, &url)
+}
+
 pub fn clear_endpoint() -> Result<(), String> {
     let c = desktop_store::open().map_err(|e| e.to_string())?;
     c.execute(
-        "UPDATE connection SET url = '', server_pubkey_b64 = NULL, paired = 0, control_api_base_url = '' WHERE id = 1",
+        "UPDATE connection SET url = '', server_pubkey_b64 = NULL, paired = 0, control_api_base_url = '', control_api_jwt = '', control_api_jwt_expires_at_ms = 0 WHERE id = 1",
         [],
     )
     .map_err(|e| e.to_string())?;
@@ -420,11 +543,7 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
         let _ = crate::bookmarks::upsert_bookmark(&endpoint, &endpoint);
         let _ = crate::bookmarks::set_bookmark_pairing(&endpoint, b.server_pubkey_b64.clone());
 
-        Ok(GrpcConnectResult {
-            endpoint,
-            current_version: r.current_version,
-            state: r.state,
-        })
+        Ok(grpc_connect_result(endpoint, r))
     })
 }
 

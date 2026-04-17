@@ -1,2 +1,4 @@
 node_modules/
 dist/
+src-tauri/bundle-extra/
+src-tauri/bundled/cli/pirate

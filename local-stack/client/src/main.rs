@@ -587,6 +587,12 @@ async fn run_auth(
             ms, r.current_version, r.state
         );
     }
+    if !r.project_version.trim().is_empty() {
+        println!(
+            "manifest_project_version={}",
+            r.project_version.trim()
+        );
+    }
     Ok(())
 }
 

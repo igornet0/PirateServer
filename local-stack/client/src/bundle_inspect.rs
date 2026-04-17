@@ -20,15 +20,32 @@ impl BundleProfile {
     }
 }
 
+fn bundle_root_has_server_bins(dir: &Path) -> bool {
+    dir.join("bin/deploy-server").is_file() && dir.join("bin/control-api").is_file()
+}
+
 fn find_bundle_root_in_dir(dir: &Path) -> Option<PathBuf> {
     for name in ["pirate-linux-amd64", "pirate-linux-aarch64"] {
         let d = dir.join(name);
-        if d.join("bin/deploy-server").is_file() && d.join("bin/control-api").is_file() {
+        if bundle_root_has_server_bins(&d) {
             return Some(d);
         }
     }
-    if dir.join("bin/deploy-server").is_file() && dir.join("bin/control-api").is_file() {
+    if bundle_root_has_server_bins(dir) {
         return Some(dir.to_path_buf());
+    }
+    // Fallback: any single subdirectory with server binaries (matches deploy-server unpack rules).
+    let mut hits: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_dir() && bundle_root_has_server_bins(&p) {
+                hits.push(p);
+            }
+        }
+    }
+    if hits.len() == 1 {
+        return hits.pop();
     }
     None
 }

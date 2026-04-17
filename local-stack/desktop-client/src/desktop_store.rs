@@ -61,8 +61,36 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
     )?;
     migrate_bookmarks(&c)?;
     migrate_connection_control_api(&c)?;
+    migrate_control_api_jwt(&c)?;
     migrate_display_stream_prefs(&c)?;
     Ok(c)
+}
+
+fn migrate_control_api_jwt(c: &Connection) -> Result<(), rusqlite::Error> {
+    let cols = connection_column_names(c)?;
+    if !cols.iter().any(|n| n == "control_api_jwt") {
+        c.execute(
+            "ALTER TABLE connection ADD COLUMN control_api_jwt TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    let cols = connection_column_names(c)?;
+    if !cols.iter().any(|n| n == "control_api_jwt_expires_at_ms") {
+        c.execute(
+            "ALTER TABLE connection ADD COLUMN control_api_jwt_expires_at_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn connection_column_names(c: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = c.prepare("PRAGMA table_info(connection)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(cols)
 }
 
 fn migrate_display_stream_prefs(c: &Connection) -> Result<(), rusqlite::Error> {

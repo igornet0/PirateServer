@@ -150,13 +150,13 @@ mod tests {
         g
     }
 
-    fn sample_compiled_rules() -> CompiledDefaultRules {
-        let mut rules = CompiledDefaultRules::default();
-        rules.block = HostRuleSet::compile_from_strings(&["json.blocked".into()]).unwrap();
-        rules.pass = HostRuleSet::compile_from_strings(&["json.pass".into()]).unwrap();
-        rules.our = HostRuleSet::compile_from_strings(&["json.tunnel".into()]).unwrap();
-        rules
-    }
+    // fn sample_compiled_rules() -> CompiledDefaultRules {
+    //     let mut rules = CompiledDefaultRules::default();
+    //     rules.block = HostRuleSet::compile_from_strings(&["json.blocked".into()]).unwrap();
+    //     rules.pass = HostRuleSet::compile_from_strings(&["json.pass".into()]).unwrap();
+    //     rules.our = HostRuleSet::compile_from_strings(&["json.tunnel".into()]).unwrap();
+    //     rules
+    // }
 
     #[test]
     fn all_disabled_tunnels() {

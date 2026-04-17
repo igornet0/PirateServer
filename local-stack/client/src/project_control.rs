@@ -1,6 +1,7 @@
 //! Project init + scan (`pirate init-project`, `pirate scan-project`).
 
 use crate::project_registry;
+use crate::network_access::{apply_detected_services_to_manifest, detect_services, ServiceDetectionReport};
 use deploy_core::pirate_project::{detect_runtime, guess_port, PirateManifest};
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,7 @@ pub struct ScanReport {
     pub has_dockerfile: bool,
     pub markers: Vec<String>,
     pub updated_pirate_toml: bool,
+    pub detected_services: ServiceDetectionReport,
 }
 
 /// Initialize `pirate.toml` in `project_root` (default `.`).
@@ -79,8 +81,9 @@ pub fn scan_project(project_root: &Path, dry_run: bool) -> Result<ScanReport, St
 
     let path = root.join("pirate.toml");
     let mut updated = false;
-    if path.is_file() && !dry_run {
+    let detected_services = if path.is_file() && !dry_run {
         let mut m = PirateManifest::read_file(&path).map_err(|e| format!("parse pirate.toml: {e}"))?;
+        let detected_services = detect_services(&root, Some(&m));
         if m.runtime.r#type != rt {
             m.runtime.r#type = rt.to_string();
             updated = true;
@@ -90,12 +93,22 @@ pub fn scan_project(project_root: &Path, dry_run: bool) -> Result<ScanReport, St
             m.health.port = port;
             updated = true;
         }
+        let before_api = m.services.api.is_some();
+        let before_web = m.services.web.is_some();
+        apply_detected_services_to_manifest(&mut m, &detected_services);
+        if before_api != m.services.api.is_some() || before_web != m.services.web.is_some() {
+            updated = true;
+        }
         if updated {
             let body = m.to_toml_string().map_err(|e| e.to_string())?;
             std::fs::write(&path, body).map_err(|e| e.to_string())?;
         }
         let _ = project_registry::register_from_pirate_toml_dir(&root);
-    }
+        detected_services
+    } else {
+        let manifest_ref = PirateManifest::read_file(&path).ok();
+        detect_services(&root, manifest_ref.as_ref())
+    };
 
     Ok(ScanReport {
         project_root: root.display().to_string(),
@@ -104,5 +117,6 @@ pub fn scan_project(project_root: &Path, dry_run: bool) -> Result<ScanReport, St
         has_dockerfile: root.join("Dockerfile").is_file(),
         markers,
         updated_pirate_toml: updated,
+        detected_services,
     })
 }

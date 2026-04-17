@@ -1,7 +1,8 @@
 //! Pure-Rust checks for `deploy_client` packing / validation (no running gRPC server).
 
 use deploy_client::{
-    build_chunks, build_server_stack_chunks, default_version, pack_directory, read_or_pack_bundle,
+    build_chunks, build_server_stack_chunks, default_version, pack_directory, pack_release_sources,
+    read_or_pack_bundle,
     validate_version_label,
 };
 use sha2::Digest;
@@ -75,4 +76,66 @@ fn read_or_pack_bundle_rejects_non_tar_file() {
     fs::write(&p, b"x").unwrap();
     assert!(read_or_pack_bundle(&p).is_err());
     let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn pack_release_sources_uses_selected_outputs_only() {
+    let pid = std::process::id();
+    let root = std::env::temp_dir().join(format!("deploy-client-release-select-{pid}"));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("dist")).unwrap();
+    fs::write(root.join("dist/app.js"), b"ok").unwrap();
+    fs::write(root.join("README.md"), b"skip").unwrap();
+
+    let packed = pack_release_sources(&root, &["dist".to_string()], None).unwrap();
+    let out = std::env::temp_dir().join(format!("deploy-client-release-select-{pid}.tar.gz"));
+    let _ = fs::remove_file(&out);
+    fs::write(&out, packed).unwrap();
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&out).unwrap()));
+    let mut names = Vec::<String>::new();
+    for e in ar.entries().unwrap() {
+        let e = e.unwrap();
+        names.push(e.path().unwrap().to_string_lossy().to_string());
+    }
+    assert!(names.iter().any(|n| n == "dist/app.js"));
+    assert!(!names.iter().any(|n| n == "README.md"));
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pack_release_sources_blocks_path_escape() {
+    let pid = std::process::id();
+    let root = std::env::temp_dir().join(format!("deploy-client-release-escape-{pid}"));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let err = pack_release_sources(&root, &["../".to_string()], None).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pack_directory_applies_pirateignore() {
+    let pid = std::process::id();
+    let root = std::env::temp_dir().join(format!("deploy-client-release-ignore-{pid}"));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("dist")).unwrap();
+    fs::write(root.join("dist/app.js"), b"ok").unwrap();
+    fs::write(root.join("secret.txt"), b"nope").unwrap();
+    fs::write(root.join(".pirateignore"), "secret.txt\n").unwrap();
+
+    let packed = pack_directory(&root).unwrap();
+    let out = std::env::temp_dir().join(format!("deploy-client-release-ignore-{pid}.tar.gz"));
+    let _ = fs::remove_file(&out);
+    fs::write(&out, packed).unwrap();
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&out).unwrap()));
+    let mut names = Vec::<String>::new();
+    for e in ar.entries().unwrap() {
+        let e = e.unwrap();
+        names.push(e.path().unwrap().to_string_lossy().to_string());
+    }
+    assert!(!names.iter().any(|n| n == "secret.txt"));
+    assert!(names.iter().any(|n| n == "dist/app.js"));
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_dir_all(&root);
 }
