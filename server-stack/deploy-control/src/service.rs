@@ -1,12 +1,17 @@
 use crate::types::{
     DataSourceItemView, DataSourcesListView, DatabaseColumnsView, DatabaseInfoView,
     DatabaseRelationshipsView, DatabaseSchemasView, DatabaseTablePreviewView, DatabaseTablesView,
-    HistoryView, LocalClientConnect, ProjectView, ProjectsView, ReleasesView, StatusView,
+    HistoryView, HostDeployEnvPutView, HostDeployEnvView, LocalClientConnect,
+    ProjectNginxSnippetView, ProjectTelemetryLogLine, ProjectTelemetryView, ProjectView,
+    ProjectsView, ReleasesView, StatusView,
 };
 use deploy_auth::attach_auth_metadata;
 use deploy_core::{
-    list_release_versions, normalize_project_id, project_deploy_root, validate_project_id,
+    list_release_versions, nginx_snippet, normalize_project_id, process_manager,
+    project_deploy_root, read_current_version_from_symlink, release_dir_for_version,
+    validate_project_id,
 };
+use deploy_core::pirate_project::PirateManifest;
 use deploy_db::{
     explorer_columns, explorer_foreign_keys, explorer_schemas, explorer_table_preview,
     explorer_tables, fetch_postgres_server_info, DataSourceRow, DbStore, PgPool,
@@ -21,8 +26,10 @@ use deploy_proto::deploy::{
 use ed25519_dalek::SigningKey;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use thiserror::Error;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 fn sanitize_config_json_public(v: &serde_json::Value) -> serde_json::Value {
     let mut out = v.clone();
@@ -33,10 +40,108 @@ fn sanitize_config_json_public(v: &serde_json::Value) -> serde_json::Value {
     out
 }
 
+fn tail_file_lines(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut lines: Vec<String> = raw.lines().map(|s| s.to_string()).collect();
+    if lines.len() > limit {
+        lines = lines.split_off(lines.len() - limit);
+    }
+    Ok(lines)
+}
+
+const MAX_PROJECT_NGINX_SNIPPET: usize = 512 * 1024;
+
+/// `releases/<ver>/pirate-nginx-snippet.conf` after deploy when the manifest requests a nginx release snippet.
+fn project_nginx_snippet_view(project_root: &Path, current_version: &str) -> ProjectNginxSnippetView {
+    let mut ver = current_version.trim().to_string();
+    if ver.is_empty() {
+        ver = read_current_version_from_symlink(project_root).unwrap_or_default();
+    }
+    let ver = ver.trim();
+    let placeholder = project_root
+        .join("releases")
+        .join("<version>")
+        .join("pirate-nginx-snippet.conf");
+    if ver.is_empty() {
+        return ProjectNginxSnippetView {
+            path: placeholder.to_string_lossy().to_string(),
+            configured: false,
+            status: Some("no_release".to_string()),
+            reason_code: Some("no_active_version".to_string()),
+            hint: Some(
+                "No active release version (current symlink / status empty). Deploy once first."
+                    .to_string(),
+            ),
+            content: None,
+        };
+    }
+    let release_dir = release_dir_for_version(project_root, ver);
+    let snippet_path = release_dir.join("pirate-nginx-snippet.conf");
+    let manifest_path = release_dir.join("pirate.toml");
+    let path_str = snippet_path.to_string_lossy().to_string();
+    let manifest_opt = PirateManifest::read_file(&manifest_path).ok();
+
+    let absent = |reason_code: &str, hint: String| ProjectNginxSnippetView {
+        path: path_str.clone(),
+        configured: false,
+        status: Some("absent".to_string()),
+        reason_code: Some(reason_code.to_string()),
+        hint: Some(hint),
+        content: None,
+    };
+
+    match fs::read_to_string(&snippet_path) {
+        Ok(s) if !s.trim().is_empty() => {
+            let content = if s.len() > MAX_PROJECT_NGINX_SNIPPET {
+                Some(format!(
+                    "{}\n\n... [truncated, total {} bytes]",
+                    &s[..MAX_PROJECT_NGINX_SNIPPET],
+                    s.len()
+                ))
+            } else {
+                Some(s)
+            };
+            ProjectNginxSnippetView {
+                path: path_str,
+                configured: true,
+                status: Some("present".to_string()),
+                reason_code: None,
+                hint: None,
+                content,
+            }
+        }
+        _ => {
+            if let Some(ref m) = manifest_opt {
+                if let Some(skip) = nginx_snippet::nginx_release_skip(m) {
+                    return absent(skip.reason_code(), skip.hint_en().to_string());
+                }
+                return absent(
+                    "not_generated",
+                    "Manifest expects a snippet but the file is missing; redeploy or check deploy-server logs."
+                        .to_string(),
+                );
+            }
+            absent(
+                "no_manifest_in_release",
+                "pirate.toml not found under this release; redeploy with a valid manifest."
+                    .to_string(),
+            )
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ControlError {
     #[error("grpc: {0}")]
     Grpc(String),
+    #[error("host_deploy_env: {0}")]
+    HostDeployEnv(String),
+    #[error("nginx: {0}")]
+    NginxOp(String),
+    #[error("host_service: {0}")]
+    HostServiceOp(String),
+    #[error("antiddos: {0}")]
+    Antiddos(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -119,6 +224,93 @@ impl ControlPlane {
         }
     }
 
+    pub async fn project_telemetry(
+        &self,
+        project_id: &str,
+        logs_limit: usize,
+    ) -> Result<ProjectTelemetryView, ControlError> {
+        validate_project_id(project_id).map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let pid = normalize_project_id(project_id);
+        let root = project_deploy_root(&self.deploy_root, &pid);
+        let status = self.get_status(&pid).await?;
+
+        let runtime = process_manager::read_runtime_state(&root);
+        let process_pid = runtime.as_ref().and_then(|r| r.pid);
+
+        let mut cpu_percent = None;
+        let mut ram_used_bytes = None;
+        let mut ram_percent = None;
+        let gpu_percent = None;
+        let mut telemetry_available = false;
+
+        if let Some(ppid) = process_pid {
+            let mut sys = System::new_with_specifics(
+                RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+            );
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[Pid::from_u32(ppid)]),
+                true,
+                ProcessRefreshKind::everything(),
+            );
+            if let Some(proc_item) = sys.process(Pid::from_u32(ppid)) {
+                cpu_percent = Some(proc_item.cpu_usage());
+                let mem = proc_item.memory();
+                ram_used_bytes = Some(mem);
+                let total = sys.total_memory();
+                if total > 0 {
+                    ram_percent = Some((mem as f32 / total as f32) * 100.0);
+                }
+                telemetry_available = true;
+            }
+        }
+
+        let log_path = root.join(".pirate").join("runtime.log");
+        let mut logs_available = false;
+        let mut logs_tail = Vec::new();
+        if log_path.is_file() {
+            let tail = tail_file_lines(&log_path, logs_limit.max(1)).unwrap_or_default();
+            logs_tail = tail
+                .into_iter()
+                .map(|message| ProjectTelemetryLogLine {
+                    ts_ms: chrono::Utc::now().timestamp_millis(),
+                    level: "info".to_string(),
+                    message,
+                })
+                .collect();
+            logs_available = true;
+        }
+
+        let project_nginx = project_nginx_snippet_view(&root, &status.current_version);
+
+        Ok(ProjectTelemetryView {
+            project_id: pid,
+            state: status.state,
+            pid: process_pid,
+            cpu_percent,
+            ram_used_bytes,
+            ram_percent,
+            gpu_percent,
+            telemetry_available,
+            logs_available,
+            logs_tail,
+            collected_at_ms: chrono::Utc::now().timestamp_millis(),
+            project_nginx,
+        })
+    }
+
+    /// Truncate `<deploy_root>/.pirate/runtime.log` for the project (creates empty file if missing).
+    pub async fn clear_project_runtime_log(&self, project_id: &str) -> Result<(), ControlError> {
+        validate_project_id(project_id).map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let pid = normalize_project_id(project_id);
+        let root = project_deploy_root(&self.deploy_root, &pid);
+        let log_path = root.join(".pirate").join("runtime.log");
+        if let Some(parent) = log_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&log_path, b"").await?;
+        Ok(())
+    }
+
     async fn status_fallback(&self, err: String, project_id: &str) -> Result<StatusView, ControlError> {
         if let Some(db) = &self.db {
             if let Some(row) = db.get_snapshot(project_id).await? {
@@ -169,6 +361,33 @@ impl ControlPlane {
         }
         projects.sort_by(|a, b| a.id.cmp(&b.id));
         ProjectsView { projects }
+    }
+
+    /// Create a new non-`default` project id: directory under `projects/` plus optional DB row.
+    /// Safe to call before first deploy; id is recorded in `project_snapshots` when DB is configured.
+    pub async fn allocate_project_id(&self) -> Result<crate::types::AllocateProjectResponse, ControlError> {
+        for _attempt in 0..96u32 {
+            let id = format!("p-{}", Uuid::new_v4().as_simple());
+            validate_project_id(&id).map_err(|e| ControlError::Grpc(e.to_string()))?;
+            let root = project_deploy_root(&self.deploy_root, &id);
+            if root.exists() {
+                continue;
+            }
+            fs::create_dir_all(&root)?;
+            if let Some(db) = &self.db {
+                if let Err(e) = db
+                    .upsert_snapshot(&id, "", "stopped", None)
+                    .await
+                {
+                    let _ = fs::remove_dir_all(&root);
+                    return Err(e.into());
+                }
+            }
+            return Ok(crate::types::AllocateProjectResponse { id });
+        }
+        Err(ControlError::Grpc(
+            "could not allocate a unique project id".into(),
+        ))
     }
 
     pub async fn fetch_history(
@@ -288,6 +507,131 @@ impl ControlPlane {
         Ok(crate::types::ProcessControlView {
             current_version: r.current_version,
             state: r.state,
+        })
+    }
+
+    /// `app.env` in the project deploy root (same layout as `releases/`).
+    pub fn read_app_env(&self, project_id: &str) -> Result<crate::types::AppEnvView, ControlError> {
+        validate_project_id(project_id).map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let pid = normalize_project_id(project_id);
+        let path = project_deploy_root(&self.deploy_root, &pid).join("app.env");
+        let exists = path.is_file();
+        let content = if exists {
+            fs::read_to_string(&path)?
+        } else {
+            String::new()
+        };
+        Ok(crate::types::AppEnvView {
+            path: path.to_string_lossy().to_string(),
+            content,
+            exists,
+        })
+    }
+
+    pub fn write_app_env(&self, project_id: &str, content: &str) -> Result<crate::types::AppEnvView, ControlError> {
+        validate_project_id(project_id).map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let pid = normalize_project_id(project_id);
+        let path = project_deploy_root(&self.deploy_root, &pid).join("app.env");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, content.as_bytes())?;
+        Ok(crate::types::AppEnvView {
+            path: path.to_string_lossy().to_string(),
+            content: content.to_string(),
+            exists: true,
+        })
+    }
+
+    /// Max size for `/etc/pirate-deploy.env` via control-api (matches helper script).
+    pub const MAX_HOST_DEPLOY_ENV_BYTES: usize = 512 * 1024;
+
+    /// Read host env file (same path systemd `EnvironmentFile` uses for deploy-server / control-api).
+    pub fn read_host_deploy_env(path: &Path) -> Result<HostDeployEnvView, ControlError> {
+        let exists = path.is_file();
+        let content = if exists {
+            fs::read_to_string(path)?
+        } else {
+            String::new()
+        };
+        Ok(HostDeployEnvView {
+            path: path.to_string_lossy().to_string(),
+            content,
+            exists,
+        })
+    }
+
+    /// Write host env via `sudo -n pirate-write-deploy-env.sh <path>` (stdin = new content).
+    pub fn write_host_deploy_env(
+        path: &Path,
+        content: &str,
+        helper_script: &Path,
+    ) -> Result<HostDeployEnvPutView, ControlError> {
+        if content.len() > Self::MAX_HOST_DEPLOY_ENV_BYTES {
+            return Err(ControlError::HostDeployEnv(format!(
+                "content exceeds {} bytes",
+                Self::MAX_HOST_DEPLOY_ENV_BYTES
+            )));
+        }
+        if content.as_bytes().contains(&0) {
+            return Err(ControlError::HostDeployEnv(
+                "content must not contain NUL bytes".into(),
+            ));
+        }
+        let Some(target) = path.to_str() else {
+            return Err(ControlError::HostDeployEnv("invalid UTF-8 path".into()));
+        };
+        if helper_script.is_file() {
+            let mut child = Command::new("sudo")
+                .args([
+                    "-n",
+                    helper_script
+                        .to_str()
+                        .ok_or_else(|| ControlError::HostDeployEnv("invalid helper path".into()))?,
+                    target,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| ControlError::HostDeployEnv(format!("sudo spawn: {e}")))?;
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                ControlError::HostDeployEnv("sudo: stdin not available".into())
+            })?;
+            std::io::Write::write_all(&mut stdin, content.as_bytes())
+                .map_err(|e| ControlError::HostDeployEnv(format!("sudo stdin: {e}")))?;
+            drop(stdin);
+            let out = child
+                .wait_with_output()
+                .map_err(|e| ControlError::HostDeployEnv(format!("sudo wait: {e}")))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                return Err(ControlError::HostDeployEnv(format!(
+                    "helper failed (status {}): {} {}",
+                    out.status,
+                    stdout.trim(),
+                    stderr.trim()
+                )));
+            }
+            let restart_scheduled = String::from_utf8_lossy(&out.stdout)
+                .to_string()
+                .contains("restart shortly")
+                || String::from_utf8_lossy(&out.stderr).contains("restart");
+            return Ok(HostDeployEnvPutView {
+                path: path.to_string_lossy().to_string(),
+                content: content.to_string(),
+                exists: true,
+                restart_scheduled,
+            });
+        }
+
+        fs::write(path, content.as_bytes())?;
+        Ok(HostDeployEnvPutView {
+            path: path.to_string_lossy().to_string(),
+            content: content.to_string(),
+            exists: true,
+            restart_scheduled: false,
         })
     }
 

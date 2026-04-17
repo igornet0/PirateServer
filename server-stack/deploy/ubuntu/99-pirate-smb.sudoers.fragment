@@ -1,0 +1,3 @@
+# Pirate: non-interactive sudo for SMB helpers, stack OTA, and dashboard host env writer (control-api).
+# Keep in sync with OTA: pirate-apply-stack-bundle.sh installs this same file to /etc/sudoers.d/99-pirate-smb.
+pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh, /usr/local/lib/pirate/pirate-write-deploy-env.sh, /usr/local/lib/pirate/pirate-ensure-nginx.sh, /usr/local/lib/pirate/pirate-nginx-apply-site.sh, /usr/local/lib/pirate/pirate-host-service.sh, /usr/local/lib/pirate/pirate-antiddos-apply.sh

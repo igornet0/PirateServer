@@ -78,6 +78,38 @@ impl From<ControlError> for ApiError {
     fn from(e: ControlError) -> Self {
         match e {
             ControlError::Grpc(msg) => ApiError::bad_gateway(msg),
+            ControlError::HostDeployEnv(msg) => {
+                if msg.contains("exceeds") || msg.contains("NUL bytes") {
+                    ApiError::bad_request(msg)
+                } else {
+                    ApiError::bad_gateway(msg)
+                }
+            }
+            ControlError::NginxOp(msg) => {
+                if msg.contains("mode must be") || msg.contains("exceeds") || msg.contains("NUL") {
+                    ApiError::bad_request(msg)
+                } else {
+                    ApiError::bad_gateway(msg)
+                }
+            }
+            ControlError::HostServiceOp(msg) => {
+                if msg.contains("unknown service")
+                    || msg.contains("must be install")
+                    || msg.contains("cannot be installed")
+                    || msg.contains("dispatcher not found")
+                {
+                    ApiError::bad_request(msg)
+                } else {
+                    ApiError::bad_gateway(msg)
+                }
+            }
+            ControlError::Antiddos(msg) => {
+                if msg.contains("invalid") || msg.contains("must be") || msg.contains("out of range") {
+                    ApiError::bad_request(msg)
+                } else {
+                    ApiError::bad_gateway(msg)
+                }
+            }
             ControlError::Io(err) => ApiError::internal(err.to_string()),
             ControlError::Db(err) => match err {
                 DbError::InvalidIdentifier(msg) => ApiError::bad_request(msg),

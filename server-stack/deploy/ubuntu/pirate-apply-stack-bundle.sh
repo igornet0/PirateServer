@@ -106,11 +106,41 @@ if [[ -f "$BUNDLE_ROOT/server-stack-manifest.json" ]]; then
   chown pirate:pirate /var/lib/pirate/server-stack-manifest.json
 fi
 
-# Keep OTA helper in sync with the bundle (so fixes to this script ship with the next tarball).
-NEW_SCRIPT="$BUNDLE_ROOT/lib/pirate/pirate-apply-stack-bundle.sh"
-if [[ -f "$NEW_SCRIPT" ]]; then
-  echo "==> refresh /usr/local/lib/pirate/pirate-apply-stack-bundle.sh from bundle"
-  install -m 0755 "$NEW_SCRIPT" /usr/local/lib/pirate/pirate-apply-stack-bundle.sh
+# Sync helper scripts from bundle to host (SMB, host-env writer, nginx helpers, OTA apply script itself).
+LIB_SRC="$BUNDLE_ROOT/lib/pirate"
+SUDOERS_FRAG_NAME=99-pirate-smb.sudoers.fragment
+if [[ -d "$LIB_SRC" ]]; then
+  echo "==> sync helper scripts -> /usr/local/lib/pirate"
+  install -d -m 0755 /usr/local/lib/pirate
+  shopt -s nullglob
+  for _pf in "$LIB_SRC"/*.sh; do
+    _bn="$(basename "$_pf")"
+    install -m 0755 "$_pf" "/usr/local/lib/pirate/$_bn"
+  done
+  shopt -u nullglob
+  if [[ -f "$LIB_SRC/$SUDOERS_FRAG_NAME" ]]; then
+    install -m 0644 "$LIB_SRC/$SUDOERS_FRAG_NAME" "/usr/local/lib/pirate/$SUDOERS_FRAG_NAME"
+  fi
+fi
+
+# Sudoers must match install.sh: canonical file is 99-pirate-smb.sudoers.fragment (bundled under lib/pirate).
+SUDOERS_PIRATE=/etc/sudoers.d/99-pirate-smb
+FRAG_BUNDLE="$LIB_SRC/$SUDOERS_FRAG_NAME"
+FRAG_HOST="/usr/local/lib/pirate/$SUDOERS_FRAG_NAME"
+if [[ -f "$FRAG_BUNDLE" ]]; then
+  install -m 0440 "$FRAG_BUNDLE" "$SUDOERS_PIRATE"
+elif [[ -f "$FRAG_HOST" ]]; then
+  install -m 0440 "$FRAG_HOST" "$SUDOERS_PIRATE"
+else
+  cat >"$SUDOERS_PIRATE" <<'SUDOERS'
+# Pirate: non-interactive sudo for SMB helpers, stack OTA, and dashboard host env writer (control-api).
+# Legacy bundle without 99-pirate-smb.sudoers.fragment — NOPASSWD list must match install.sh.
+pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh, /usr/local/lib/pirate/pirate-write-deploy-env.sh, /usr/local/lib/pirate/pirate-ensure-nginx.sh, /usr/local/lib/pirate/pirate-nginx-apply-site.sh, /usr/local/lib/pirate/pirate-host-service.sh, /usr/local/lib/pirate/pirate-antiddos-apply.sh
+SUDOERS
+chmod 0440 "$SUDOERS_PIRATE"
+fi
+if command -v visudo >/dev/null 2>&1; then
+  visudo -c -f "$SUDOERS_PIRATE" >/dev/null
 fi
 
 if [[ -n "$APPLY_JSON_PATH" ]] && command -v python3 >/dev/null 2>&1; then

@@ -12,7 +12,7 @@
 | `bin/client`, `bin/pirate` | один бинарник CLI (`pirate` — копия/симлинк на `client`) |
 | `systemd/*.service` | unit-файлы для `deploy-server` и `control-api` |
 | `nginx/*.conf`, `nginx/*.conf.in` | шаблоны nginx (сайт + API-only, с доменом и без) |
-| `lib/pirate/*.sh` | OTA стека, SMB, опциональные установщики СУБД (`install-postgresql.sh` и т.д.) |
+| `lib/pirate/*.sh`, `lib/pirate/99-pirate-smb.sudoers.fragment` | OTA стека, SMB, установщики (`install-*.sh`) и **скрипты удаления (`remove-*.sh`)** для диспетчера `pirate-host-service.sh`, WAN helpers (`pirate-ensure-https.sh`, …); фрагмент — NOPASSWD как при `install.sh` |
 | `share/ui/dist/` | статика дашборда (если сборка не `UI_BUILD=0`) |
 | `env.example` | комментированный шаблон переменных окружения |
 | `install.sh`, `uninstall.sh`, `purge-pirate-data.sh` | установка и очистка |
@@ -58,6 +58,13 @@ cd pirate-linux-amd64-*
 - `pirate_DEPLOY_ALLOW_SERVER_STACK_UPDATE=0|1` — разрешение OTA обновления стека;
 - `pirate_DISPLAY_STREAM_CONSENT=0|1` — политика трансляции экрана (после проверки GUI).
 
+Для WAN-режима используйте helper-скрипты:
+
+```bash
+sudo /usr/local/lib/pirate/pirate-ensure-https.sh example.com ops@example.com
+sudo /usr/local/lib/pirate/pirate-firewall-apply.sh wan 50051
+```
+
 После установки:
 
 - конфигурация: **`/etc/pirate-deploy.env`** (права обычно root + группа `pirate`, см. [`env.example`](env.example));
@@ -65,6 +72,22 @@ cd pirate-linux-amd64-*
 - сервисы: `systemctl status deploy-server`, `systemctl status control-api`.
 
 Шаблон всех переменных и пояснения — в [`env.example`](env.example). После смены сети или домена чаще всего нужно поправить **`DEPLOY_GRPC_PUBLIC_URL`** и при необходимости **`DEPLOY_SUBSCRIPTION_PUBLIC_HOST`**.
+
+### Первое OTA после смены формата архива / рассинхрона распаковки
+
+Команда **`pirate update`** / `UploadServerStack` распаковывает `.tar.gz` **внутри процесса `deploy-server`**. Логика распаковки и поиска корня бандла (`pirate-linux-aarch64/` и т.д.) живёт в **самом бинарнике** `deploy-server`. Если удалённый сервер ещё на старой сборке, OTA может снова падать с ошибкой вида «expected bundle with bin/deploy-server…», не исправляя себя по воздуху.
+
+**Один раз** (bootstrap без цикла OTA):
+
+1. На машине с доступом к хосту распакуйте тот же архив, которым пользуетесь для OTA: `tar xzf pirate-linux-aarch64-*.tar.gz`.
+2. Скопируйте из `pirate-linux-aarch64/bin/` файлы **`deploy-server`** и при необходимости **`control-api`** в каталоги из unit-файлов systemd (см. `ExecStart` в [`deploy-server.service`](deploy-server.service) и [`control-api.service`](control-api.service)), обычно что-то вроде `/usr/local/bin/` или домашний каталог пользователя `pirate`.
+3. `sudo systemctl restart deploy-server` (и `control-api`, если обновляли).
+4. Убедитесь, что в **`/etc/pirate-deploy.env`** для OTA задано **`DEPLOY_ALLOW_SERVER_STACK_UPDATE=1`** (или эквивалент при установке).
+5. Повторите `pirate update` с клиента.
+
+Дальнейшие обновления стека через gRPC должны выполняться уже новым `deploy-server`, без ручного копирования бинарников на каждый релиз.
+
+Проверить архив локально перед загрузкой: из корня репозитория [`scripts/verify-server-stack-bundle-tar.sh`](../../../scripts/verify-server-stack-bundle-tar.sh) — распаковывает во временный каталог и проверяет наличие обоих бинарников в ожидаемом корне.
 
 ## Makefile в каталоге бандла
 
@@ -99,3 +122,19 @@ sudo ./purge-pirate-data.sh --remove-os-user   # при необходимост
 ```
 
 Опции см. в самих скриптах (`--help` / комментарии в начале файлов).
+
+## Опциональные пакеты через десктоп (вкладка «Сервисы»)
+
+После установки или OTA стека на хосте в `/usr/local/lib/pirate/` лежит **`pirate-host-service.sh`** — whitelist-диспетчер (`install` / `remove` для фиксированных id: `node`, `redis`, `postgresql`, …). В `install.sh` пользователю `pirate` выдаётся `NOPASSWD` только на этот скрипт (в дополнение к SMB/nginx/env). Если в ответе API или в логах видно `sudo: a password is required`, обновите хост (повторный `./install.sh` из актуального бандла или правка `/etc/sudoers.d/…`) и проверьте от имени `pirate`: `sudo -n /usr/local/lib/pirate/pirate-host-service.sh install node`.
+
+**Preflight OTA:** перед `pirate update` убедитесь, что в архиве есть фрагмент sudoers (иначе OTA снова сузит NOPASSWD):
+
+```bash
+tar tzf pirate-linux-aarch64-no-ui-*.tar.gz | grep lib/pirate/99-pirate-smb.sudoers.fragment
+```
+
+Или: `./scripts/verify-server-stack-bundle-tar.sh dist/pirate-linux-*-no-ui-*.tar.gz`.
+
+**Проверка на хосте после OTA:** `grep host-service /etc/sudoers.d/99-pirate-smb` и `sudo -u pirate sudo -n /usr/local/lib/pirate/pirate-host-service.sh --help` (без запроса пароля).
+
+**Важно:** удаление СУБД через API вызывает сценарии `remove-*.sh` (`apt-get remove --purge`). Это может **безвозвратно удалить данные** на хосте. Используйте на тестовых машинах или после резервного копирования.

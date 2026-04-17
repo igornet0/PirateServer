@@ -18,7 +18,7 @@
 # Явно задать домен: sudo pirate_DOMAIN=deploy.example.com ./install.sh  или  --domain deploy.example.com
 # Каталог: распакованный pirate-linux-amd64/ (рядом с bin/, share/, install.sh).
 # Состав бандла (см. scripts/linux-bundle-build.sh): bin/{deploy-server,control-api,client,pirate},
-#   systemd/*.service, nginx/*.conf*, lib/pirate/*.sh, share/ui/dist (если не .bundle-no-ui),
+#   systemd/*.service, nginx/*.conf*, lib/pirate/*.sh и 99-pirate-smb.sudoers.fragment, share/ui/dist (если не .bundle-no-ui),
 #   server-stack-manifest.json, env.example.
 # Блок «GUI / трансляция»: сначала bin/pirate (или bin/client) gui-check из бандла, иначе pirate-gui-probe.sh;
 #   затем вопрос о display stream при gui_detected; см. PIRATE_DISPLAY_STREAM_CONSENT в /etc/pirate-deploy.env
@@ -444,6 +444,7 @@ usermod -aG sudo pirate 2>/dev/null || true
 
 install -d -o pirate -g pirate -m 0755 /var/lib/pirate/deploy
 mkdir -p /var/lib/pirate/db-mounts/.creds
+install -d -o pirate -g pirate -m 0755 /var/lib/pirate/antiddos/projects
 chown -R pirate:pirate /var/lib/pirate/db-mounts
 chmod 700 /var/lib/pirate/db-mounts /var/lib/pirate/db-mounts/.creds
 if [[ "$pirate_UI" == "1" ]]; then
@@ -471,12 +472,14 @@ chown pirate:pirate /var/lib/pirate/original-bundle-path
 chmod 0644 /var/lib/pirate/original-bundle-path
 
 echo "==> sudoers (SMB helpers + OTA server-stack apply; только фиксированные пути)"
+# NOPASSWD list: single source of truth — 99-pirate-smb.sudoers.fragment (bundled under lib/pirate for OTA).
 SUDOERS_PIRATE=/etc/sudoers.d/99-pirate-smb
-cat >"$SUDOERS_PIRATE" <<'SUDOERS'
-# Pirate: non-interactive sudo for SMB helpers and stack OTA helper (deploy-server calls this as user pirate)
-pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh
-SUDOERS
-chmod 0440 "$SUDOERS_PIRATE"
+SUDOERS_FRAG="$SCRIPT_DIR/99-pirate-smb.sudoers.fragment"
+if [[ ! -f "$SUDOERS_FRAG" ]]; then
+  echo "Ошибка: не найден $SUDOERS_FRAG" >&2
+  exit 1
+fi
+install -m 0440 "$SUDOERS_FRAG" "$SUDOERS_PIRATE"
 if command -v visudo >/dev/null 2>&1; then
   visudo -c -f "$SUDOERS_PIRATE" || {
     echo "Ошибка: проверка sudoers не прошла" >&2

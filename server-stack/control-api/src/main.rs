@@ -1,5 +1,6 @@
 //! HTTP control plane: status (via gRPC to deploy-server), releases (FS), history (PostgreSQL), nginx config.
 
+mod antiddos_api;
 mod auth;
 mod cors;
 mod data_sources_api;
@@ -22,11 +23,14 @@ use deploy_auth::{
     load_authorized_peers, load_identity, save_authorized_peers, IdentityFile,
 };
 use deploy_control::{
-    apply_nginx_put, read_nginx_config, ControlPlane, CpuDetail, DatabaseColumnsView,
+    apply_nginx_put, apply_nginx_site_via_sudo, collect_host_services, collect_nginx_status,
+    ensure_nginx_via_sudo, host_service_action_via_sudo, read_nginx_config, read_nginx_site_file,
+    AllocateProjectResponse, AppEnvView, ControlPlane, CpuDetail, DatabaseColumnsView,
     DatabaseInfoView, DatabaseRelationshipsView, DatabaseSchemasView, DatabaseTablePreviewView,
-    DatabaseTablesView, DiskDetail, HostStatsHistory, MemoryDetail, NginxConfigPut, NginxConfigView,
-    NginxPutResponseView, NetworkDetail, ProcessControlView, ProcessesDetail, ProjectsView,
-    RollbackBody, RollbackView, SeriesResponse,
+    DatabaseTablesView, DiskDetail, HostDeployEnvPutView, HostDeployEnvView, HostServiceActionView,
+    HostServicesView, HostStatsHistory, MemoryDetail, NginxConfigPut, NginxConfigView, NginxEnsureView,
+    NginxEnvUpdateView, NginxEnvVarUpdateView, NginxPutResponseView, NginxStatusView, NetworkDetail,
+    ProcessControlView, ProcessesDetail, ProjectsView, RollbackBody, RollbackView, SeriesResponse,
 };
 use deploy_db::{DbStore, PgPool};
 use sqlx::postgres::PgPoolOptions;
@@ -74,6 +78,23 @@ pub(crate) struct ApiState {
     subscription_tls_sni: Option<String>,
     /// Same as deploy-server `DEPLOY_GRPC_PUBLIC_URL` — public gRPC URL for clients (bootstrap JSON, hints).
     pub(crate) grpc_public_url: Option<String>,
+    /// Path to host env file (`EnvironmentFile` for systemd units), default `/etc/pirate-deploy.env`.
+    pub(crate) host_deploy_env_path: PathBuf,
+    /// Helper run via `sudo -n` to write host env and schedule restarts (`install.sh` deploys it).
+    pub(crate) host_deploy_env_write_script: PathBuf,
+    /// Effective control-api listen port for env sync fallback.
+    control_api_port: u16,
+    /// Path to editable nginx site file (`/etc/nginx/sites-available/pirate` by default).
+    nginx_site_path: PathBuf,
+    /// Helper run via `sudo -n` to install/start nginx and seed Pirate vhost.
+    nginx_ensure_script: PathBuf,
+    /// Helper run via `sudo -n` to write site config, test and reload nginx.
+    nginx_apply_site_script: PathBuf,
+    /// Whitelist dispatcher for optional host packages (`install` / `remove`).
+    host_service_dispatch_script: PathBuf,
+    antiddos_state_dir: PathBuf,
+    antiddos_apply_script: PathBuf,
+    antiddos_limit_log_path: PathBuf,
 }
 
 /// Parse database URL and strip password for safe display (PostgreSQL; SQLite returned as-is).
@@ -85,6 +106,165 @@ fn redact_database_url(raw: &str) -> Option<String> {
     let mut u = url::Url::parse(t).ok()?;
     let _ = u.set_password(None);
     Some(u.to_string())
+}
+
+fn parse_env_lines(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = t.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.is_empty() {
+            continue;
+        }
+        out.push((key.to_string(), v.trim().to_string()));
+    }
+    out
+}
+
+fn read_env_value(content: &str, key: &str) -> Option<String> {
+    for (k, v) in parse_env_lines(content) {
+        if k == key {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn canonical_http_base(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mut u = url::Url::parse(t).ok()?;
+    if u.scheme() != "http" && u.scheme() != "https" {
+        return None;
+    }
+    u.set_path("");
+    u.set_query(None);
+    u.set_fragment(None);
+    if u.path() != "/" {
+        return None;
+    }
+    Some(u.to_string().trim_end_matches('/').to_string())
+}
+
+fn base_from_grpc_public(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let u = url::Url::parse(t).ok()?;
+    let host = u.host_str()?;
+    let scheme = if u.scheme() == "https" { "https" } else { "http" };
+    Some(format!("{scheme}://{host}"))
+}
+
+fn apply_nginx_env_sync(
+    current_content: &str,
+    mode: &str,
+    fallback_control_port: u16,
+) -> Result<(String, Vec<NginxEnvVarUpdateView>), ApiError> {
+    let mut desired: Vec<(&str, Option<String>)> = Vec::new();
+    let control_port = read_env_value(current_content, "CONTROL_API_PORT")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(fallback_control_port);
+    let direct_url = format!("http://127.0.0.1:{control_port}");
+    match mode {
+        "api_only" | "with_ui" => {
+            let public_from_current = read_env_value(current_content, "DEPLOY_CONTROL_API_PUBLIC_URL")
+                .and_then(|s| canonical_http_base(&s));
+            let public_from_grpc = read_env_value(current_content, "DEPLOY_GRPC_PUBLIC_URL")
+                .and_then(|s| base_from_grpc_public(&s));
+            let public_url = public_from_current.or(public_from_grpc).unwrap_or_else(|| direct_url.clone());
+            desired.push(("NGINX_CONFIG_PATH", Some("/etc/nginx/nginx.conf".to_string())));
+            desired.push(("DEPLOY_CONTROL_API_PUBLIC_URL", Some(public_url)));
+            desired.push(("DEPLOY_CONTROL_API_DIRECT_URL", Some(direct_url)));
+        }
+        "remove" => {
+            desired.push(("NGINX_CONFIG_PATH", None));
+            desired.push(("NGINX_TEST_FULL_CONFIG", None));
+            desired.push(("NGINX_ADMIN_TOKEN", None));
+            desired.push(("DEPLOY_CONTROL_API_PUBLIC_URL", Some(direct_url.clone())));
+            desired.push(("DEPLOY_CONTROL_API_DIRECT_URL", Some(direct_url)));
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "mode must be api_only, with_ui or remove",
+            ));
+        }
+    }
+
+    let mut updates = Vec::<NginxEnvVarUpdateView>::new();
+    let mut out_lines = Vec::<String>::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut desired_map = std::collections::HashMap::<String, Option<String>>::new();
+    for (k, v) in desired {
+        desired_map.insert(k.to_string(), v);
+    }
+
+    for line in current_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || !trimmed.contains('=') {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        let Some((left, right)) = line.split_once('=') else {
+            out_lines.push(line.to_string());
+            continue;
+        };
+        let key = left.trim().to_string();
+        if let Some(new_val_opt) = desired_map.get(&key) {
+            seen.insert(key.clone());
+            let old_val = Some(right.trim().to_string());
+            match new_val_opt {
+                Some(new_val) => {
+                    out_lines.push(format!("{key}={new_val}"));
+                    if old_val.as_deref() != Some(new_val.as_str()) {
+                        updates.push(NginxEnvVarUpdateView {
+                            key,
+                            old_value: old_val,
+                            new_value: Some(new_val.clone()),
+                        });
+                    }
+                }
+                None => {
+                    updates.push(NginxEnvVarUpdateView {
+                        key,
+                        old_value: old_val,
+                        new_value: None,
+                    });
+                }
+            }
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+
+    for (key, new_val_opt) in desired_map {
+        if seen.contains(&key) {
+            continue;
+        }
+        if let Some(new_val) = new_val_opt {
+            out_lines.push(format!("{key}={new_val}"));
+            updates.push(NginxEnvVarUpdateView {
+                key,
+                old_value: None,
+                new_value: Some(new_val),
+            });
+        }
+    }
+
+    let mut next = out_lines.join("\n");
+    if !next.ends_with('\n') {
+        next.push('\n');
+    }
+    Ok((next, updates))
 }
 
 fn bearer_raw(headers: &HeaderMap) -> Option<&str> {
@@ -241,6 +421,16 @@ struct ProjectQuery {
 }
 
 #[derive(serde::Deserialize)]
+struct ProjectTelemetryQuery {
+    /// Empty or omitted means `default`.
+    #[serde(default)]
+    project: String,
+    /// Max number of log lines to return.
+    #[serde(default)]
+    logs_limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
 struct HistoryQuery {
     /// When omitted or empty, return events for all projects.
     #[serde(default)]
@@ -266,6 +456,37 @@ async fn api_status(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn api_project_telemetry(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<ProjectTelemetryQuery>,
+) -> Result<Json<deploy_control::ProjectTelemetryView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .project_telemetry(&project_or_default(&q.project), q.logs_limit.unwrap_or(120))
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[derive(serde::Serialize)]
+struct TelemetryClearOut {
+    ok: bool,
+}
+
+async fn api_project_telemetry_clear(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<ProjectQuery>,
+) -> Result<Json<TelemetryClearOut>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .clear_project_runtime_log(&project_or_default(&q.project))
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(TelemetryClearOut { ok: true }))
 }
 
 #[derive(serde::Serialize)]
@@ -658,6 +879,19 @@ async fn api_projects(
     Ok(Json(s.plane.list_projects()))
 }
 
+/// Allocate a new deploy project id (filesystem + metadata DB); for local clients to fill `pirate.toml`.
+async fn api_projects_allocate(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<AllocateProjectResponse>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .allocate_project_id()
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 async fn api_history(
     State(s): State<ApiState>,
     headers: HeaderMap,
@@ -941,6 +1175,83 @@ async fn api_process_restart(
         .map_err(Into::into)
 }
 
+#[derive(serde::Deserialize)]
+struct AppEnvPutBody {
+    content: String,
+}
+
+async fn api_app_env_get(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<ProjectQuery>,
+) -> Result<Json<AppEnvView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .read_app_env(&project_or_default(&q.project))
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn api_app_env_put(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<ProjectQuery>,
+    Json(body): Json<AppEnvPutBody>,
+) -> Result<Json<AppEnvView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    s.plane
+        .write_app_env(&project_or_default(&q.project), &body.content)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+fn host_deploy_env_example_template() -> &'static str {
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../deploy/ubuntu/env.example"
+    ))
+}
+
+async fn api_host_deploy_env_get(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<HostDeployEnvView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    ControlPlane::read_host_deploy_env(&s.host_deploy_env_path)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn api_host_deploy_env_put(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<AppEnvPutBody>,
+) -> Result<Json<HostDeployEnvPutView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    ControlPlane::write_host_deploy_env(
+        &s.host_deploy_env_path,
+        &body.content,
+        &s.host_deploy_env_write_script,
+    )
+    .map(Json)
+    .map_err(Into::into)
+}
+
+#[derive(serde::Serialize)]
+struct HostDeployEnvTemplateBody {
+    template: &'static str,
+}
+
+async fn api_host_deploy_env_template(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<HostDeployEnvTemplateBody>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(HostDeployEnvTemplateBody {
+        template: host_deploy_env_example_template(),
+    }))
+}
+
 async fn get_nginx_config(
     State(s): State<ApiState>,
     headers: HeaderMap,
@@ -977,6 +1288,111 @@ async fn put_nginx_config(
             Ok(Json(outcome.response))
         }
     }
+}
+
+async fn api_nginx_status(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<NginxStatusView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(collect_nginx_status(
+        &s.nginx_site_path,
+        &s.nginx_ensure_script,
+        &s.nginx_apply_site_script,
+    )))
+}
+
+async fn api_nginx_site_get(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<NginxConfigView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(read_nginx_site_file(&s.nginx_site_path)))
+}
+
+async fn api_nginx_site_put(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<NginxConfigPut>,
+) -> Result<Json<NginxPutResponseView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let out = apply_nginx_site_via_sudo(
+        &s.nginx_site_path,
+        &body.content,
+        &s.nginx_apply_site_script,
+    )?;
+    Ok(Json(out))
+}
+
+#[derive(serde::Deserialize)]
+struct NginxEnsureBody {
+    mode: String,
+}
+
+async fn api_host_services(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<HostServicesView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(collect_host_services(
+        &s.nginx_site_path,
+        &s.nginx_ensure_script,
+        &s.nginx_apply_site_script,
+        &s.host_service_dispatch_script,
+    )))
+}
+
+async fn api_host_service_install(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<HostServiceActionView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(host_service_action_via_sudo(
+        "install",
+        &id,
+        &s.host_service_dispatch_script,
+    )?))
+}
+
+async fn api_host_service_remove(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<HostServiceActionView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(host_service_action_via_sudo(
+        "remove",
+        &id,
+        &s.host_service_dispatch_script,
+    )?))
+}
+
+async fn api_nginx_ensure(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<NginxEnsureBody>,
+) -> Result<Json<NginxEnsureView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let mode = body.mode.trim().to_string();
+    let mut out = ensure_nginx_via_sudo(&mode, &s.nginx_ensure_script)?;
+    if !out.ok {
+        return Ok(Json(out));
+    }
+    let current_env = ControlPlane::read_host_deploy_env(&s.host_deploy_env_path)?;
+    let (next_content, updates) =
+        apply_nginx_env_sync(&current_env.content, &mode, s.control_api_port)?;
+    let env_put = ControlPlane::write_host_deploy_env(
+        &s.host_deploy_env_path,
+        &next_content,
+        &s.host_deploy_env_write_script,
+    )?;
+    out.env_update = Some(NginxEnvUpdateView {
+        mode,
+        restart_scheduled: env_put.restart_scheduled,
+        updates,
+    });
+    Ok(Json(out))
 }
 
 #[derive(Parser, Debug)]
@@ -1050,6 +1466,62 @@ struct Args {
     /// If set, PUT `/api/v1/nginx/config` requires `Authorization: Bearer <token>`.
     #[arg(long, env = "NGINX_ADMIN_TOKEN")]
     nginx_admin_token: Option<String>,
+
+    /// Path to nginx site config managed by desktop tab (`GET/PUT /api/v1/nginx/site`).
+    #[arg(
+        long,
+        env = "CONTROL_API_NGINX_SITE_PATH",
+        default_value = "/etc/nginx/sites-available/pirate"
+    )]
+    nginx_site_path: PathBuf,
+
+    /// Privileged helper to install/start nginx (`POST /api/v1/nginx/ensure`).
+    #[arg(
+        long,
+        env = "CONTROL_API_NGINX_ENSURE_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-ensure-nginx.sh"
+    )]
+    nginx_ensure_script: PathBuf,
+
+    /// Privileged helper to apply nginx site from stdin (`PUT /api/v1/nginx/site`).
+    #[arg(
+        long,
+        env = "CONTROL_API_NGINX_APPLY_SITE_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-nginx-apply-site.sh"
+    )]
+    nginx_apply_site_script: PathBuf,
+
+    /// `pirate-host-service.sh` whitelist (install/remove optional host packages).
+    #[arg(
+        long,
+        env = "CONTROL_API_HOST_SERVICE_DISPATCH_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-host-service.sh"
+    )]
+    host_service_dispatch_script: PathBuf,
+
+    /// Anti-DDoS state directory (`host.json`, `projects/*.json`).
+    #[arg(
+        long,
+        env = "CONTROL_API_ANTIDDOS_STATE_DIR",
+        default_value = "/var/lib/pirate/antiddos"
+    )]
+    antiddos_state_dir: PathBuf,
+
+    /// Privileged helper: `pirate-antiddos-apply.sh`.
+    #[arg(
+        long,
+        env = "CONTROL_API_ANTIDDOS_APPLY_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-antiddos-apply.sh"
+    )]
+    antiddos_apply_script: PathBuf,
+
+    /// Nginx log for rate-limit events (fail2ban + stats tail).
+    #[arg(
+        long,
+        env = "CONTROL_API_ANTIDDOS_LIMIT_LOG",
+        default_value = "/var/log/nginx/pirate-antiddos-error.log"
+    )]
+    antiddos_limit_log_path: PathBuf,
 
     /// If set, `Authorization: Bearer` may match this token (in addition to JWT when `CONTROL_API_JWT_SECRET` is set).
     #[arg(long, env = "CONTROL_API_BEARER_TOKEN")]
@@ -1200,6 +1672,9 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         nginx_config = ?args.nginx_config_path,
         nginx_test_full = args.nginx_test_full_config,
         nginx_auth = %if args.nginx_admin_token.is_some() { "on" } else { "off" },
+        nginx_site_path = %args.nginx_site_path.display(),
+        nginx_ensure_script = %args.nginx_ensure_script.display(),
+        nginx_apply_site_script = %args.nginx_apply_site_script.display(),
         api_bearer = %if args.api_bearer_token.is_some() { "on" } else { "off" },
         jwt = %if args.jwt_secret.is_some() { "on" } else { "off" },
         cors = %if std::env::var("CONTROL_API_CORS_ALLOW_ANY").ok().as_deref() == Some("1") {
@@ -1316,6 +1791,17 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty());
 
+    let host_deploy_env_path = std::env::var("CONTROL_API_HOST_DEPLOY_ENV_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/pirate-deploy.env"));
+    let host_deploy_env_write_script = std::env::var("CONTROL_API_WRITE_DEPLOY_ENV_SCRIPT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/lib/pirate/pirate-write-deploy-env.sh"));
+
     let state = ApiState {
         plane,
         nginx_config_path: args.nginx_config_path.clone(),
@@ -1338,12 +1824,27 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         subscription_server_hostname,
         subscription_tls_sni,
         grpc_public_url,
+        host_deploy_env_path,
+        host_deploy_env_write_script,
+        control_api_port: args.listen_port,
+        nginx_site_path: args.nginx_site_path.clone(),
+        nginx_ensure_script: args.nginx_ensure_script.clone(),
+        nginx_apply_site_script: args.nginx_apply_site_script.clone(),
+        host_service_dispatch_script: args.host_service_dispatch_script.clone(),
+        antiddos_state_dir: args.antiddos_state_dir.clone(),
+        antiddos_apply_script: args.antiddos_apply_script.clone(),
+        antiddos_limit_log_path: args.antiddos_limit_log_path.clone(),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/auth/login", post(api_login))
         .route("/api/v1/status", get(api_status))
+        .route("/api/v1/projects/telemetry", get(api_project_telemetry))
+        .route(
+            "/api/v1/projects/telemetry/clear",
+            post(api_project_telemetry_clear),
+        )
         .route("/api/v1/host-stats", get(api_host_stats))
         .route(
             "/api/v1/host-stats/detail/cpu",
@@ -1370,6 +1871,7 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/host-stats/ws", get(api_host_stats_ws))
         .route("/api/v1/releases", get(api_releases))
         .route("/api/v1/projects", get(api_projects))
+        .route("/api/v1/projects/allocate", post(api_projects_allocate))
         .route("/api/v1/history", get(api_history))
         .route("/api/v1/grpc-sessions", get(api_grpc_sessions))
         .route(
@@ -1436,8 +1938,51 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/rollback", post(api_rollback))
         .route("/api/v1/process/stop", post(api_process_stop))
         .route("/api/v1/process/restart", post(api_process_restart))
+        .route(
+            "/api/v1/app-env",
+            get(api_app_env_get).put(api_app_env_put),
+        )
+        .route(
+            "/api/v1/host-deploy-env",
+            get(api_host_deploy_env_get).put(api_host_deploy_env_put),
+        )
+        .route(
+            "/api/v1/host-deploy-env/template",
+            get(api_host_deploy_env_template),
+        )
         .route("/api/v1/nginx/config", get(get_nginx_config))
         .route("/api/v1/nginx/config", put(put_nginx_config))
+        .route("/api/v1/nginx/status", get(api_nginx_status))
+        .route("/api/v1/nginx/site", get(api_nginx_site_get).put(api_nginx_site_put))
+        .route("/api/v1/nginx/ensure", post(api_nginx_ensure))
+        .route("/api/v1/host-services", get(api_host_services))
+        .route(
+            "/api/v1/host-services/:id/install",
+            post(api_host_service_install),
+        )
+        .route(
+            "/api/v1/host-services/:id/remove",
+            post(api_host_service_remove),
+        )
+        .route("/api/v1/antiddos", get(antiddos_api::api_antiddos_get).put(antiddos_api::api_antiddos_put))
+        .route(
+            "/api/v1/antiddos/enable",
+            post(antiddos_api::api_antiddos_enable),
+        )
+        .route(
+            "/api/v1/antiddos/disable",
+            post(antiddos_api::api_antiddos_disable),
+        )
+        .route(
+            "/api/v1/antiddos/apply",
+            post(antiddos_api::api_antiddos_apply),
+        )
+        .route("/api/v1/antiddos/stats", get(antiddos_api::api_antiddos_stats))
+        .route(
+            "/api/v1/antiddos/projects/:project_id",
+            put(antiddos_api::api_antiddos_project_put)
+                .delete(antiddos_api::api_antiddos_project_delete),
+        )
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(cors::build_cors_layer())
         .with_state(state);
