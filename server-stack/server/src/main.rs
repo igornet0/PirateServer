@@ -4,6 +4,7 @@ mod admin_seed;
 mod auth;
 mod benchmark;
 mod deploy_service;
+mod listen_port_owner;
 mod tunnel_admission;
 mod tunnel_flush;
 mod tunnel_registry;
@@ -30,7 +31,7 @@ use tonic::transport::server::TcpIncoming;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -226,6 +227,61 @@ fn grpc_host_from_public_url(url: &str) -> String {
         return "127.0.0.1".to_string();
     }
     rest[..end].to_string()
+}
+
+fn normalize_http_base_url(s: &str) -> String {
+    s.trim().trim_end_matches('/').to_string()
+}
+
+/// Best-effort `http://host:8080` from gRPC public URL (same host, port 8080).
+fn derive_control_api_url_from_grpc(endpoint: &str) -> String {
+    let s = endpoint.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let host_part = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if host_part.is_empty() {
+        return String::new();
+    }
+    let out = if host_part.contains(":50051") {
+        format!("http://{}", host_part.replace(":50051", ":8080"))
+    } else if !host_part.contains(':') {
+        format!("http://{host_part}:8080")
+    } else if let Some((h, _p)) = host_part.rsplit_once(':') {
+        format!("http://{h}:8080")
+    } else {
+        format!("http://{host_part}:8080")
+    };
+    normalize_http_base_url(&out)
+}
+
+/// Direct control-api URL (`DEPLOY_CONTROL_API_DIRECT_URL`, or derived from gRPC public URL).
+fn control_api_direct_url(grpc_public_url: &str) -> String {
+    if let Ok(u) = std::env::var("DEPLOY_CONTROL_API_DIRECT_URL") {
+        let t = u.trim();
+        if !t.is_empty() {
+            return normalize_http_base_url(t);
+        }
+    }
+    derive_control_api_url_from_grpc(grpc_public_url)
+}
+
+/// Public control-api URL for clients (nginx / TLS). `DEPLOY_CONTROL_API_PUBLIC_URL`, or same as direct when unset.
+fn control_api_public_url(_grpc_public_url: &str, direct: &str) -> String {
+    if let Ok(u) = std::env::var("DEPLOY_CONTROL_API_PUBLIC_URL") {
+        let t = u.trim();
+        if !t.is_empty() {
+            return normalize_http_base_url(t);
+        }
+    }
+    direct.to_string()
 }
 
 fn resolve_quic_bind(args: &Args) -> Option<SocketAddr> {
@@ -430,6 +486,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(bind = %s, "DEPLOY_METRICS_BIND: invalid address, metrics disabled");
         }
     }
+    let control_api_direct = control_api_direct_url(&public_url);
+    let control_api_public = control_api_public_url(&public_url, &control_api_direct);
+
+    if std::env::var("DEPLOY_CONTROL_API_PUBLIC_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_none()
+    {
+        warn!(
+            control_api_http_url = %control_api_public,
+            control_api_http_url_direct = %control_api_direct,
+            "DEPLOY_CONTROL_API_PUBLIC_URL is unset: GetStatus will advertise the above public URL (often :8080 derived from gRPC). Set DEPLOY_CONTROL_API_PUBLIC_URL when clients use nginx or another host/port (e.g. http://192.168.x.x without :8080)."
+        );
+    }
+
     let svc = DeployServiceServer::new(DeployServiceImpl::new(
         args.root,
         args.max_upload_bytes,
@@ -437,6 +508,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_server_stack_update,
         args.binary_name,
         public_url,
+        control_api_public,
+        control_api_direct,
         states,
         db,
         server_auth,

@@ -1,0 +1,84 @@
+# Merge with tests/docker/docker-compose.test.yml — стек сервера + контейнер «ПК» (CLI client) и нагрузочный Anti-DDoS-тест между контейнерами.
+#
+# Сервер: postgres, deploy-server, control-api, nginx (как в docker-compose.test.yml).
+# Не публикуем порты на хост по умолчанию (как grpc-client-e2e), чтобы не конфликтовать с локальным compose.
+#
+# Поднять стек:
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.anti-ddos.yml -p pirateserver-antiddos up -d --build
+#
+# «ПК» в Docker — smoke gRPC + HTTP:
+#   docker compose -f tests/docker/docker-compose.test.yml -f tests/docker/docker-compose.anti-ddos.yml -p pirateserver-antiddos --profile anti-ddos run --rm pc-client-smoke
+#
+# Нагрузка на nginx с другого контейнера (аналог make test-anti-ddos, URL внутри сети):
+#   docker compose ... --profile anti-ddos run --rm anti-ddos-runner
+# Или: ./scripts/run-docker-anti-ddos.sh
+
+services:
+  deploy-server:
+    ports: !override []
+
+  control-api:
+    ports: !override []
+
+  nginx:
+    ports: !override []
+
+  # Имитирует машину пользователя: deploy client → gRPC + проверка HTTP через nginx.
+  pc-client-smoke:
+    profiles:
+      - anti-ddos
+    image: pirate-test-runtime
+    pull_policy: never
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        echo "==> PC client: gRPC deploy-server:50051"
+        client --endpoint http://deploy-server:50051 status
+        echo "==> PC client: HTTP через nginx (dashboard API health)"
+        curl -sfS "http://nginx:80/health" | head -c 300
+        echo ""
+        echo "OK: pc-client-smoke"
+    depends_on:
+      deploy-server:
+        condition: service_started
+      control-api:
+        condition: service_healthy
+      nginx:
+        condition: service_started
+
+  # Нагрузочный сценарий: запросы с контейнера-«атакующего» на nginx (между контейнерами в одной bridge-сети).
+  anti-ddos-runner:
+    profiles:
+      - anti-ddos
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        apk add --no-cache bash curl coreutils findutils python3 jq >/dev/null
+        exec bash /scripts/test-anti-ddos.sh
+    volumes:
+      - ../../scripts/test-anti-ddos.sh:/scripts/test-anti-ddos.sh:ro
+      - ../../scripts/lib:/scripts/lib:ro
+      - ../../scripts/wrk_status.lua:/scripts/wrk_status.lua:ro
+    environment:
+      URL: http://nginx:80
+      PATH_SUFFIX: ${PATH_SUFFIX:-/}
+      PARALLEL: ${PARALLEL:-60}
+      BURST_N: ${BURST_N:-1200}
+      BURST_CONC: ${BURST_CONC:-80}
+      CONSTANT_RPS: ${CONSTANT_RPS:-30}
+      DURATION_SEC: ${DURATION_SEC:-45}
+      HIGH_CONCURRENCY: ${HIGH_CONCURRENCY:-200}
+      HIGH_DURATION_SEC: ${HIGH_DURATION_SEC:-30}
+      INSECURE: ${INSECURE:-0}
+      SKIP_SLOW: ${SKIP_SLOW:-0}
+      REPORT_JSON: ${REPORT_JSON:-}
+    depends_on:
+      nginx:
+        condition: service_started
+      control-api:
+        condition: service_healthy

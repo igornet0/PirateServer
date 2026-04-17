@@ -1,5 +1,6 @@
 //! Deploy: stream → temp file, SHA-256, tar unpack, symlink, process control.
 
+use crate::listen_port_owner;
 use crate::metrics_http::ProxyTunnelMetrics;
 use crate::proxy_session;
 use crate::tunnel_admission::{self, TunnelAdmission};
@@ -8,7 +9,8 @@ use crate::tunnel_flush::{
 };
 use crate::tunnel_registry::{redis_fields_snapshot, RedisTunnelDropGuard, TunnelRedis};
 use deploy_core::{
-    normalize_project_id, pirate_project::PirateManifest, process_manager,
+    normalize_project_id, pirate_project::PirateManifest,
+    pirate_project::read_pirate_project_version_from_deploy_root, process_manager,
     project_deploy_root, read_current_version_from_symlink,
     read_host_stack_ui_flags, read_server_stack_bundle_version_from_var_lib, refresh_process_state,
     release_dir_for_version, status_current_version_display, validate_project_id,
@@ -28,8 +30,9 @@ use deploy_control::{
     CpuDetail, CpuTimes, DiskDetail, DiskIoSummary, HostLogLine, HostMountStats, HostNetInterface,
     HostStatsView, LoadAvg, MemoryDetail, MemoryOverview, NetworkDetail, ProcessCpu, ProcessDisk,
     ProcessMem, ProcessRow, ProcessesDetail, SeriesHint, NetCounters,
+    nginx_route_conflicts,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use deploy_proto::deploy::{
     deploy_service_server::DeployService, host_stats_detail_response::Detail as HostStatsDetailOneof,
     proxy_client_msg, proxy_server_msg,
@@ -44,7 +47,8 @@ use deploy_proto::deploy::{
     ProxyClientMsg, ProxyOpenResult, ProxyServerMsg,
     DisplayTopologyDisplay, ReportDisplayTopologyRequest, ReportDisplayTopologyResponse,
     ReportResourceUsageRequest, ReportResourceUsageResponse,
-    RestartProcessRequest, RollbackRequest, RollbackResponse, SeriesHintProto, StackApplyMode,
+    RemoveProjectRequest, RemoveProjectResponse, RestartProcessRequest, RollbackRequest,
+    RollbackResponse, SeriesHintProto, StackApplyMode, ValidateDeployRequest, ValidateDeployResponse,
     StackApplyOptions, ServerStackChunk, ServerStackInfo, ServerStackInfoRequest, ServerStackResponse,
     StatusRequest, StatusResponse,
     StopProcessRequest,
@@ -57,6 +61,7 @@ use futures_util::Stream;
 use futures_util::StreamExt;
 use prost::Message;
 use sha2::{Digest, Sha256};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 #[cfg(unix)]
@@ -578,6 +583,10 @@ pub struct DeployServiceImpl {
     pub binary_fallback: String,
     /// gRPC endpoint URL for local client bundles (`DEPLOY_GRPC_PUBLIC_URL` / default).
     pub public_url: String,
+    /// HTTP base for control-api (public / nginx); see `StatusResponse.control_api_http_url`.
+    pub control_api_http_url: String,
+    /// Direct control-api base (e.g. `:8080`); see `StatusResponse.control_api_http_url_direct`.
+    pub control_api_http_url_direct: String,
     pub states: Arc<tokio::sync::Mutex<HashMap<String, AppState>>>,
     pub db: Option<Arc<DbStore>>,
     pub auth: Option<Arc<ServerAuth>>,
@@ -601,6 +610,8 @@ impl DeployServiceImpl {
         allow_server_stack_update: bool,
         binary_fallback: String,
         public_url: String,
+        control_api_http_url: String,
+        control_api_http_url_direct: String,
         states: Arc<tokio::sync::Mutex<HashMap<String, AppState>>>,
         db: Option<Arc<DbStore>>,
         auth: Option<Arc<ServerAuth>>,
@@ -619,6 +630,8 @@ impl DeployServiceImpl {
             allow_server_stack_update,
             binary_fallback,
             public_url,
+            control_api_http_url,
+            control_api_http_url_direct,
             states,
             db,
             auth,
@@ -632,7 +645,12 @@ impl DeployServiceImpl {
         }
     }
 
-    fn status_response(&self, current_version: String, state: String) -> StatusResponse {
+    fn status_response(
+        &self,
+        current_version: String,
+        state: String,
+        project_version: String,
+    ) -> StatusResponse {
         let (client_connect_token, client_connect_pairing) = if let Some(ref auth) = self.auth {
             (
                 auth.server_pubkey_b64.clone(),
@@ -647,6 +665,9 @@ impl DeployServiceImpl {
             client_connect_token,
             client_connect_url: self.public_url.clone(),
             client_connect_pairing,
+            project_version,
+            control_api_http_url: self.control_api_http_url.clone(),
+            control_api_http_url_direct: self.control_api_http_url_direct.clone(),
         }
     }
 
@@ -726,6 +747,40 @@ fn ensure_run_sh_executable(release_dir: &Path) {
 fn ensure_run_sh_executable(_release_dir: &Path) {}
 
 fn unpack_tar_gz(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Prefer system `tar` on Unix: archives produced by macOS `tar` (bsdtar) or GNU tar unpack
+    // reliably; the Rust `tar` crate can disagree with some vendor tar streams.
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+        std::fs::create_dir_all(dst)?;
+        match Command::new("tar")
+            .arg("-xzf")
+            .arg(src)
+            .arg("-C")
+            .arg(dst)
+            .status()
+        {
+            Ok(st) if st.success() => return Ok(()),
+            Ok(st) => {
+                warn!(
+                    ?st,
+                    path = %src.display(),
+                    "system tar failed; falling back to rust tar crate"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    %e,
+                    path = %src.display(),
+                    "system tar not runnable; falling back to rust tar crate"
+                );
+            }
+        }
+    }
+    unpack_tar_gz_rust(src, dst)
+}
+
+fn unpack_tar_gz_rust(src: &Path, dst: &Path) -> std::io::Result<()> {
     use flate2::read::GzDecoder;
     use std::fs::File;
     use std::path::Component;
@@ -754,6 +809,21 @@ async fn spawn_release(
     version: &str,
     binary_fallback: &str,
 ) -> Result<tokio::process::Child, Status> {
+    let pirate_dir = root.join(".pirate");
+    std::fs::create_dir_all(&pirate_dir).map_err(|e| {
+        Status::internal(format!("create {}: {e}", pirate_dir.display()))
+    })?;
+    let log_path = pirate_dir.join("runtime.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&log_path)
+        .map_err(|e| Status::internal(format!("open {}: {e}", log_path.display())))?;
+    let log_err = log_file
+        .try_clone()
+        .map_err(|e| Status::internal(format!("open {} (stderr): {e}", log_path.display())))?;
+
     let release_dir = release_dir_for_version(root, version);
     let run_sh = release_dir.join("run.sh");
 
@@ -762,8 +832,8 @@ async fn spawn_release(
         c.arg(run_sh.as_os_str())
             .current_dir(&release_dir)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(log_err));
         c
     } else {
         let bin = release_dir.join(binary_fallback);
@@ -777,8 +847,8 @@ async fn spawn_release(
         let mut c = tokio::process::Command::new(&bin);
         c.current_dir(&release_dir)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(log_err));
         c
     };
 
@@ -791,6 +861,61 @@ async fn stop_child(child: &mut tokio::process::Child) {
         warn!(error = %e, "kill child");
     }
     let _ = child.wait().await;
+}
+
+fn occupied_ports_from_manifest(manifest: &PirateManifest) -> Vec<u16> {
+    let mut ports = BTreeSet::<u16>::new();
+    if let Some(ref api) = manifest.services.api {
+        if api.port > 0 {
+            ports.insert(api.port);
+        }
+    }
+    if let Some(ref web) = manifest.services.web {
+        if web.port > 0 {
+            ports.insert(web.port);
+        }
+    }
+    if manifest.proxy.enabled && manifest.proxy.port > 0 {
+        ports.insert(manifest.proxy.port);
+    }
+    ports.into_iter().collect()
+}
+
+fn detect_busy_ports(ports: &[u16]) -> Vec<u16> {
+    let mut out = Vec::<u16>::new();
+    for p in ports {
+        let bind = format!("127.0.0.1:{p}");
+        if TcpListener::bind(&bind).is_err() {
+            out.push(*p);
+        }
+    }
+    out
+}
+
+/// Drop ports that are "busy" only because this project's managed process still holds them
+/// (same `project_id` under `project_deploy_root`; verified via `/proc` on Linux).
+fn filter_busy_ports_excluding_same_project(
+    base_root: &Path,
+    project_id: &str,
+    busy: &[u16],
+) -> Vec<u16> {
+    let root = project_deploy_root(base_root, project_id);
+    let Some(rs) = process_manager::read_runtime_state(&root) else {
+        return busy.to_vec();
+    };
+    let pid = match rs.pid {
+        Some(p) if p > 0 => p,
+        _ => return busy.to_vec(),
+    };
+    let want = normalize_project_id(project_id);
+    let got = normalize_project_id(&rs.project_id);
+    if !got.is_empty() && got != want {
+        return busy.to_vec();
+    }
+    busy.iter()
+        .copied()
+        .filter(|&p| !listen_port_owner::pid_listens_on_deploy_port(pid, p))
+        .collect()
 }
 
 #[tonic::async_trait]
@@ -1095,6 +1220,36 @@ impl DeployService for DeployServiceImpl {
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(Status::internal)?;
 
+        if let Some(ref man) = manifest_opt {
+            match deploy_core::nginx_snippet::nginx_release_skip(man) {
+                None => {
+                    info!(
+                        project = %project_key,
+                        version = %version,
+                        nginx_snippet = "written",
+                        "release sidecar"
+                    );
+                }
+                Some(skip) => {
+                    info!(
+                        project = %project_key,
+                        version = %version,
+                        nginx_snippet = "skipped",
+                        reason = skip.reason_code(),
+                        "release sidecar"
+                    );
+                }
+            }
+        } else {
+            info!(
+                project = %project_key,
+                version = %version,
+                nginx_snippet = "skipped",
+                reason = "no_manifest",
+                "release sidecar"
+            );
+        }
+
         info!(project = %project_key, version = %version, "artifact unpacked");
 
         let root = project_root.clone();
@@ -1191,9 +1346,10 @@ impl DeployService for DeployServiceImpl {
             &root,
             env!("CARGO_PKG_VERSION"),
         );
+        let project_version = read_pirate_project_version_from_deploy_root(&root);
 
         Ok(Response::new(
-            self.status_response(current, st.state.clone()),
+            self.status_response(current, st.state.clone(), project_version),
         ))
     }
 
@@ -1270,6 +1426,153 @@ impl DeployService for DeployServiceImpl {
         }))
     }
 
+    async fn validate_deploy(
+        &self,
+        request: Request<ValidateDeployRequest>,
+    ) -> Result<Response<ValidateDeployResponse>, Status> {
+        let meta = request.metadata().clone();
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("ValidateDeploy", &request.get_ref().project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "ValidateDeploy",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+
+        let inner = request.into_inner();
+        let manifest = PirateManifest::parse(&inner.manifest_toml)
+            .map_err(|e| Status::invalid_argument(format!("manifest_toml parse: {e}")))?;
+        let mut blockers = Vec::<String>::new();
+        let mut warnings = Vec::<String>::new();
+
+        if let Err(e) = manifest.validate_network_proxy() {
+            blockers.push(e);
+        }
+
+        let mode = manifest.network.mode.trim().to_ascii_lowercase();
+        if mode == "wan" {
+            if !manifest.network.tls.https {
+                warnings.push(
+                    "WAN mode without HTTPS enabled ([network.tls].https=false)".to_string(),
+                );
+            }
+            if !manifest.network.firewall.managed {
+                warnings.push(
+                    "WAN mode with unmanaged firewall; open only required ports".to_string(),
+                );
+            }
+        }
+
+        let ports = occupied_ports_from_manifest(&manifest);
+        let busy = detect_busy_ports(&ports);
+        let busy = filter_busy_ports_excluding_same_project(&self.base_root, &inner.project_id, &busy);
+        for p in busy {
+            blockers.push(format!("port {p} is already occupied on host"));
+        }
+
+        if manifest.proxy.enabled
+            && manifest.proxy.backend.trim().eq_ignore_ascii_case("nginx")
+            && manifest.proxy.routes.is_empty()
+            && manifest.services.api.is_none()
+            && manifest.services.web.is_none()
+        {
+            blockers.push(
+                "proxy enabled but no routes/services found ([proxy].routes or [services].api/web)"
+                    .to_string(),
+            );
+        }
+        for conflict in nginx_route_conflicts(&manifest) {
+            blockers.push(conflict);
+        }
+
+        Ok(Response::new(ValidateDeployResponse {
+            allow: blockers.is_empty(),
+            blockers,
+            warnings,
+        }))
+    }
+
+    async fn remove_project(
+        &self,
+        request: Request<RemoveProjectRequest>,
+    ) -> Result<Response<RemoveProjectResponse>, Status> {
+        let meta = request.metadata().clone();
+        validate_project_id(&request.get_ref().project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("RemoveProject", &request.get_ref().project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "RemoveProject",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let inner = request.into_inner();
+        let key = normalize_project_id(&inner.project_id);
+        let root = project_deploy_root(&self.base_root, &inner.project_id);
+
+        let mut map = self.states.lock().await;
+        let st = map.entry(key.clone()).or_insert_with(AppState::default);
+        if let Some(ref mut c) = st.child {
+            stop_child(c).await;
+            st.child = None;
+        }
+        st.current_version.clear();
+        st.state = "stopped".to_string();
+        st.last_error = None;
+        drop(map);
+
+        let mut removed_root = root.display().to_string();
+        if key == "default" {
+            // Legacy single-project layout under base_root: clear only deploy artifacts.
+            let current = root.join("current");
+            if current.exists() {
+                let _ = std::fs::remove_file(&current);
+            }
+            let releases = root.join("releases");
+            if releases.exists() {
+                std::fs::remove_dir_all(&releases)
+                    .map_err(|e| Status::internal(format!("remove releases: {e}")))?;
+            }
+            let runtime_dir = root.join(".pirate");
+            if runtime_dir.exists() {
+                let _ = std::fs::remove_dir_all(&runtime_dir);
+            }
+            removed_root = root.display().to_string();
+        } else if root.exists() {
+            std::fs::remove_dir_all(&root)
+                .map_err(|e| Status::internal(format!("remove project root: {e}")))?;
+        }
+
+        let mut removed_db_rows: u64 = 0;
+        if let Some(db) = self.db.clone() {
+            match db.delete_project_data(&key).await {
+                Ok(n) => removed_db_rows = n,
+                Err(e) => return Err(Status::internal(format!("remove db rows: {e}"))),
+            }
+        }
+
+        Ok(Response::new(RemoveProjectResponse {
+            status: "ok".to_string(),
+            project_id: key,
+            removed_root,
+            removed_db_rows,
+        }))
+    }
+
     async fn stop_process(
         &self,
         request: Request<StopProcessRequest>,
@@ -1323,8 +1626,9 @@ impl DeployService for DeployServiceImpl {
             &root,
             env!("CARGO_PKG_VERSION"),
         );
+        let project_version = read_pirate_project_version_from_deploy_root(&root);
         Ok(Response::new(
-            self.status_response(for_response, "stopped".to_string()),
+            self.status_response(for_response, "stopped".to_string(), project_version),
         ))
     }
 
@@ -1401,9 +1705,11 @@ impl DeployService for DeployServiceImpl {
 
         let map = self.states.lock().await;
         let st = map.get(&key).ok_or_else(|| Status::internal("internal: project state"))?;
+        let project_version = read_pirate_project_version_from_deploy_root(&root);
         Ok(Response::new(self.status_response(
             st.current_version.clone(),
             st.state.clone(),
+            project_version,
         )))
     }
 
@@ -3332,6 +3638,24 @@ fn bundle_has_server_bins(dir: &Path) -> bool {
     }
 }
 
+/// Best-effort listing of `extract_dir` top-level names for OTA diagnostics (gRPC error text).
+fn format_extract_dir_top_level(extracted: &Path) -> String {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(extracted) {
+        for ent in rd.flatten() {
+            let label = ent.file_name().to_string_lossy().into_owned();
+            let kind = if ent.path().is_dir() { "dir" } else { "file" };
+            names.push(format!("{label}({kind})"));
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        "(empty or unreadable)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 async fn apply_stack_bundle_command(
     br: &Path,
     ver: &str,
@@ -3394,9 +3718,29 @@ fn find_pirate_bundle_root(extracted: &Path) -> Result<PathBuf, Status> {
     if bundle_has_server_bins(extracted) {
         return Ok(extracted.to_path_buf());
     }
-    Err(Status::invalid_argument(
-        "expected bundle with bin/deploy-server and bin/control-api (top-level or pirate-*-*/)",
-    ))
+    // Fallback: any single top-level directory containing server binaries (custom/repacked bundle names).
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(extracted) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_dir() && bundle_has_server_bins(&p) {
+                candidates.push(p);
+            }
+        }
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates[0].clone());
+    }
+    if candidates.len() > 1 {
+        return Err(Status::invalid_argument(format!(
+            "multiple bundle roots in tarball; expected exactly one directory with bin/deploy-server and bin/control-api; extract_dir top-level: {}",
+            format_extract_dir_top_level(extracted)
+        )));
+    }
+    Err(Status::invalid_argument(format!(
+        "expected bundle with bin/deploy-server and bin/control-api (top-level or pirate-*-*/); extract_dir top-level: {}",
+        format_extract_dir_top_level(extracted)
+    )))
 }
 
 fn parse_stack_manifest_versions(s: &str) -> (Option<String>, Option<String>) {
