@@ -19,9 +19,20 @@ import {
 import { bindInboundsTab, loadInbounds } from "./views/inbounds.js";
 import { loadNginx, saveNginx } from "./views/nginx.js";
 
+let dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleDashboardRefresh(): void {
+  if (dashboardRefreshTimer != null) {
+    clearTimeout(dashboardRefreshTimer);
+  }
+  dashboardRefreshTimer = setTimeout(() => {
+    dashboardRefreshTimer = null;
+    void refreshDashboard();
+  }, 200);
+}
+
 initI18n();
 onLocaleChange(() => {
-  void refreshDashboard();
+  scheduleDashboardRefresh();
   void loadNginx();
   refreshDatabaseFromLocale();
   void loadInbounds();
@@ -33,7 +44,11 @@ function bootstrapDashboard(): void {
   }
 
   const loading = t("loading");
-  document.getElementById("status")!.textContent = loading;
+  const statusJsonEl = document.getElementById("status-json");
+  if (statusJsonEl) {
+    statusJsonEl.textContent = loading;
+  }
+  document.getElementById("status-kpi-strip")?.setAttribute("data-loading", "1");
   document.getElementById("releases")!.textContent = loading;
   document.getElementById("history")!.textContent = loading;
   (document.getElementById("projects") as HTMLElement).textContent = loading;
@@ -59,7 +74,7 @@ function bootstrapDashboard(): void {
     }
     ap.addEventListener("change", () => {
       void activeProject();
-      void refreshDashboard();
+      scheduleDashboardRefresh();
     });
   }
 
@@ -93,10 +108,8 @@ function bootstrapDashboard(): void {
     }
   });
 
-  void refreshDashboard();
-  setInterval(() => {
-    void refreshDashboard();
-  }, 10_000);
+  scheduleDashboardRefresh();
+  setInterval(scheduleDashboardRefresh, 10_000);
 
   document.getElementById("nginx-load")?.addEventListener("click", () => {
     void loadNginx();

@@ -141,34 +141,116 @@
             role="tabpanel"
             aria-labelledby="tab-status"
           >
-            <section id="status-section" class="panel-block">
-              <h2 data-i18n="status.heading">Current status</h2>
-              <pre id="status">Loading…</pre>
-              <div class="row actions status-actions">
-                <button
-                  type="button"
-                  id="btn-host-server-info"
-                  class="ghost"
-                  data-i18n="status.hostServer.open"
-                >
-                  Server information
-                </button>
+            <section id="status-section" class="panel-block status-dashboard">
+              <div id="status-kpi-strip" class="status-kpi-strip" data-loading="1" aria-live="polite">
+                <div class="kpi-tile" id="kpi-tile-deploy">
+                  <span class="kpi-tile-label" data-i18n="status.kpi.deploy">Deploy</span>
+                  <div class="kpi-tile-value-row">
+                    <span class="kpi-tile-value" id="kpi-deploy-state">—</span>
+                    <span class="badge badge--muted" id="kpi-deploy-version">—</span>
+                  </div>
+                  <span class="kpi-tile-sub muted" id="kpi-deploy-source">—</span>
+                </div>
+                <div class="kpi-tile" id="kpi-tile-clients">
+                  <span class="kpi-tile-label" data-i18n="status.kpi.clients">gRPC clients</span>
+                  <div class="kpi-tile-value-row">
+                    <span class="kpi-tile-value kpi-tile-value--lg" id="kpi-clients-online">—</span>
+                    <span class="kpi-tile-sub" id="kpi-clients-total"></span>
+                  </div>
+                  <span class="kpi-tile-sub muted" id="kpi-clients-hint"></span>
+                </div>
+                <div class="kpi-tile kpi-tile--compact" id="kpi-tile-traffic" hidden>
+                  <span class="kpi-tile-label" data-i18n="status.kpi.traffic">gRPC audit</span>
+                  <span class="kpi-tile-sub mono-inline" id="kpi-audit-summary"></span>
+                </div>
+                <div class="kpi-tile kpi-tile--alert" id="kpi-tile-alert" hidden>
+                  <span class="kpi-tile-label" data-i18n="status.kpi.attention">Attention</span>
+                  <span class="kpi-tile-value" id="kpi-alert-text">—</span>
+                </div>
               </div>
-              <section id="grpc-sessions-section" class="panel-block grpc-sessions-block">
-                <h3 class="subheading" data-i18n="status.sessions.heading">gRPC client connections</h3>
-                <p class="muted" data-i18n="status.sessions.hint">
-                  Peer keys, last IP, and presence; recent gRPC-level audit (TCP noise hidden by default).
-                </p>
-                <div id="grpc-sessions-summary" class="grpc-sessions-summary muted"></div>
-                <div id="grpc-sessions-summary-peers" class="grpc-sessions-summary muted"></div>
-                <div id="grpc-sessions-benchmark" class="grpc-sessions-summary muted"></div>
-                <h4 class="subheading grpc-sessions-sub" data-i18n="status.sessions.peersHeading">
+
+              <article class="dash-card" id="status-system-card">
+                <header class="dash-card-header">
+                  <div>
+                    <h2 class="dash-card-title" data-i18n="status.section.system">System status</h2>
+                    <p class="dash-card-desc muted" data-i18n="status.section.systemDesc">
+                      Deploy controller snapshot (version, state, source).
+                    </p>
+                  </div>
+                  <div class="dash-card-actions">
+                    <button
+                      type="button"
+                      id="btn-host-server-info"
+                      class="ghost"
+                      data-i18n="status.hostServer.open"
+                    >
+                      Server information
+                    </button>
+                  </div>
+                </header>
+                <div id="status-summary-grid" class="status-summary-grid" hidden></div>
+                <p id="status-fetch-error" class="dash-inline-alert danger-text" hidden></p>
+                <details class="raw-json-details">
+                  <summary class="raw-json-summary">
+                    <span data-i18n="status.rawJsonToggle">Raw JSON</span>
+                    <button
+                      type="button"
+                      id="btn-copy-status-json"
+                      class="ghost btn-sm raw-json-copy"
+                      data-i18n="status.copyJson"
+                    >
+                      Copy
+                    </button>
+                  </summary>
+                  <pre id="status-json" class="json-view-pre">Loading…</pre>
+                </details>
+              </article>
+
+              <section id="grpc-sessions-section" class="dash-card grpc-sessions-block">
+                <header class="dash-card-header dash-card-header--stack">
+                  <div>
+                    <h2 class="dash-card-title" data-i18n="status.section.clients">Clients &amp; audit</h2>
+                    <p class="dash-card-desc muted" data-i18n="status.sessions.hint">
+                      Peer keys, last IP, and presence; recent gRPC-level audit (TCP noise hidden by default).
+                    </p>
+                  </div>
+                </header>
+                <div id="grpc-sessions-benchmark" class="bench-pill muted" hidden></div>
+                <div class="status-section-label" data-i18n="status.sessions.peersHeading">
                   Registered gRPC clients
-                </h4>
-                <p class="muted" data-i18n="status.sessions.peersHint"></p>
-                <div class="grpc-sessions-scroll">
+                </div>
+                <p class="muted section-hint" data-i18n="status.sessions.peersHint"></p>
+                <div class="data-table-toolbar">
+                  <label class="toolbar-search">
+                    <span class="visually-hidden" data-i18n="status.peers.searchLabel">Search clients</span>
+                    <input
+                      type="search"
+                      id="grpc-peers-search"
+                      class="dash-input"
+                      autocomplete="off"
+                      data-i18n-placeholder="status.peers.searchPlaceholder"
+                      placeholder="Search by client key…"
+                    />
+                  </label>
+                  <select
+                    id="grpc-peers-filter"
+                    class="dash-select"
+                    data-i18n-aria="status.peers.filterAria"
+                  >
+                    <option value="all" data-i18n="status.peers.filterAll">All</option>
+                    <option value="online" data-i18n="status.peers.filterOnline">Online only</option>
+                    <option value="offline" data-i18n="status.peers.filterOffline">Offline only</option>
+                  </select>
+                  <select id="grpc-peers-sort" class="dash-select" data-i18n-aria="status.peers.sortAria">
+                    <option value="last_seen" data-i18n="status.peers.sortLastSeen">Last seen</option>
+                    <option value="online_first" data-i18n="status.peers.sortOnlineFirst">Online first</option>
+                    <option value="client_key" data-i18n="status.peers.sortKey">Client key</option>
+                  </select>
+                  <span class="toolbar-meta muted" id="grpc-peers-meta"></span>
+                </div>
+                <div class="data-table-scroll grpc-sessions-scroll">
                   <table
-                    class="proj-table grpc-sessions-table"
+                    class="data-table data-table--striped grpc-sessions-table"
                     aria-label="gRPC peer keys"
                   >
                     <thead>
@@ -189,13 +271,13 @@
                     <tbody id="grpc-sessions-peers-tbody"></tbody>
                   </table>
                 </div>
-                <h4 class="subheading grpc-sessions-sub" data-i18n="status.sessions.auditHeading">
-                  Recent gRPC audit events
-                </h4>
-                <p class="muted" data-i18n="status.sessions.auditHint"></p>
-                <div class="grpc-sessions-scroll">
+                <div class="status-section-label status-section-label--spaced" data-i18n="status.section.audit">
+                  Activity &amp; audit
+                </div>
+                <p class="muted section-hint" data-i18n="status.sessions.auditHint"></p>
+                <div class="data-table-scroll grpc-sessions-scroll">
                   <table
-                    class="proj-table grpc-sessions-table"
+                    class="data-table data-table--striped grpc-sessions-table"
                     aria-describedby="grpc-sessions-section"
                   >
                     <thead>
@@ -217,8 +299,8 @@
                     Show raw TCP connection events
                   </summary>
                   <p class="muted" data-i18n="status.sessions.tcpAuditHint"></p>
-                  <div class="grpc-sessions-scroll">
-                    <table class="proj-table grpc-sessions-table" aria-label="TCP audit">
+                  <div class="data-table-scroll grpc-sessions-scroll">
+                    <table class="data-table data-table--striped grpc-sessions-table" aria-label="TCP audit">
                       <thead>
                         <tr>
                           <th data-i18n="status.sessions.colTime">Time</th>
@@ -241,58 +323,92 @@
                 <p id="grpc-sessions-error" class="muted danger-text" hidden></p>
               </section>
 
-              <section id="display-stream-section" class="panel-block local-client-bundle">
-                <h3 class="subheading" data-i18n="status.displayStream.heading">Display stream (producer)</h3>
-                <p class="muted" data-i18n="status.displayStream.hint">
-                  Build a config for the CLI producer: paste the data URL on the remote host
-                  (<code class="mono-inline">client display-stream run --config …</code>). Use an ingest URL from the
-                  local Pirate desktop client (receive) or any HTTP POST target.
-                </p>
-                <div class="row actions display-stream-form" style="flex-wrap: wrap; gap: 0.75rem; align-items: flex-end">
-                  <label class="stacked-label">
-                    <span data-i18n="status.displayStream.ingestUrl">Ingest URL</span>
+              <section id="display-stream-section" class="dash-card display-stream-card">
+                <header class="dash-card-header dash-card-header--stack">
+                  <div>
+                    <h2 class="dash-card-title" data-i18n="status.displayStream.heading">Display stream (producer)</h2>
+                    <p class="dash-card-desc muted" data-i18n="status.displayStream.hint">
+                      Build a config for the CLI producer: paste the data URL on the remote host
+                      (<code class="mono-inline">client display-stream run --config …</code>). Use an ingest URL from the
+                      local Pirate desktop client (receive) or any HTTP POST target.
+                    </p>
+                  </div>
+                </header>
+
+                <div class="display-stream-grid" role="group" aria-label="Display stream producer options">
+                  <label class="display-stream-field display-stream-field--full">
+                    <span class="display-stream-label" data-i18n="status.displayStream.ingestUrl">Ingest URL</span>
                     <input
                       id="display-stream-ingest-url"
                       type="url"
-                      class="mono-input"
+                      class="dash-input display-stream-input"
                       placeholder="http://192.168.0.10:12345/ingest"
                       autocomplete="off"
                     />
                   </label>
-                  <label class="stacked-label">
-                    <span data-i18n="status.displayStream.token">Bearer token (optional)</span>
-                    <input id="display-stream-token" type="password" class="mono-input" autocomplete="off" />
+                  <label class="display-stream-field display-stream-field--full">
+                    <span class="display-stream-label" data-i18n="status.displayStream.token">Bearer token (optional)</span>
+                    <input
+                      id="display-stream-token"
+                      type="password"
+                      class="dash-input display-stream-input"
+                      autocomplete="off"
+                    />
                   </label>
-                  <label class="stacked-label">
-                    <span data-i18n="status.displayStream.quality">Quality (1–100)</span>
-                    <input id="display-stream-quality" type="number" min="1" max="100" value="70" class="mono-input" />
+                  <label class="display-stream-field display-stream-field--trio">
+                    <span class="display-stream-label" data-i18n="status.displayStream.quality">Quality (1–100)</span>
+                    <input
+                      id="display-stream-quality"
+                      type="number"
+                      min="1"
+                      max="100"
+                      value="70"
+                      class="dash-input display-stream-input display-stream-input--num"
+                    />
                   </label>
-                  <label class="stacked-label">
-                    <span data-i18n="status.displayStream.fps">FPS (1–60)</span>
-                    <input id="display-stream-fps" type="number" min="1" max="60" value="10" class="mono-input" />
+                  <label class="display-stream-field display-stream-field--trio">
+                    <span class="display-stream-label" data-i18n="status.displayStream.fps">FPS (1–60)</span>
+                    <input
+                      id="display-stream-fps"
+                      type="number"
+                      min="1"
+                      max="60"
+                      value="10"
+                      class="dash-input display-stream-input display-stream-input--num"
+                    />
                   </label>
-                  <label class="stacked-label">
-                    <span data-i18n="status.displayStream.encrypt">Transport</span>
-                    <select id="display-stream-encrypt" class="mono-input">
+                  <label class="display-stream-field display-stream-field--trio">
+                    <span class="display-stream-label" data-i18n="status.displayStream.encrypt">Transport</span>
+                    <select id="display-stream-encrypt" class="dash-input dash-select">
                       <option value="none" data-i18n="status.displayStream.encryptNone">HTTP (no TLS)</option>
                       <option value="tls" data-i18n="status.displayStream.encryptTls">HTTPS (TLS)</option>
                     </select>
                   </label>
-                  <label class="stacked-label">
-                    <span data-i18n="status.displayStream.peer">gRPC peer (displays)</span>
-                    <select id="display-stream-peer" class="mono-input">
+                  <label class="display-stream-field display-stream-field--half">
+                    <span class="display-stream-label" data-i18n="status.displayStream.peer">gRPC peer (displays)</span>
+                    <select id="display-stream-peer" class="dash-input dash-select">
                       <option value="" data-i18n="status.displayStream.peerManual">— manual index —</option>
                     </select>
                   </label>
-                  <label class="stacked-label">
-                    <span data-i18n="status.displayStream.displayIndex">Display index</span>
-                    <select id="display-stream-display-index" class="mono-input"></select>
+                  <label class="display-stream-field display-stream-field--half">
+                    <span class="display-stream-label" data-i18n="status.displayStream.displayIndex">Display index</span>
+                    <select id="display-stream-display-index" class="dash-input dash-select"></select>
                   </label>
                 </div>
-                <p class="muted" data-i18n="status.displayStream.protocolNote">Protocol: HTTP POST <code>image/jpeg</code> (fixed).</p>
-                <pre id="display-stream-data-url" class="mono-block" style="white-space: pre-wrap; word-break: break-all"></pre>
-                <div class="row actions">
-                  <button type="button" id="btn-copy-display-stream" class="ghost">
+
+                <p class="display-stream-protocol muted" data-i18n="status.displayStream.protocolNote">
+                  Protocol: HTTP POST <code class="mono-inline">image/jpeg</code> (fixed).
+                </p>
+
+                <div class="display-stream-output">
+                  <div class="display-stream-output-header">
+                    <span data-i18n="status.displayStream.outputLabel">Encoded config (data URL)</span>
+                  </div>
+                  <pre id="display-stream-data-url" class="display-stream-data-pre"></pre>
+                </div>
+
+                <div class="display-stream-actions">
+                  <button type="button" id="btn-copy-display-stream" class="primary">
                     <span data-i18n="status.displayStream.copy">Copy data URL</span>
                   </button>
                   <button type="button" id="btn-display-stream-preview" class="ghost">
