@@ -1008,7 +1008,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "control-api"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "argon2",
  "async-stream",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-control"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "deploy-auth",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-db"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "serde",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -4564,7 +4564,7 @@ dependencies = [
 
 [[package]]
 name = "pirate-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "deploy-core",
  "dirs 5.0.1",
