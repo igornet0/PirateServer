@@ -172,6 +172,38 @@ impl DbStore {
         Ok(())
     }
 
+    /// Remove deploy metadata rows for one project (events + snapshot).
+    pub async fn delete_project_data(&self, project_id: &str) -> Result<u64, DbError> {
+        let mut affected: u64 = 0;
+        match self {
+            Self::Postgres(pool) => {
+                let r1 = sqlx::query("DELETE FROM deploy_events WHERE project_id = $1")
+                    .bind(project_id)
+                    .execute(pool)
+                    .await?;
+                let r2 = sqlx::query("DELETE FROM project_snapshots WHERE project_id = $1")
+                    .bind(project_id)
+                    .execute(pool)
+                    .await?;
+                affected = affected.saturating_add(r1.rows_affected());
+                affected = affected.saturating_add(r2.rows_affected());
+            }
+            Self::Sqlite(pool) => {
+                let r1 = sqlx::query("DELETE FROM deploy_events WHERE project_id = $1")
+                    .bind(project_id)
+                    .execute(pool)
+                    .await?;
+                let r2 = sqlx::query("DELETE FROM project_snapshots WHERE project_id = $1")
+                    .bind(project_id)
+                    .execute(pool)
+                    .await?;
+                affected = affected.saturating_add(r1.rows_affected());
+                affected = affected.saturating_add(r2.rows_affected());
+            }
+        }
+        Ok(affected)
+    }
+
     pub async fn get_snapshot(&self, project_id: &str) -> Result<Option<SnapshotRow>, DbError> {
         let row = match self {
             Self::Postgres(pool) => {
