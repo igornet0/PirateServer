@@ -13,6 +13,10 @@ service DeployService {
   rpc GetStatus(StatusRequest) returns (StatusResponse);
 
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
+  rpc ValidateDeploy(ValidateDeployRequest) returns (ValidateDeployResponse);
+
+  // Stop app process and remove all deployed data for project (DB rows + files).
+  rpc RemoveProject(RemoveProjectRequest) returns (RemoveProjectResponse);
 
   // Stop managed child without changing the active release (symlink unchanged).
   rpc StopProcess(StopProcessRequest) returns (StatusResponse);
@@ -112,6 +116,12 @@ message StatusResponse {
   string client_connect_token = 3;
   string client_connect_url = 4;
   string client_connect_pairing = 5;
+  // `[project].version` from `pirate.toml` in the active release (empty if missing).
+  string project_version = 6;
+  // HTTP base for control-api REST (`/api/v1/...`). Prefer public / nginx URL when set (DEPLOY_CONTROL_API_PUBLIC_URL).
+  string control_api_http_url = 7;
+  // Direct control-api bind (e.g. `http://host:8080`) when it differs from the public URL (DEPLOY_CONTROL_API_DIRECT_URL or derived from gRPC host).
+  string control_api_http_url_direct = 8;
 }
 
 message RollbackRequest {
@@ -122,6 +132,28 @@ message RollbackRequest {
 message RollbackResponse {
   string status = 1;
   string active_version = 2;
+}
+
+message ValidateDeployRequest {
+  string project_id = 1;
+  string manifest_toml = 2;
+}
+
+message ValidateDeployResponse {
+  bool allow = 1;
+  repeated string blockers = 2;
+  repeated string warnings = 3;
+}
+
+message RemoveProjectRequest {
+  string project_id = 1;
+}
+
+message RemoveProjectResponse {
+  string status = 1;
+  string project_id = 2;
+  string removed_root = 3;
+  uint64 removed_db_rows = 4;
 }
 
 message StopProcessRequest {
