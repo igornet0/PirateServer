@@ -10,6 +10,7 @@ pub mod display_ingest;
 pub mod bookmarks;
 pub mod connection;
 pub mod control_api;
+pub mod host_agent;
 pub mod deploy;
 pub mod paas;
 pub mod server_stack;
@@ -22,12 +23,19 @@ pub mod toolchain_probe;
 pub mod status;
 
 pub use bookmarks::{
-    load_bookmarks, remove_bookmark, set_bookmark_label, upsert_bookmark, ServerBookmark,
+    bookmark_by_id, load_bookmarks, remove_bookmark, set_bookmark_host_agent, set_bookmark_label,
+    upsert_bookmark, ServerBookmark,
 };
 pub use connection::{
     add_bookmark_from_input, clear_endpoint, connect_from_bundle, load_endpoint, load_project_id,
+    control_api_recent_restart_hint,
     load_control_api_base, parse_grpc_endpoint_from_bundle, save_endpoint, set_active_project,
-    set_control_api_base, verify_grpc_endpoint, verify_grpc_status_for_project, GrpcConnectResult,
+    mark_control_api_recent_restart, set_control_api_base,     verify_grpc_endpoint,
+    verify_grpc_status_for_project, verify_grpc_status_for_project_async, GrpcConnectResult,
+};
+pub use host_agent::{
+    host_agent_health_json, host_agent_reboot_json, host_agent_status_json,
+    host_agent_upload_server_stack,
 };
 pub use control_api::{
     allocate_and_apply_remote_project_id, allocate_remote_project_id, control_api_ensure_nginx,
@@ -39,8 +47,10 @@ pub use control_api::{
     control_api_fetch_host_deploy_env_template_json, control_api_fetch_host_services_json,
     control_api_fetch_nginx_site_json, control_api_fetch_nginx_status_json,
     control_api_clear_project_runtime_log, control_api_fetch_project_telemetry_json,
+    control_api_health_probe,
     control_api_fetch_status_json,
-    control_api_host_service_install, control_api_host_service_remove, control_api_login,
+    control_api_host_service_install, control_api_host_service_remove, control_api_bearer_token,
+    control_api_login,
     control_api_logout, control_api_put_app_env, control_api_put_host_deploy_env,
     control_api_put_nginx_site, control_api_restart_process_json, control_api_session_active,
     control_api_stop_process_json, ensure_deploy_project_id_for_deploy,
@@ -49,8 +59,9 @@ pub use control_api::{
 };
 pub use deploy::{
     analyze_network_access, check_project_uploaded, read_release_version_from_manifest,
-    validate_network_access_remote, DeployOutcome, NetworkAccessAnalysis, ProjectDeployCheck,
-    RemoveProjectOutcome, RollbackOutcome,
+    validate_network_access_remote, AnalyzeNetworkAccessOverrides, DeployOutcome, DeployProgressEvent,
+    NetworkAccessAnalysis, NetworkAccessRouteOverride, ProjectDeployCheck, RemoveProjectOutcome,
+    RollbackOutcome,
 };
 pub use host_services_compat::{host_services_gap, summarize_host_services_for_manifest, HostServicesCompatSummary};
 pub use preflight::{run_projects_preflight, ProjectsPreflightReport};

@@ -21,6 +21,25 @@ fn migrate_bookmarks(c: &Connection) -> Result<(), rusqlite::Error> {
             [],
         )?;
     }
+    migrate_bookmarks_host_agent(c)?;
+    Ok(())
+}
+
+fn migrate_bookmarks_host_agent(c: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt = c.prepare("PRAGMA table_info(bookmarks)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !cols.iter().any(|n| n == "host_agent_base_url") {
+        c.execute(
+            "ALTER TABLE bookmarks ADD COLUMN host_agent_base_url TEXT",
+            [],
+        )?;
+    }
+    if !cols.iter().any(|n| n == "host_agent_token") {
+        c.execute("ALTER TABLE bookmarks ADD COLUMN host_agent_token TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -123,6 +142,18 @@ fn migrate_connection_control_api(c: &Connection) -> Result<(), rusqlite::Error>
     if !cols.iter().any(|n| n == "control_api_base_url") {
         c.execute(
             "ALTER TABLE connection ADD COLUMN control_api_base_url TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !cols.iter().any(|n| n == "control_api_base_mode") {
+        c.execute(
+            "ALTER TABLE connection ADD COLUMN control_api_base_mode TEXT NOT NULL DEFAULT 'auto'",
+            [],
+        )?;
+    }
+    if !cols.iter().any(|n| n == "control_api_recent_restart_until_ms") {
+        c.execute(
+            "ALTER TABLE connection ADD COLUMN control_api_recent_restart_until_ms INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

@@ -12,10 +12,14 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Request;
 
 use crate::bookmarks::bookmark_pairing_pubkey_for_url;
 use crate::desktop_store;
+
+const CONTROL_API_BASE_MODE_AUTO: &str = "auto";
+const CONTROL_API_BASE_MODE_MANUAL: &str = "manual";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +35,9 @@ pub struct GrpcConnectResult {
     /// Direct control-api base from server (`DEPLOY_CONTROL_API_DIRECT_URL` or derived :8080).
     #[serde(default)]
     pub control_api_http_url_direct: String,
+    /// deploy-server max artifact upload (bytes) when advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_upload_bytes: Option<u64>,
 }
 
 fn identity_path() -> PathBuf {
@@ -42,6 +49,13 @@ fn identity_path() -> PathBuf {
 
 fn default_project_id() -> String {
     "default".to_string()
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,14 +189,15 @@ fn apply_control_api_hint_from_status(r: &StatusResponse) {
         return;
     }
     let chosen = normalize_endpoint(chosen_raw);
-    if load_control_api_base()
-        .as_ref()
-        .map(|s| normalize_endpoint(s))
-        == Some(chosen.clone())
+    let current = load_control_api_base();
+    if current.as_ref().map(|s| normalize_endpoint(s)) == Some(chosen.clone()) {
+        return;
+    }
+    if current.is_some() && load_control_api_base_mode().as_deref() == Some(CONTROL_API_BASE_MODE_MANUAL)
     {
         return;
     }
-    let _ = set_control_api_base(&chosen);
+    let _ = set_control_api_base_with_mode(&chosen, CONTROL_API_BASE_MODE_AUTO);
 }
 
 fn grpc_connect_result(endpoint: String, r: StatusResponse) -> GrpcConnectResult {
@@ -194,6 +209,7 @@ fn grpc_connect_result(endpoint: String, r: StatusResponse) -> GrpcConnectResult
         state: r.state,
         control_api_http_url: r.control_api_http_url,
         control_api_http_url_direct: r.control_api_http_url_direct,
+        max_upload_bytes: (r.max_upload_bytes > 0).then_some(r.max_upload_bytes),
     }
 }
 
@@ -251,34 +267,41 @@ pub fn verify_grpc_endpoint(endpoint: &str) -> Result<GrpcConnectResult, String>
 }
 
 /// GetStatus for a specific deploy `project_id` (uses saved gRPC endpoint).
-pub fn verify_grpc_status_for_project(project_id: &str) -> Result<GrpcConnectResult, String> {
+/// Safe to `.await` from Tauri / existing Tokio runtime (unlike [`verify_grpc_status_for_project`]).
+pub async fn verify_grpc_status_for_project_async(project_id: &str) -> Result<GrpcConnectResult, String> {
     let endpoint = load_endpoint().ok_or_else(|| "no saved endpoint".to_string())?;
     validate_endpoint(&endpoint)?;
     let endpoint = normalize_endpoint(&endpoint);
     let pid = deploy_core::normalize_project_id(project_id);
+
+    let mut client = DeployServiceClient::connect(endpoint.clone())
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    let mut req = Request::new(StatusRequest {
+        project_id: pid.clone(),
+    });
+    if use_signed_for_endpoint(&endpoint) {
+        let sk = load_or_create_identity(&identity_path()).map_err(|e| e.to_string())?;
+        attach_auth_metadata(&mut req, &sk, "GetStatus", &pid, "").map_err(|e| e.to_string())?;
+    }
+    let r: StatusResponse = client
+        .get_status(req)
+        .await
+        .map_err(|e| format!("GetStatus failed: {e}"))?
+        .into_inner();
+    Ok(grpc_connect_result(endpoint, r))
+}
+
+/// GetStatus for a specific deploy `project_id` (uses saved gRPC endpoint).
+///
+/// Uses a dedicated runtime + `block_on` — **do not** call from async code that already runs on Tokio
+/// (e.g. inside `async fn` Tauri commands); use [`verify_grpc_status_for_project_async`] instead.
+pub fn verify_grpc_status_for_project(project_id: &str) -> Result<GrpcConnectResult, String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-
-    rt.block_on(async move {
-        let mut client = DeployServiceClient::connect(endpoint.clone())
-            .await
-            .map_err(|e| format!("connect failed: {e}"))?;
-        let mut req = Request::new(StatusRequest {
-            project_id: pid.clone(),
-        });
-        if use_signed_for_endpoint(&endpoint) {
-            let sk = load_or_create_identity(&identity_path()).map_err(|e| e.to_string())?;
-            attach_auth_metadata(&mut req, &sk, "GetStatus", &pid, "").map_err(|e| e.to_string())?;
-        }
-        let r: StatusResponse = client
-            .get_status(req)
-            .await
-            .map_err(|e| format!("GetStatus failed: {e}"))?
-            .into_inner();
-        Ok(grpc_connect_result(endpoint, r))
-    })
+    rt.block_on(verify_grpc_status_for_project_async(project_id))
 }
 
 pub fn save_endpoint(endpoint: &str) -> Result<(), String> {
@@ -339,6 +362,10 @@ pub fn load_control_api_base() -> Option<String> {
 /// Persist control-api HTTP base (e.g. `http://192.168.0.30:8080`). Empty string clears.
 /// Changing the base URL clears a stored control-api JWT (session is host-specific).
 pub fn set_control_api_base(url: &str) -> Result<(), String> {
+    set_control_api_base_with_mode(url, CONTROL_API_BASE_MODE_MANUAL)
+}
+
+fn set_control_api_base_with_mode(url: &str, mode: &str) -> Result<(), String> {
     let t = url.trim();
     if !t.is_empty() {
         validate_endpoint(t)?;
@@ -347,14 +374,59 @@ pub fn set_control_api_base(url: &str) -> Result<(), String> {
     let old = load_control_api_base();
     let c = desktop_store::open().map_err(|e| e.to_string())?;
     c.execute(
-        "UPDATE connection SET control_api_base_url = ?1 WHERE id = 1",
-        params![new_base.clone()],
+        "UPDATE connection SET control_api_base_url = ?1, control_api_base_mode = ?2 WHERE id = 1",
+        params![new_base.clone(), mode],
     )
     .map_err(|e| e.to_string())?;
     if old.as_ref().map(|s| s.as_str()) != Some(new_base.as_str()) {
         let _ = clear_control_api_jwt();
     }
     Ok(())
+}
+
+fn load_control_api_base_mode() -> Option<String> {
+    let c = desktop_store::open().ok()?;
+    let s: String = c
+        .query_row(
+            "SELECT control_api_base_mode FROM connection WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+pub fn mark_control_api_recent_restart(seconds: i64) -> Result<(), String> {
+    let ttl = seconds.max(1);
+    let until = now_ms().saturating_add(ttl.saturating_mul(1000));
+    let c = desktop_store::open().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE connection SET control_api_recent_restart_until_ms = ?1 WHERE id = 1",
+        params![until],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn control_api_recent_restart_hint() -> bool {
+    let c = match desktop_store::open() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let until: i64 = match c.query_row(
+        "SELECT control_api_recent_restart_until_ms FROM connection WHERE id = 1",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    until > now_ms()
 }
 
 /// Stored JWT from control-api `POST /api/v1/auth/login` and absolute expiry (ms since epoch).
@@ -444,7 +516,7 @@ pub fn add_bookmark_from_input(raw: &str) -> Result<String, String> {
 pub fn clear_endpoint() -> Result<(), String> {
     let c = desktop_store::open().map_err(|e| e.to_string())?;
     c.execute(
-        "UPDATE connection SET url = '', server_pubkey_b64 = NULL, paired = 0, control_api_base_url = '', control_api_jwt = '', control_api_jwt_expires_at_ms = 0 WHERE id = 1",
+        "UPDATE connection SET url = '', server_pubkey_b64 = NULL, paired = 0, control_api_base_url = '', control_api_base_mode = 'auto', control_api_jwt = '', control_api_jwt_expires_at_ms = 0, control_api_recent_restart_until_ms = 0 WHERE id = 1",
         [],
     )
     .map_err(|e| e.to_string())?;

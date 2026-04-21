@@ -19,6 +19,12 @@ pub struct ServerBookmark {
     /// True when `server_pubkey_b64` is set and gRPC should send signed metadata for this URL.
     #[serde(default)]
     pub paired: bool,
+    /// Out-of-band host-agent base URL (e.g. http://host:9443).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_agent_base_url: Option<String>,
+    /// Bearer token for host-agent `/v1/*`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_agent_token: Option<String>,
 }
 
 fn normalize_url(s: &str) -> String {
@@ -60,7 +66,7 @@ fn load_bookmarks_raw() -> Vec<ServerBookmark> {
         return Vec::new();
     };
     let mut stmt = match c.prepare(
-        "SELECT id, label, url, server_pubkey_b64, paired FROM bookmarks ORDER BY rowid",
+        "SELECT id, label, url, server_pubkey_b64, paired, host_agent_base_url, host_agent_token FROM bookmarks ORDER BY rowid",
     ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -72,6 +78,8 @@ fn load_bookmarks_raw() -> Vec<ServerBookmark> {
             url: row.get(2)?,
             server_pubkey_b64: row.get(3)?,
             paired: row.get::<_, i64>(4)? != 0,
+            host_agent_base_url: row.get(5)?,
+            host_agent_token: row.get(6)?,
         })
     });
     let Ok(rows) = rows else {
@@ -92,13 +100,15 @@ fn save_bookmarks(list: &[ServerBookmark]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     for b in list {
         tx.execute(
-            "INSERT INTO bookmarks (id, label, url, server_pubkey_b64, paired) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO bookmarks (id, label, url, server_pubkey_b64, paired, host_agent_base_url, host_agent_token) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 b.id,
                 b.label,
                 b.url,
                 b.server_pubkey_b64,
                 if b.paired { 1 } else { 0 },
+                b.host_agent_base_url,
+                b.host_agent_token,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -132,6 +142,8 @@ pub fn upsert_bookmark(label: impl Into<String>, url: &str) -> Result<String, St
         url,
         server_pubkey_b64: None,
         paired: false,
+        host_agent_base_url: None,
+        host_agent_token: None,
     });
     save_bookmarks(&list)?;
     Ok(id)
@@ -153,6 +165,8 @@ fn set_bookmark_pairing_inner(url: &str, server_pubkey_b64: String) -> Result<()
             url,
             paired: true,
             server_pubkey_b64: Some(server_pubkey_b64),
+            host_agent_base_url: None,
+            host_agent_token: None,
         });
     }
     save_bookmarks(&list)
@@ -184,6 +198,39 @@ pub fn remove_bookmark(id: &str) -> Result<(), String> {
     let mut list = load_bookmarks_raw();
     list.retain(|b| b.id != id);
     save_bookmarks(&list)
+}
+
+/// Update display label for an existing bookmark (URL unchanged).
+/// Save out-of-band host-agent URL and token for a bookmark (empty strings clear).
+pub fn set_bookmark_host_agent(
+    id: &str,
+    host_agent_base_url: &str,
+    host_agent_token: &str,
+) -> Result<(), String> {
+    migrate_connection_pairing_into_bookmarks_once();
+    let mut list = load_bookmarks_raw();
+    let b = list
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| "bookmark not found".to_string())?;
+    let u = host_agent_base_url.trim();
+    let t = host_agent_token.trim();
+    b.host_agent_base_url = if u.is_empty() {
+        None
+    } else {
+        Some(u.to_string())
+    };
+    b.host_agent_token = if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    };
+    save_bookmarks(&list)
+}
+
+pub fn bookmark_by_id(id: &str) -> Option<ServerBookmark> {
+    migrate_connection_pairing_into_bookmarks_once();
+    load_bookmarks_raw().into_iter().find(|b| b.id == id)
 }
 
 /// Update display label for an existing bookmark (URL unchanged).
