@@ -19,6 +19,7 @@ pub mod settings;
 pub mod tls_profile;
 pub mod upload;
 pub mod proxy_test;
+pub mod http_ping;
 pub mod project_control;
 pub mod local_pipeline;
 pub mod project_registry;
@@ -45,12 +46,16 @@ pub mod internet_proxy {
 pub use bundle_inspect::{inspect_bundle_path, inspect_bundle_tar_gz, BundleProfile};
 pub use ops::{
     build_chunks, build_chunks_with_manifest, build_server_stack_chunks, default_version,
-    pack_directory, pack_release_sources, read_or_pack_bundle, validate_version as validate_version_label,
+    pack_directory, pack_release_sources, pack_release_sources_to_path, read_or_pack_bundle,
+    validate_version as validate_version_label,
 };
 pub use upload::{
-    deploy_directory, fetch_server_stack_info, set_artifact_upload_cancel,
-    set_server_stack_upload_cancel, upload_artifact, upload_artifact_with_manifest,
-    upload_server_stack_artifact, upload_server_stack_artifact_with_progress, DeploySummary,
+    deploy_directory, deploy_directory_with_progress, fetch_server_stack_info,
+    pack_directory_for_deploy, set_artifact_upload_cancel, set_server_stack_upload_cancel,
+    upload_artifact, upload_artifact_from_async_read, upload_artifact_with_manifest,
+    upload_packed_tar_gz_grpc, upload_server_stack_artifact,
+    upload_server_stack_artifact_with_progress, DeployProgressEvent, DeploySummary,
+    PackedDeployArtifact,
 };
 pub use project_control::{init_project, scan_project, ScanReport};
 pub use network_access::{

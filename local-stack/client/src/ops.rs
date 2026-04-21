@@ -142,11 +142,13 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), st
     Ok(())
 }
 
-pub fn pack_release_sources(
+/// Write release tarball to `out_path` (`.tar.gz`). Same layout as [`pack_release_sources`].
+pub fn pack_release_sources_to_path(
     project_root: &Path,
     output_paths: &[String],
     ignore_path: Option<&Path>,
-) -> Result<Vec<u8>, std::io::Error> {
+    out_path: &Path,
+) -> Result<(), std::io::Error> {
     let project_root = project_root.canonicalize()?;
     let ignore = compile_ignore_globs(ignore_path)?;
     let requested = output_paths_or_default(output_paths);
@@ -161,7 +163,8 @@ pub fn pack_release_sources(
         }
     }
     let mut uniq = BTreeSet::<String>::new();
-    let enc = GzEncoder::new(Vec::new(), Compression::default());
+    let raw = fs::File::create(out_path)?;
+    let enc = GzEncoder::new(raw, Compression::default());
     let mut builder = Builder::new(enc);
     for f in files {
         let rel = f
@@ -189,7 +192,23 @@ pub fn pack_release_sources(
     let enc = builder
         .into_inner()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    let out = enc.finish()?;
+    enc.finish()?;
+    Ok(())
+}
+
+pub fn pack_release_sources(
+    project_root: &Path,
+    output_paths: &[String],
+    ignore_path: Option<&Path>,
+) -> Result<Vec<u8>, std::io::Error> {
+    let tmp = std::env::temp_dir().join(format!(
+        "pirate-pack-{}-{}.tar.gz",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    pack_release_sources_to_path(project_root, output_paths, ignore_path, &tmp)?;
+    let out = fs::read(&tmp)?;
+    let _ = fs::remove_file(&tmp);
     Ok(out)
 }
 

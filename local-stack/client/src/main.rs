@@ -6,7 +6,7 @@ mod stack_update_prompt;
 mod version_info;
 mod gui_probe;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use deploy_client::{
     board,
     bootstrap_apply,
@@ -42,10 +42,60 @@ use tonic::Request;
 /// Default gRPC HTTP/2 endpoint (IPv6 loopback).
 const DEFAULT_ENDPOINT: &str = "http://[::1]:50051";
 
+#[derive(Args, Debug, Clone)]
+struct TestProxyRunArgs {
+    /// Only measure download speed through the proxy.
+    #[arg(long)]
+    speed: bool,
+    /// Only estimate max parallel successful HTTP requests through the proxy (synonym in docs: max_connect).
+    #[arg(long = "max-connect")]
+    max_connect: bool,
+    /// HTTP proxy URL (local `pirate board` listener).
+    #[arg(long, default_value = "http://127.0.0.1:3128")]
+    proxy: String,
+    /// Target URL via the proxy (default: env `PIRATE_PROXY_TEST_UPSTREAM` or `http://127.0.0.1:9000/size?bytes=262144`).
+    #[arg(long)]
+    upstream_url: Option<String>,
+    /// Hint for `?bytes=` when the upstream URL has no `bytes=` query (speed / max-connect trials).
+    #[arg(long, default_value_t = 262144)]
+    bytes: u64,
+    /// Per-request timeout (seconds).
+    #[arg(long, default_value_t = 60)]
+    timeout: u64,
+    /// Upper bound for parallel-connection search (`max_connect` estimate).
+    #[arg(long, default_value_t = 128)]
+    cap: u32,
+    /// Minimum success fraction for a parallel trial (0.0–1.0).
+    #[arg(long, default_value_t = 0.95)]
+    min_success_rate: f64,
+    /// Print one JSON line (smoke, speed, max_connect fields).
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum TestProxySub {
+    /// Control-api `GET /api/v1/ping` through the HTTP CONNECT proxy (`pirate board` must be listening).
+    Ping {
+        /// Control-api HTTP base (e.g. `https://host` or `http://host:8080`). Not the gRPC URL from global `--url` / `--endpoint`.
+        #[arg(long = "http-url")]
+        http_url: String,
+        #[arg(long, default_value = "http://127.0.0.1:3128")]
+        proxy: String,
+        /// Download size for speed sample (`?bytes=`); use 0 for RTT only.
+        #[arg(long, default_value_t = 262144)]
+        bytes: u64,
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = env!("CARGO_BIN_NAME"),
-    about = "Deploy artifact to deploy-server over gRPC; pair with `auth`, optional HTTP CONNECT proxy with `board`",
+    about = "Deploy artifact to deploy-server over gRPC; pair with `auth`, optional HTTP CONNECT proxy with `board`. HTTP control-api checks: `ping --http-url` (not global `--url`, which is gRPC).",
     subcommand_required = false,
     disable_version_flag = true
 )]
@@ -58,7 +108,7 @@ struct Cli {
     #[arg(long = "version-all", global = true)]
     version_all: bool,
 
-    /// Server endpoint, e.g. http://[::1]:50051 (overrides saved connection).
+    /// gRPC deploy-server endpoint, e.g. http://[::1]:50051 (overrides saved connection). For HTTP control-api use `ping --http-url`, not this flag.
     #[arg(long = "endpoint", visible_alias = "url", global = true)]
     endpoint: Option<String>,
 
@@ -120,33 +170,24 @@ enum Commands {
     /// Test local HTTP CONNECT proxy: smoke GET, speed through proxy, and empirical max parallel requests (`pirate board` must be listening).
     ///
     /// Does not use gRPC `ConnectionProbe` (that measures gRPC bandwidth, not HTTP CONNECT to an upstream URL).
-    #[command(name = "test-proxy")]
+    /// Subcommand `ping` hits control-api `/api/v1/ping` through the same proxy.
+    #[command(name = "test-proxy", args_conflicts_with_subcommands = true)]
     TestProxy {
-        /// Only measure download speed through the proxy.
-        #[arg(long)]
-        speed: bool,
-        /// Only estimate max parallel successful HTTP requests through the proxy (synonym in docs: max_connect).
-        #[arg(long = "max-connect")]
-        max_connect: bool,
-        /// HTTP proxy URL (local `pirate board` listener).
-        #[arg(long, default_value = "http://127.0.0.1:3128")]
-        proxy: String,
-        /// Target URL via the proxy (default: env `PIRATE_PROXY_TEST_UPSTREAM` or `http://127.0.0.1:9000/size?bytes=262144`).
-        #[arg(long)]
-        upstream_url: Option<String>,
-        /// Hint for `?bytes=` when the upstream URL has no `bytes=` query (speed / max-connect trials).
+        #[command(subcommand)]
+        sub: Option<TestProxySub>,
+        #[command(flatten)]
+        run: TestProxyRunArgs,
+    },
+    /// HTTP ping to control-api (`GET /api/v1/ping`). Use `--http-url` for the API base; global `--url` is the gRPC deploy endpoint, not this.
+    Ping {
+        /// Control-api HTTP base (e.g. `https://host` or `http://127.0.0.1:8080`).
+        #[arg(long = "http-url")]
+        http_url: String,
+        /// Download size for speed sample (`?bytes=` on server); 0 = RTT only (small JSON pong).
         #[arg(long, default_value_t = 262144)]
         bytes: u64,
-        /// Per-request timeout (seconds).
         #[arg(long, default_value_t = 60)]
         timeout: u64,
-        /// Upper bound for parallel-connection search (`max_connect` estimate).
-        #[arg(long, default_value_t = 128)]
-        cap: u32,
-        /// Minimum success fraction for a parallel trial (0.0–1.0).
-        #[arg(long, default_value_t = 0.95)]
-        min_success_rate: f64,
-        /// Print one JSON line (smoke, speed, max_connect fields).
         #[arg(long)]
         json: bool,
     },
@@ -1078,6 +1119,21 @@ fn truncate_pubkey_display(s: &str, max: usize) -> String {
     }
 }
 
+fn emit_http_ping_result(
+    out: &deploy_client::http_ping::HttpPingJson,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        println!("{}", serde_json::to_string(out)?);
+    } else {
+        deploy_client::http_ping::print_http_ping_human(out);
+    }
+    if !out.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -1174,31 +1230,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
-        Commands::TestProxy {
-            speed,
-            max_connect,
-            proxy,
-            upstream_url,
+        Commands::Ping {
+            http_url,
             bytes,
             timeout,
-            cap,
-            min_success_rate,
             json,
         } => {
+            use deploy_client::http_ping::{run_http_ping, HttpPingOptions};
+            let opts = HttpPingOptions {
+                http_base: http_url.clone(),
+                proxy_url: None,
+                download_bytes: *bytes,
+                timeout_secs: *timeout,
+            };
+            let out = run_http_ping(opts).await;
+            emit_http_ping_result(&out, *json)?;
+            return Ok(());
+        }
+        Commands::TestProxy { sub, run } => {
+            if let Some(TestProxySub::Ping {
+                http_url,
+                proxy,
+                bytes,
+                timeout,
+                json,
+            }) = sub
+            {
+                use deploy_client::http_ping::{run_http_ping, HttpPingOptions};
+                let opts = HttpPingOptions {
+                    http_base: http_url.clone(),
+                    proxy_url: Some(proxy.clone()),
+                    download_bytes: *bytes,
+                    timeout_secs: *timeout,
+                };
+                let out = run_http_ping(opts).await;
+                emit_http_ping_result(&out, *json)?;
+                return Ok(());
+            }
             use deploy_client::proxy_test::{self, TestProxyOptions};
-            let upstream = upstream_url
+            let upstream = run
+                .upstream_url
                 .clone()
                 .unwrap_or_else(proxy_test::default_upstream_url);
             let opts = TestProxyOptions {
-                proxy_url: proxy.clone(),
+                proxy_url: run.proxy.clone(),
                 upstream_url: upstream,
-                bytes: *bytes,
-                timeout_secs: *timeout,
-                max_connect_cap: *cap,
-                min_success_rate: *min_success_rate,
-                run_speed: *speed,
-                run_max_connect: *max_connect,
-                json: *json,
+                bytes: run.bytes,
+                timeout_secs: run.timeout,
+                max_connect_cap: run.cap,
+                min_success_rate: run.min_success_rate,
+                run_speed: run.speed,
+                run_max_connect: run.max_connect,
+                json: run.json,
             };
             proxy_test::run_proxy_tests(opts).await?;
             return Ok(());
