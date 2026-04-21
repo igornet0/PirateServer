@@ -1,10 +1,12 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
+import { viteLoginRoutePlugin } from "./vite-plugin-login-route";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  plugins: [viteLoginRoutePlugin()],
   server: {
     port: 5173,
     proxy: {

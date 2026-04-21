@@ -12,6 +12,8 @@ export interface StatusView {
   state: string;
   source: string;
   local_client?: LocalClientConnect | null;
+  /** Effective artifact upload limit (bytes): min(control-api DEPLOY_MAX_UPLOAD_BYTES, deploy-server policy) from GET /api/v1/status */
+  max_upload_bytes?: number | null;
 }
 
 /** `GET /api/v1/grpc-sessions` — deploy-server gRPC audit (metadata DB). */

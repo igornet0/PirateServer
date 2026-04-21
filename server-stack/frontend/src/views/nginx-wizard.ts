@@ -28,6 +28,10 @@ ${tls}
     root ${opts.rootPath};
     index index.html;
 
+    location = /login {
+        try_files /login.html =404;
+    }
+
     location /api/ {
         proxy_pass http://${opts.apiUpstream};
         proxy_http_version 1.1;

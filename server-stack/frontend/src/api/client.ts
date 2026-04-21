@@ -1,5 +1,6 @@
 import { apiUrl } from "./api-base.js";
 import { deployFetch } from "./deploy-fetch.js";
+import { redirectIfUnauthorized } from "../views/login.js";
 import type {
   ApiErrorBody,
   CpuDetail,
@@ -114,6 +115,10 @@ async function parseError(res: Response): Promise<never> {
 async function getJson<T>(path: string): Promise<T> {
   const r = await deployFetch(apiUrl(path), { headers: baseHeaders() });
   if (!r.ok) {
+    if (redirectIfUnauthorized(r.status)) {
+      await r.text().catch(() => {});
+      throw new ApiRequestError("Unauthorized", 401);
+    }
     await parseError(r);
   }
   return r.json() as Promise<T>;
@@ -135,6 +140,10 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!r.ok) {
+    if (redirectIfUnauthorized(r.status)) {
+      await r.text().catch(() => {});
+      throw new ApiRequestError("Unauthorized", 401);
+    }
     await parseError(r);
   }
   return r.json() as Promise<T>;
@@ -151,6 +160,10 @@ async function patchJson<T>(path: string, body?: unknown): Promise<T> {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!r.ok) {
+    if (redirectIfUnauthorized(r.status)) {
+      await r.text().catch(() => {});
+      throw new ApiRequestError("Unauthorized", 401);
+    }
     await parseError(r);
   }
   return r.json() as Promise<T>;
@@ -162,6 +175,10 @@ async function deleteJson(path: string): Promise<void> {
     headers: baseHeaders(),
   });
   if (!r.ok) {
+    if (redirectIfUnauthorized(r.status)) {
+      await r.text().catch(() => {});
+      throw new ApiRequestError("Unauthorized", 401);
+    }
     await parseError(r);
   }
 }
@@ -493,6 +510,10 @@ export async function putNginxConfig(content: string): Promise<NginxPutResponseV
     body: JSON.stringify({ content }),
   });
   if (!r.ok) {
+    if (redirectIfUnauthorized(r.status)) {
+      await r.text().catch(() => {});
+      throw new ApiRequestError("Unauthorized", 401);
+    }
     await parseError(r);
   }
   return r.json() as Promise<NginxPutResponseView>;

@@ -20,6 +20,7 @@ import type {
 } from "../api/types.js";
 import { ApiRequestError } from "../api/types.js";
 import { t } from "../i18n/index.js";
+import { redirectIfUnauthorized } from "./login.js";
 import type { MessageKey } from "../i18n/translations.js";
 import {
   cpuStatus,
@@ -1408,6 +1409,9 @@ function bindLiveSse(checkbox: HTMLInputElement): void {
           checkbox.checked = false;
           if (badge) {
             badge.hidden = true;
+          }
+          if (res.status === 401 && redirectIfUnauthorized(401)) {
+            return;
           }
           const msg =
             res.status === 503

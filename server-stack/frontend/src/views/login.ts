@@ -23,6 +23,40 @@ const STATIC_DASH_KEY = "deploy.staticDashboard";
 /** Optional bearer from login page "Skip" — applied once to `#api-token` on dashboard load. */
 const PENDING_API_TOKEN_KEY = "deploy.pendingApiToken";
 
+/** Clean URL for the sign-in page (dev server + nginx). */
+export const LOGIN_PATH = "/login";
+/** Dashboard root (serves `index.html`). */
+export const DASHBOARD_PATH = "/";
+
+export function isLoginPath(): boolean {
+  try {
+    const p = window.location.pathname;
+    return (
+      p === LOGIN_PATH ||
+      p === "/login.html" ||
+      p.endsWith("/login.html")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * When control-api returns 401 and the user is not on the login screen, clear session and go to `/login`.
+ * No-op on the login page (e.g. wrong password).
+ * @returns true if a redirect was triggered (caller should not parse the body as a normal API error).
+ */
+export function redirectIfUnauthorized(status: number): boolean {
+  if (status !== 401) {
+    return false;
+  }
+  if (isLoginPath()) {
+    return false;
+  }
+  clearSessionAndReload();
+  return true;
+}
+
 export function hasSessionAccess(): boolean {
   try {
     const t = sessionStorage.getItem(TOKEN_KEY);
@@ -39,14 +73,14 @@ export function hasSessionAccess(): boolean {
 }
 
 /**
- * Dashboard entry: redirect to `login.html` if there is no JWT session and no "skip" mode.
+ * Dashboard entry: redirect to `/login` if there is no JWT session and no "skip" mode.
  * Returns false when a redirect is in progress.
  */
 export function assertDashboardAccess(): boolean {
   if (hasSessionAccess()) {
     return true;
   }
-  window.location.replace("login.html");
+  window.location.replace(LOGIN_PATH);
   return false;
 }
 
@@ -58,7 +92,7 @@ export function clearSessionAndReload(): void {
   } catch {
     /* ignore */
   }
-  window.location.replace("login.html");
+  window.location.replace(LOGIN_PATH);
 }
 
 /** Call once on dashboard init after `assertDashboardAccess()` — copies pending token from login skip flow. */
@@ -205,7 +239,7 @@ function prefillLoginFromSetup(): void {
  */
 export function initLoginPage(): void {
   if (hasSessionAccess()) {
-    window.location.replace("index.html");
+    window.location.replace(DASHBOARD_PATH);
     return;
   }
 
@@ -295,12 +329,11 @@ export function initLoginPage(): void {
 
   const form = document.getElementById("login-form") as HTMLFormElement | null;
   const errEl = document.getElementById("login-error");
-  const skipBtn = document.getElementById("login-skip");
   const advToggle = document.getElementById("login-advanced-toggle");
   const adv = document.getElementById("login-advanced");
 
   const goToDashboard = () => {
-    window.location.replace("index.html");
+    window.location.replace(DASHBOARD_PATH);
   };
 
   form?.addEventListener("submit", (ev) => {
@@ -359,24 +392,6 @@ export function initLoginPage(): void {
         }
       }
     })();
-  });
-
-  skipBtn?.addEventListener("click", () => {
-    const copyFrom = document.getElementById("api-token-login") as HTMLInputElement | null;
-    const tok = copyFrom?.value?.trim() ?? "";
-    if (tok) {
-      try {
-        sessionStorage.setItem(PENDING_API_TOKEN_KEY, tok);
-      } catch {
-        /* ignore */
-      }
-    }
-    try {
-      sessionStorage.setItem(STATIC_DASH_KEY, "1");
-    } catch {
-      /* ignore */
-    }
-    goToDashboard();
   });
 
   advToggle?.addEventListener("click", () => {

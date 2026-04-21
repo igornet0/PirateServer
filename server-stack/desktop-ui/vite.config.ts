@@ -1,12 +1,14 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
+import { viteLoginRoutePlugin } from "../frontend/vite-plugin-login-route";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const frontendRoot = path.resolve(__dirname, "../frontend");
 
 export default defineConfig(({ mode }) => ({
   root: frontendRoot,
+  plugins: [viteLoginRoutePlugin()],
   base: "./",
   define: {
     "import.meta.env.VITE_CONTROL_API_BASE": JSON.stringify(
