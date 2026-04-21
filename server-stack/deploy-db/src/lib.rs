@@ -17,6 +17,20 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 use thiserror::Error;
 
+/// Per-table delete counts for a project (deploy metadata schema: only `deploy_events` and `project_snapshots` reference `project_id`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteProjectDataStats {
+    pub deploy_events: u64,
+    pub project_snapshots: u64,
+}
+
+impl DeleteProjectDataStats {
+    #[must_use]
+    pub fn total_rows(&self) -> u64 {
+        self.deploy_events.saturating_add(self.project_snapshots)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error(transparent)]
@@ -173,8 +187,7 @@ impl DbStore {
     }
 
     /// Remove deploy metadata rows for one project (events + snapshot).
-    pub async fn delete_project_data(&self, project_id: &str) -> Result<u64, DbError> {
-        let mut affected: u64 = 0;
+    pub async fn delete_project_data(&self, project_id: &str) -> Result<DeleteProjectDataStats, DbError> {
         match self {
             Self::Postgres(pool) => {
                 let r1 = sqlx::query("DELETE FROM deploy_events WHERE project_id = $1")
@@ -185,8 +198,10 @@ impl DbStore {
                     .bind(project_id)
                     .execute(pool)
                     .await?;
-                affected = affected.saturating_add(r1.rows_affected());
-                affected = affected.saturating_add(r2.rows_affected());
+                Ok(DeleteProjectDataStats {
+                    deploy_events: r1.rows_affected(),
+                    project_snapshots: r2.rows_affected(),
+                })
             }
             Self::Sqlite(pool) => {
                 let r1 = sqlx::query("DELETE FROM deploy_events WHERE project_id = $1")
@@ -197,11 +212,12 @@ impl DbStore {
                     .bind(project_id)
                     .execute(pool)
                     .await?;
-                affected = affected.saturating_add(r1.rows_affected());
-                affected = affected.saturating_add(r2.rows_affected());
+                Ok(DeleteProjectDataStats {
+                    deploy_events: r1.rows_affected(),
+                    project_snapshots: r2.rows_affected(),
+                })
             }
         }
-        Ok(affected)
     }
 
     pub async fn get_snapshot(&self, project_id: &str) -> Result<Option<SnapshotRow>, DbError> {
@@ -1967,5 +1983,31 @@ mod grpc_session_tests {
             .expect("agg");
         assert_eq!(agg.len(), 1);
         assert_eq!(agg[0].client_pubkey_b64, "abckey");
+    }
+}
+
+#[cfg(test)]
+mod delete_project_tests {
+    use super::{DbStore, DeleteProjectDataStats};
+
+    #[tokio::test]
+    async fn delete_project_data_counts_per_table_sqlite() {
+        let db = DbStore::connect("sqlite::memory:").await.expect("connect");
+        db.migrate().await.expect("migrate");
+        db.record_event("p1", "upload", "v1", None).await.unwrap();
+        db.upsert_snapshot("p1", "v1", "running", None)
+            .await
+            .unwrap();
+        let s = db.delete_project_data("p1").await.unwrap();
+        assert_eq!(
+            s,
+            DeleteProjectDataStats {
+                deploy_events: 1,
+                project_snapshots: 1,
+            }
+        );
+        assert_eq!(s.total_rows(), 2);
+        let s2 = db.delete_project_data("p1").await.unwrap();
+        assert_eq!(s2.total_rows(), 0);
     }
 }

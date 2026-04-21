@@ -1,6 +1,6 @@
 [package]
 name = "deploy-db"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Deploy metadata (PostgreSQL or SQLite) and optional PostgreSQL explorer helpers"
 
