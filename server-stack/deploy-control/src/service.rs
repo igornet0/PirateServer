@@ -216,6 +216,7 @@ impl ControlPlane {
                         state: r.state,
                         source: "grpc",
                         local_client,
+                        max_upload_bytes: (r.max_upload_bytes > 0).then_some(r.max_upload_bytes),
                     })
                 }
                 Err(e) => self.status_fallback(e.to_string(), &pid).await,
@@ -320,6 +321,7 @@ impl ControlPlane {
                     state: row.state,
                     source: "database",
                     local_client: None,
+                    max_upload_bytes: None,
                 });
             }
         }
@@ -1047,6 +1049,33 @@ impl ControlPlane {
         db.fetch_grpc_proxy_session_by_subscription_token(token)
             .await
             .map_err(Into::into)
+    }
+
+    /// HTTP ingress: stream a tarball from `artifact_path` to deploy-server (same RPC as desktop gRPC client).
+    pub async fn grpc_upload_project_artifact_from_path(
+        &self,
+        project_id: &str,
+        version: &str,
+        manifest_toml: Option<&str>,
+        artifact_path: &Path,
+        file_len: u64,
+        chunk_size: usize,
+        max_upload_bytes: u64,
+    ) -> Result<deploy_proto::deploy::DeployResponse, ControlError> {
+        validate_project_id(project_id).map_err(|e| ControlError::Grpc(e.to_string()))?;
+        let pid = normalize_project_id(project_id);
+        crate::grpc_artifact_upload::grpc_upload_project_artifact_from_path(
+            &self.grpc_endpoint,
+            self.grpc_signing_key.as_ref(),
+            &pid,
+            version,
+            manifest_toml,
+            artifact_path,
+            file_len,
+            chunk_size,
+            max_upload_bytes,
+        )
+        .await
     }
 }
 

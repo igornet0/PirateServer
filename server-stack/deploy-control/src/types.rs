@@ -99,6 +99,9 @@ pub struct StatusView {
     pub source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_client: Option<LocalClientConnect>,
+    /// deploy-server `max_upload_bytes` when gRPC status succeeded (omit on DB fallback / legacy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_upload_bytes: Option<u64>,
 }
 
 /// Per-project `app.env` next to `releases/` (sourced by `run.sh` or tooling).

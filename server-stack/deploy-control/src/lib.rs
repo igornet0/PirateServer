@@ -1,6 +1,7 @@
 //! Dashboard control plane: aggregate gRPC status, filesystem releases, PostgreSQL history, nginx file ops.
 
 mod antiddos;
+mod grpc_artifact_upload;
 mod host_stats;
 mod host_stats_detail;
 mod host_stats_history;
