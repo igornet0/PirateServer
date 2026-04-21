@@ -12,6 +12,7 @@ members = [
     "server-stack/deploy-core",
     "server-stack/deploy-auth",
     "server-stack/tunnel-gateway",
+    "server-stack/host-agent",
     "local-stack/client",
     "local-stack/local-agent",
     "local-stack/desktop-client",

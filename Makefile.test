@@ -1,0 +1,79 @@
+# Local smoke tests (display stream CLI). Run from repo root:
+#   make -f Makefile.test help
+#   make -f Makefile.test display-list
+#   make -f Makefile.test start-local-server-macos
+#   (по умолчанию PORT=50052 BIND=127.0.0.1; проверка GUI в scripts/start-local-macos-stack.sh)
+#
+# First build may be slow: npm (dashboard UI) + cargo build deploy-server + control-api
+
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+CARGO ?= cargo
+MAKE ?= make
+
+# Пусто по умолчанию: эфемерный каталог repo/tmp/pirate-local-stack.* (удаляется после выхода).
+# DEPLOY_LOCAL_ROOT=/path — постоянное хранилище (не удаляется).
+DEPLOY_LOCAL_ROOT ?=
+PORT ?= 50052
+BIND ?= 127.0.0.1
+CONTROL_API_PORT ?= 8080
+# Пропустить pirate gui-check при старте полного стека (macOS).
+SKIP_GUI_CHECK ?=
+
+.PHONY: help display-list display-list-macos build-ui start-local-server-macos start-local-server-macos-minimal
+
+help:
+	@echo "Makefile.test — display-stream CLI + локальный server-stack (как dist install.sh)"
+	@echo ""
+	@echo "  make -f Makefile.test display-list"
+	@echo "      Run: cargo run -p deploy-client -- display-stream list-displays"
+	@echo "      Verifies monitor enumeration (xcap); on macOS grant Screen Recording if prompted."
+	@echo ""
+	@echo "  make -f Makefile.test display-list-macos"
+	@echo "      Alias for display-list."
+	@echo ""
+	@echo "  make -f Makefile.test build-ui"
+	@echo "      Build dashboard static UI (server-stack/frontend → dist), same as: make ui"
+	@echo ""
+	@echo "  make -f Makefile.test start-local-server-macos"
+	@echo "      Сборка UI, затем интерактивные вопросы как в dist install.sh (домен, админ,"
+	@echo "      пароль, OTA server-stack, CONTROL_API_HOST_STATS_*), затем deploy-server +"
+	@echo "      bootstrap-grpc-key + control-api (как на сервере после install.sh, без nginx)."
+	@echo "      Дашборд: второй терминал — cd server-stack/frontend && npm run dev"
+	@echo "      По умолчанию: PORT=50052 BIND=127.0.0.1; проверка дисплея: pirate gui-check (SKIP_GUI_CHECK=1 — пропустить)"
+	@echo "      Постоянный DEPLOY_ROOT: DEPLOY_LOCAL_ROOT=/path (иначе — tmp в репо, потом rm)"
+	@echo "      Без вопросов: pirate_NONINTERACTIVE=1 pirate_UI_ADMIN_PASSWORD=secret …"
+	@echo ""
+	@echo "  make -f Makefile.test start-local-server-macos-minimal"
+	@echo "      Только deploy-server с DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1 (без UI/control-api)."
+	@echo ""
+	@echo "  End-to-end producer → ingest needs a running receiver (e.g. Pirate desktop ingest on POST /ingest)."
+
+display-list display-list-macos:
+	cd "$(REPO_ROOT)" && $(CARGO) run -p deploy-client -- display-stream list-displays
+
+# Dashboard (Vite) — delegates to repo root Makefile `ui` / `frontend`.
+build-ui:
+	$(MAKE) -C "$(REPO_ROOT)" ui
+
+# Полный локальный стек (вопросы как в install.sh, см. scripts/start-local-macos-stack.sh).
+start-local-server-macos: build-ui
+	cd "$(REPO_ROOT)" && \
+	REPO_ROOT="$(REPO_ROOT)" \
+	CARGO="$(CARGO)" \
+	PORT="$(PORT)" \
+	BIND="$(BIND)" \
+	DEPLOY_LOCAL_ROOT="$(DEPLOY_LOCAL_ROOT)" \
+	CONTROL_API_PORT="$(CONTROL_API_PORT)" \
+	SKIP_GUI_CHECK="$(SKIP_GUI_CHECK)" \
+	bash scripts/start-local-macos-stack.sh
+
+# Только gRPC без пары с control-api (старый быстрый режим).
+start-local-server-macos-minimal:
+	cd "$(REPO_ROOT)" && \
+	REPO_ROOT="$(REPO_ROOT)" \
+	CARGO="$(CARGO)" \
+	PORT="$(PORT)" \
+	BIND="$(BIND)" \
+	DEPLOY_LOCAL_ROOT="$(DEPLOY_LOCAL_ROOT)" \
+	LOCAL_STACK_MINIMAL=1 \
+	bash scripts/start-local-macos-stack.sh

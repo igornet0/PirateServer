@@ -69,10 +69,10 @@ else
 fi
 
 echo "==> Rust release ($TARGET_TRIPLE)"
-cargo build --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client
+cargo build --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client -p pirate-host-agent
 
 BIN_DIR="$CARGO_TARGET_DIR/$TARGET_TRIPLE/release"
-for b in deploy-server control-api client pirate; do
+for b in deploy-server control-api client pirate pirate-host-agent; do
   if [[ ! -f "$BIN_DIR/$b" ]]; then
     echo "missing: $BIN_DIR/$b"
     exit 1
@@ -82,7 +82,7 @@ done
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/nginx" "$STAGE/lib/pirate" "$STAGE/launchd"
 
-cp -a "$BIN_DIR/deploy-server" "$BIN_DIR/control-api" "$BIN_DIR/client" "$BIN_DIR/pirate" "$STAGE/bin/"
+cp -a "$BIN_DIR/deploy-server" "$BIN_DIR/control-api" "$BIN_DIR/client" "$BIN_DIR/pirate" "$BIN_DIR/pirate-host-agent" "$STAGE/bin/"
 chmod +x "$STAGE/bin/"*
 if [[ "$UI_BUILD" == "1" ]]; then
   mkdir -p "$STAGE/share/ui/dist"

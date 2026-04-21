@@ -21,4 +21,4 @@ cd /work
 export CARGO_TARGET_DIR
 rustup target add "$TARGET_TRIPLE" 2>/dev/null || true
 exec cargo build --release --target "$TARGET_TRIPLE" \
-  -p deploy-server -p control-api -p deploy-client
+  -p deploy-server -p control-api -p deploy-client -p pirate-host-agent

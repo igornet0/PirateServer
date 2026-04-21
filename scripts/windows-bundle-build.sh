@@ -70,7 +70,7 @@ cargo_windows_release() {
     echo "warning: unknown host OS; trying plain cargo build (may fail for ring/msvc)." >&2
     cmd=(cargo build)
   fi
-  "${cmd[@]}" --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client
+  "${cmd[@]}" --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client -p pirate-host-agent
 }
 
 ARCH_RAW="${ARCH:-amd64}"
@@ -128,7 +128,7 @@ echo "==> Rust release ($TARGET_TRIPLE)"
 cargo_windows_release
 
 BIN_DIR="$CARGO_TARGET_DIR/$TARGET_TRIPLE/release"
-for b in deploy-server.exe control-api.exe client.exe pirate.exe; do
+for b in deploy-server.exe control-api.exe client.exe pirate.exe pirate-host-agent.exe; do
   if [[ ! -f "$BIN_DIR/$b" ]]; then
     echo "missing: $BIN_DIR/$b"
     exit 1
@@ -138,7 +138,7 @@ done
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/nginx" "$STAGE/lib/pirate"
 
-cp -a "$BIN_DIR/deploy-server.exe" "$BIN_DIR/control-api.exe" "$BIN_DIR/client.exe" "$BIN_DIR/pirate.exe" "$STAGE/bin/"
+cp -a "$BIN_DIR/deploy-server.exe" "$BIN_DIR/control-api.exe" "$BIN_DIR/client.exe" "$BIN_DIR/pirate.exe" "$BIN_DIR/pirate-host-agent.exe" "$STAGE/bin/"
 
 if [[ "$UI_BUILD" == "1" ]]; then
   mkdir -p "$STAGE/share/ui/dist"

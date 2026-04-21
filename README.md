@@ -1,17 +1,15 @@
 # PirateServer / deploy workspace
 
-Монорепозиторий: **серверный стек** (приём артефактов по gRPC, HTTP control plane, метаданные в SQLite на «железе» или PostgreSQL в Docker, дашборд) и **локальные инструменты** (CLI `client`, заготовка `local-agent`).
+Monorepo with two main product stacks:
 
-## Быстрая навигация
+- `server-stack` - server deployment and runtime control services.
+- `local-stack` - operator workstation tools (CLI and desktop app).
 
-| Что нужно | Куда смотреть |
-|-----------|----------------|
-| Роли каталогов (сервер / ПК / общее) | [`docs/ARCHITECTURE_SERVER_VS_LOCAL.md`](docs/ARCHITECTURE_SERVER_VS_LOCAL.md) |
-| Локальный контур (проекты, UI на ПК, агент) | [`docs/LOCAL_STACK_DESIGN.md`](docs/LOCAL_STACK_DESIGN.md) |
-| Локальный desktop UI (`pirate-client`, Tauri) | [`docs/DESKTOP_CLIENT.md`](docs/DESKTOP_CLIENT.md) |
-| Сборка и цели Makefile | [`Makefile`](Makefile) |
-| Стек nginx + метаданные + UI | [`docs/PHASE6.md`](docs/PHASE6.md) |
-| Дорожная карта и gRPC | [`ROADMAP.md`](ROADMAP.md) |
+## Documentation
+
+- Documentation hub: [`docs/README.md`](docs/README.md)
+- Russian: [`docs/ru/README.md`](docs/ru/README.md)
+- English: [`docs/en/README.md`](docs/en/README.md)
 
 ## Структура workspace
 
@@ -28,7 +26,7 @@
 - **`make dist-linux`** / **`make dist-arm64-linux`** — кладут тот же номер в `server-stack-manifest.json` внутри архива (`release`, `target`, `git`, `built_at`, …); имя архива: `pirate-linux-{amd64|aarch64}-<VERSION>-<дата>.tar.gz`.
 - При bump релиза обновите **`VERSION`** и при необходимости поля `version` в [`server-stack/frontend/package.json`](server-stack/frontend/package.json) и [`local-stack/desktop-ui/package.json`](local-stack/desktop-ui/package.json), чтобы они совпадали с политикой релиза.
 
-## Bare-metal и gRPC
+## Bare-metal and gRPC
 
 - Установка из `dist/pirate-linux-amd64-<версия>-<дата>.tar.gz` (или `pirate-linux-aarch64-…`): [`server-stack/deploy/ubuntu/install.sh`](server-stack/deploy/ubuntu/install.sh) создаёт пользователя ОС **`pirate`** (в т.ч. группа **`sudo`**), поднимает `deploy-server` и `control-api` под этим пользователем, выполняет `control-api bootstrap-grpc-key` и записывает `GRPC_SIGNING_KEY_PATH` в `/etc/pirate-deploy.env`. В архив входит каталог **`lib/pirate/`** (скрипты SMB и установки СУБД) — копируется в **`/usr/local/lib/pirate/`**; копии **`uninstall.sh`** / **`purge-pirate-data.sh`** — в **`/usr/local/share/pirate-uninstall/`**, путь к распакованному бандлу сохраняется в **`/var/lib/pirate/original-bundle-path`**. Полный веб-стек (nginx + статика дашборда): `sudo ./install.sh --nginx --ui` после распаковки.
 - Снятие стека: после такой установки на хосте доступно **`sudo pirate uninstall stack`** (или **`sudo client uninstall stack`**) — вызывается тот же сценарий, что и **`sudo /usr/local/share/pirate-uninstall/uninstall.sh`**; на установках **до** появления этой копии по-прежнему **`sudo ./uninstall.sh`** из каталога распаковки. Локальная очистка pairing/настроек CLI на ПК: **`pirate uninstall client`** (удаляет каталог конфигурации `pirate-client`, без остановки процессов — остановите вручную долгоживущие команды вроде **`pirate board`**).
@@ -37,7 +35,7 @@
 - Порт **50051** — это gRPC (HTTP/2), не обычный HTTP; проверять через `client` / `grpcurl`, а не через `curl` к URL.
 - Для локальной отладки на сервере можно выставить **`DEPLOY_GRPC_ALLOW_UNAUTHENTICATED=1`** для `deploy-server` (только dev, не для продакшена). См. [`server-stack/deploy/ubuntu/env.example`](server-stack/deploy/ubuntu/env.example).
 
-### Веб-дашборд (логин)
+### Web dashboard (login)
 
 - Установка **без** флага **`--ui`** не спрашивает домен и учётку дашборда и **не** записывает **`CONTROL_UI_ADMIN_*`** и **`CONTROL_API_JWT_SECRET`** в **`/etc/pirate-deploy.env`**; **`control-api`** слушает **`127.0.0.1:8080`** (переменная **`CONTROL_API_BIND`**) и не требует Bearer для **`/api/v1/*`**. Для клиента **`client pair`** по JSON этого достаточно.
 - С **`sudo ./install.sh --ui`** (при необходимости вместе с **`--nginx`**) **`install.sh`** спрашивает имя и пароль первого пользователя (Enter — **`admin`**, пароль случайный), если не заданы **`pirate_NONINTERACTIVE=1`** или **`pirate_UI_ADMIN_USERNAME`** / **`pirate_UI_ADMIN_PASSWORD`**. В env попадают **`CONTROL_UI_ADMIN_USERNAME`**, **`CONTROL_UI_ADMIN_PASSWORD`**, **`CONTROL_API_JWT_SECRET`**; пароль выводится в конце установки. Повторный запуск с **`--ui`** добавляет или обновляет эти строки; pair по gRPC не зависит от JWT.

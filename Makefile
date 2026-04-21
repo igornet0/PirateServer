@@ -121,6 +121,33 @@ help:
 	@echo "    PROJECT=client|deploy_server|control_api|dashboard_ui|release (then: make dist-manifest or make dist)"
 	@echo ""
 
+help-dist:
+	@echo ""
+	@echo "=== Distribution targets (dist, all client+server artifacts) ==="
+	@echo ""
+	@echo "All release bundles:"
+	@echo "  make dist                 - Full build: all production artifacts (client+server+installer, dashboard UI, etc)"
+	@echo ""
+	@echo "Client (deploy-client):"
+	@echo "  make dist-client-linux           - Linux tar.gz (pirate-linux-<ARCH>-<VERSION>-<date>.tar.gz)"
+	@echo "  make dist-client-macos           - macOS tar.gz (pirate-macos-<ARCH>-<VERSION>-<date>.tar.gz)"
+	@echo "  make dist-client-windows         - Windows zip (pirate-windows-<ARCH>-<VERSION>-<date>.zip)"
+	@echo ""
+	@echo "Desktop (Tauri) client:"
+	@echo "  make dist-desktop-macos          - macOS DMG/zip (deploy-dashboard-desktop-macos-<ARCH>-<VERSION>-<date>.*)"
+	@echo "  make dist-desktop-windows        - Windows zip (deploy-dashboard-desktop-windows-<ARCH>-<VERSION>-<date>.zip)"
+	@echo "  make dist-desktop-linux          - Linux tar.gz/appimage (deploy-dashboard-desktop-linux-<ARCH>-<VERSION>-<date>.*)"
+	@echo ""
+	@echo "Server components:"
+	@echo "  make dist-server                 - Server release (deploy-server-<ARCH>-<VERSION>-<date>.*)"
+	@echo "  make dist-control-api            - control-api release"
+	@echo ""
+	@echo "Other bundles:"
+	@echo "  make dist-arm64-linux            - Linux ARM64 tar.gz (for docker/raspberry)"
+	@echo "  make dist-arm64-docker-install   - Test full ARM64 docker install (incl. install script)"
+	@echo ""
+	@echo "See top of Makefile for more on installer, cross, dev, frontend, etc."
+
 # --- Full workspace ---
 
 all: build
@@ -167,11 +194,14 @@ pirate-release:
 control-api-release:
 	$(CARGO) build -p control-api --release $(CARGO_TARGET)
 
+host-agent-release:
+	$(CARGO) build -p pirate-host-agent --release $(CARGO_TARGET)
+
 local-agent-release:
 	$(CARGO) build -p local-agent --bin local-agent --release $(CARGO_TARGET)
 
-build-stack-release: server-release client-release control-api-release
-	@echo "Release binaries under target/$(if $(TARGET),$(TARGET)/,)release/: deploy-server, client, control-api"
+build-stack-release: server-release client-release control-api-release host-agent-release
+	@echo "Release binaries under target/$(if $(TARGET),$(TARGET)/,)release/: deploy-server, client, control-api, pirate-host-agent"
 
 # --- Frontend ---
 
@@ -302,6 +332,12 @@ dist-only-windows:
 	$(MAKE) ARCH=amd64 UI_BUILD=0 dist-windows
 	$(MAKE) ARCH=arm64 UI_BUILD=0 dist-windows
 
+dist-only-windows-msi:
+	$(MAKE) ARCH=amd64 UI_BUILD=1 dist-windows-msi
+	$(MAKE) ARCH=arm64 UI_BUILD=1 dist-windows-msi
+	$(MAKE) ARCH=amd64 UI_BUILD=0 dist-windows-msi
+	$(MAKE) ARCH=arm64 UI_BUILD=0 dist-windows-msi
+
 dist-only-linux:
 	$(MAKE) ARCH=amd64 UI_BUILD=1 dist-linux
 	$(MAKE) ARCH=arm64 UI_BUILD=1 dist-linux
@@ -320,13 +356,14 @@ dist-only-macos-dmg:
 	$(MAKE) ARCH=amd64 UI_BUILD=0 dist-macos-dmg
 	$(MAKE) ARCH=arm64 UI_BUILD=0 dist-macos-dmg
 
-dist-all: 
+dist-server-all: 
 	$(MAKE) dist-only-linux
 	$(MAKE) dist-only-windows
+	$(MAKE) dist-only-windows-msi
 	$(MAKE) dist-only-macos
 	$(MAKE) dist-only-macos-dmg
 
-dist-server: dist-all
+dist-server: dist-server-all
 
 dist-client-linux:
 	@chmod +x scripts/build-desktop-client-dist.sh scripts/read-version.sh
@@ -386,6 +423,10 @@ dist-client-all:
 	$(MAKE) dist-only-client-windows-msi
 
 dist-client: dist-client-all
+
+dist-all: 
+	$(MAKE) dist-server-all
+	$(MAKE) dist-client-all
 
 # --- Install artifacts ---
 

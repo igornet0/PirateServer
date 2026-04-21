@@ -10,6 +10,8 @@
 #     Deploy dashboard: DESKTOP_UI=$REPO_ROOT/server-stack/desktop-ui
 #   DIST_ARTIFACT_PREFIX — output basename prefix (default: pirate-client), e.g. deploy-dashboard-desktop
 #   WIN_EXE — Windows exe name for NSIS fallback zip (default: pirate-client.exe), e.g. deploy-dashboard-desktop.exe
+#   DMG_README_TEMPLATE — path to README template for macos-dmg (default: scripts/dmg-bundle-README.in.txt;
+#     placeholders: @VERSION@ @ARCH@ @DATE@ @PREFIX@ → README.txt at DMG root)
 # Windows cross (Darwin/Linux): clang + cargo-xwin + NSIS (makensis). Real WiX .msi only on Windows;
 #   windows-msi on Unix builds NSIS → dist/<prefix>-windows-<arch>-<ver>-<date>-nsis.zip
 #   cargo-xwin defaults to clang-cl (/imsvc); we set XWIN_CROSS_COMPILER=clang before every cargo xwin
@@ -216,6 +218,42 @@ bundle_macos_app_dir() {
 bundle_macos_dmg_dir() {
   local target="$1"
   echo "$CARGO_TARGET_DIR/$target/release/bundle/dmg"
+}
+
+# Add README.txt at the root of a Tauri-produced DMG (read-only → UDRW → attach → copy → UDZO).
+dmg_inject_readme() {
+  local src_dmg="$1"
+  local out_dmg="$2"
+  local readme_template="${DMG_README_TEMPLATE:-$REPO_ROOT/scripts/dmg-bundle-README.in.txt}"
+  local tmp_readme tmp_rw mntpnt
+
+  if [[ ! -f "$readme_template" ]]; then
+    echo "warning: DMG README template missing ($readme_template); copying .dmg unchanged." >&2
+    cp -f "$src_dmg" "$out_dmg"
+    return 0
+  fi
+
+  tmp_readme="$(mktemp "${TMPDIR:-/tmp}/pirate-dmg-readme.XXXXXX.txt")"
+  tmp_rw="$(mktemp "${TMPDIR:-/tmp}/pirate-dmg-rw.XXXXXX.dmg")"
+  mntpnt="$(mktemp -d "${TMPDIR:-/tmp}/pirate-dmg-mnt.XXXXXX")"
+  rm -f "$tmp_rw"
+
+  sed \
+    -e "s|@VERSION@|$REL|g" \
+    -e "s|@ARCH@|$ARCH_N|g" \
+    -e "s|@DATE@|$DATE_TAG|g" \
+    -e "s|@PREFIX@|$DIST_ARTIFACT_PREFIX|g" \
+    "$readme_template" >"$tmp_readme"
+
+  hdiutil convert "$src_dmg" -format UDRW -o "$tmp_rw"
+  hdiutil attach "$tmp_rw" -readwrite -nobrowse -mountpoint "$mntpnt"
+  cp -f "$tmp_readme" "$mntpnt/README.txt"
+  sync
+  hdiutil detach "$mntpnt"
+  rm -f "$out_dmg"
+  hdiutil convert "$tmp_rw" -format UDZO -imagekey zlib-level=9 -ov -o "$out_dmg"
+  rm -f "$tmp_readme" "$tmp_rw"
+  rmdir "$mntpnt" 2>/dev/null || true
 }
 
 bundle_win_nsis_dir() {
@@ -434,8 +472,8 @@ case "$MODE" in
     fi
     OUT_DMG="$DIST_DIR/${DIST_ARTIFACT_PREFIX}-macos-${ARCH_N}-${REL}-${DATE_TAG}.dmg"
     rm -f "$OUT_DMG"
-    cp -f "$DMG_SRC" "$OUT_DMG"
-    echo "Done: $OUT_DMG"
+    dmg_inject_readme "$DMG_SRC" "$OUT_DMG"
+    echo "Done: $OUT_DMG (README.txt added inside the disk image)"
     ;;
 
   windows-zip)
