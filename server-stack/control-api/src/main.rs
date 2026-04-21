@@ -7,12 +7,16 @@ mod data_sources_api;
 mod error;
 mod proxy_sessions_api;
 mod proxy_tunnel_redis;
+mod host_terminal;
 
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::http::header;
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use futures::Stream;
@@ -32,15 +36,19 @@ use deploy_control::{
     NginxEnvUpdateView, NginxEnvVarUpdateView, NginxPutResponseView, NginxStatusView, NetworkDetail,
     ProcessControlView, ProcessesDetail, ProjectsView, RollbackBody, RollbackView, SeriesResponse,
 };
+use deploy_core::{validate_project_id, validate_version};
 use deploy_db::{DbStore, PgPool};
 use sqlx::postgres::PgPoolOptions;
 use ed25519_dalek::SigningKey;
 use error::ApiError;
+use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub(crate) struct ApiState {
@@ -62,6 +70,10 @@ pub(crate) struct ApiState {
     host_history: Option<Arc<Mutex<HostStatsHistory>>>,
     /// When true, expose SSE and WebSocket host-stats streams (use with care on public networks).
     host_stats_stream_enabled: bool,
+    /// `CONTROL_API_HOST_TERMINAL=1`: WebSocket shell at `/api/v1/host-terminal/ws` (Unix only).
+    pub(crate) host_terminal_enabled: bool,
+    pub(crate) host_terminal_shell: PathBuf,
+    pub(crate) host_terminal_session_secs: u64,
     /// Explorer PostgreSQL URL with password removed (for `GET /api/v1/database-info`).
     explorer_connection_display: Option<String>,
     /// Root for DB credential files and optional server-side SMB dirs (`install.sh` creates the tree).
@@ -95,6 +107,13 @@ pub(crate) struct ApiState {
     antiddos_state_dir: PathBuf,
     antiddos_apply_script: PathBuf,
     antiddos_limit_log_path: PathBuf,
+    /// `DEPLOY_MAX_UPLOAD_BYTES` for this process; combined with deploy-server `GetStatus.max_upload_bytes` via [`effective_upload_limit_from_config_and_grpc`].
+    max_artifact_upload_bytes_configured: u64,
+    /// Chunk size when forwarding stored multipart to gRPC.
+    deploy_http_chunk_bytes: usize,
+    deploy_upload_session_chunk_bytes: usize,
+    deploy_upload_session_ttl_secs: u64,
+    deploy_upload_sessions: Arc<AsyncMutex<HashMap<String, DeployUploadSessionState>>>,
 }
 
 /// Parse database URL and strip password for safe display (PostgreSQL; SQLite returned as-is).
@@ -308,7 +327,7 @@ pub(crate) fn check_api_bearer(state: &ApiState, headers: &HeaderMap) -> Result<
 }
 
 /// Same as [`check_api_bearer`], but also accepts `access_token` query (for EventSource / WebSocket).
-fn check_api_bearer_with_query(
+pub(crate) fn check_api_bearer_with_query(
     state: &ApiState,
     headers: &HeaderMap,
     query_token: Option<&str>,
@@ -361,6 +380,37 @@ fn check_nginx_write_auth(state: &ApiState, headers: &HeaderMap) -> Result<(), A
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Max download payload for `GET /api/v1/ping?bytes=` (aligns with deploy ConnectionProbe caps).
+const PING_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(serde::Deserialize)]
+struct PingQuery {
+    /// If omitted or zero: JSON pong. If positive: octet-stream body of this size (capped).
+    #[serde(default)]
+    bytes: Option<u64>,
+}
+
+/// Unauthenticated reachability + optional bandwidth sample for `pirate ping`.
+async fn api_ping(Query(q): Query<PingQuery>) -> impl IntoResponse {
+    let raw = q.bytes.unwrap_or(0);
+    let n = raw.min(PING_MAX_BYTES);
+    if n == 0 {
+        let server_ms = chrono::Utc::now().timestamp_millis();
+        return Json(serde_json::json!({
+            "pong": true,
+            "server_ms": server_ms,
+        }))
+        .into_response();
+    }
+    let body = vec![0u8; n as usize];
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(body))
+        .unwrap()
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -445,17 +495,545 @@ pub(crate) fn project_or_default(project: &str) -> String {
     }
 }
 
+/// Effective max artifact size for HTTP deploy paths: `min(control-api env, deploy-server GetStatus)` when the latter is known.
+pub(crate) fn effective_upload_limit_from_config_and_grpc(
+    configured: u64,
+    grpc_max: Option<u64>,
+) -> u64 {
+    match grpc_max {
+        Some(g) if g > 0 => configured.min(g),
+        _ => configured,
+    }
+}
+
+async fn effective_artifact_upload_limit(s: &ApiState, project_id: &str) -> (u64, Option<u64>) {
+    let cfg = s.max_artifact_upload_bytes_configured;
+    let pid = project_or_default(project_id);
+    match s.plane.get_status(&pid).await {
+        Ok(st) => {
+            let grpc = st.max_upload_bytes;
+            let eff = effective_upload_limit_from_config_and_grpc(cfg, grpc);
+            if let Some(g) = grpc {
+                if g != cfg {
+                    warn!(
+                        project_id = %pid,
+                        control_api_max_upload_bytes = cfg,
+                        deploy_server_max_upload_bytes = g,
+                        effective_max_upload_bytes = eff,
+                        "artifact upload limit: control-api DEPLOY_MAX_UPLOAD_BYTES and deploy-server GetStatus differ; enforcing min()"
+                    );
+                }
+            }
+            (eff, grpc)
+        }
+        Err(e) => {
+            warn!(
+                %e,
+                project_id = %pid,
+                "GetStatus failed; artifact upload limit uses control-api DEPLOY_MAX_UPLOAD_BYTES only"
+            );
+            (cfg, None)
+        }
+    }
+}
+
 async fn api_status(
     State(s): State<ApiState>,
     headers: HeaderMap,
     Query(q): Query<ProjectQuery>,
 ) -> Result<Json<deploy_control::StatusView>, ApiError> {
     check_api_bearer(&s, &headers)?;
-    s.plane
-        .get_status(&project_or_default(&q.project))
+    let pid = project_or_default(&q.project);
+    let mut st = s.plane.get_status(&pid).await.map_err(ApiError::from)?;
+    let cfg = s.max_artifact_upload_bytes_configured;
+    let grpc = st.max_upload_bytes;
+    let eff = effective_upload_limit_from_config_and_grpc(cfg, grpc);
+    if let Some(g) = grpc {
+        if g != cfg {
+            warn!(
+                project_id = %pid,
+                control_api_max_upload_bytes = cfg,
+                deploy_server_max_upload_bytes = g,
+                effective_max_upload_bytes = eff,
+                "artifact upload limit: control-api DEPLOY_MAX_UPLOAD_BYTES and deploy-server GetStatus differ; enforcing min()"
+            );
+        }
+    }
+    st.max_upload_bytes = Some(eff);
+    Ok(Json(st))
+}
+
+/// Multipart deploy: fields `version` (text), optional `manifest_toml` (text, before `artifact`), `artifact` (file, `.tar.gz` bytes).
+/// Send `version` and optional `manifest_toml` before `artifact` so the server parses them first.
+#[derive(serde::Serialize)]
+struct DeployArtifactOut {
+    status: String,
+    deployed_version: String,
+}
+
+#[derive(Clone, Debug)]
+struct DeployUploadSessionState {
+    project_id: String,
+    version: String,
+    manifest_toml: Option<String>,
+    artifact_path: PathBuf,
+    artifact_bytes: u64,
+    artifact_sha256: String,
+    received_bytes: u64,
+    updated_at_ms: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct DeployUploadSessionCreateBody {
+    version: String,
+    manifest_toml: Option<String>,
+    artifact_bytes: u64,
+    artifact_sha256: String,
+}
+
+#[derive(serde::Serialize)]
+struct DeployUploadSessionCreateOut {
+    upload_id: String,
+    chunk_bytes: usize,
+    received_bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+struct DeployUploadSessionChunkOut {
+    received_bytes: u64,
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn session_is_expired(sess: &DeployUploadSessionState, ttl_secs: u64, now_ms: i64) -> bool {
+    let ttl_ms = (ttl_secs as i64).saturating_mul(1000);
+    now_ms.saturating_sub(sess.updated_at_ms) > ttl_ms
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn cleanup_expired_upload_sessions(state: &ApiState) {
+    let now = now_ms();
+    let mut expired_paths = Vec::<PathBuf>::new();
+    {
+        let mut sessions = state.deploy_upload_sessions.lock().await;
+        sessions.retain(|_, sess| {
+            if session_is_expired(sess, state.deploy_upload_session_ttl_secs, now) {
+                expired_paths.push(sess.artifact_path.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+    for p in expired_paths {
+        let _ = tokio::fs::remove_file(&p).await;
+    }
+}
+
+async fn api_deploy_artifact_session_create(
+    State(s): State<ApiState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<DeployUploadSessionCreateBody>,
+) -> Result<Json<DeployUploadSessionCreateOut>, ApiError> {
+    cleanup_expired_upload_sessions(&s).await;
+    check_api_bearer(&s, &headers)?;
+    validate_project_id(&project_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    validate_version(&body.version).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let (eff, grpc) = effective_artifact_upload_limit(&s, &project_id).await;
+    if body.artifact_bytes == 0 || body.artifact_bytes > eff {
+        return Err(ApiError::bad_request_artifact_limit(
+            format!("artifact_bytes must be between 1 and {}", eff),
+            s.max_artifact_upload_bytes_configured,
+            grpc,
+            eff,
+        ));
+    }
+    if !is_sha256_hex(body.artifact_sha256.as_str()) {
+        return Err(ApiError::bad_request(
+            "artifact_sha256 must be a 64-char hex string",
+        ));
+    }
+
+    let upload_id = uuid::Uuid::new_v4().to_string();
+    let artifact_path =
+        std::env::temp_dir().join(format!("pirate-session-deploy-{}.tar.gz", upload_id));
+    tokio::fs::File::create(&artifact_path)
         .await
-        .map(Json)
-        .map_err(Into::into)
+        .map_err(|e| ApiError::internal(format!("create upload session temp file: {e}")))?;
+    let now = now_ms();
+    let session = DeployUploadSessionState {
+        project_id: project_id.clone(),
+        version: body.version,
+        manifest_toml: body.manifest_toml,
+        artifact_path,
+        artifact_bytes: body.artifact_bytes,
+        artifact_sha256: body.artifact_sha256.to_lowercase(),
+        received_bytes: 0,
+        updated_at_ms: now,
+    };
+    {
+        let mut sessions = s.deploy_upload_sessions.lock().await;
+        sessions.insert(upload_id.clone(), session);
+    }
+
+    info!(
+        upload_id = %upload_id,
+        project_id = %project_id,
+        artifact_bytes = body.artifact_bytes,
+        "deploy_artifact session created"
+    );
+
+    Ok(Json(DeployUploadSessionCreateOut {
+        upload_id,
+        chunk_bytes: s.deploy_upload_session_chunk_bytes,
+        received_bytes: 0,
+    }))
+}
+
+async fn api_deploy_artifact_session_chunk(
+    State(s): State<ApiState>,
+    Path((project_id, upload_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<DeployUploadSessionChunkOut>, ApiError> {
+    cleanup_expired_upload_sessions(&s).await;
+    check_api_bearer(&s, &headers)?;
+    validate_project_id(&project_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let offset: u64 = query
+        .get("offset")
+        .ok_or_else(|| ApiError::bad_request("missing query parameter `offset`"))?
+        .parse()
+        .map_err(|_| ApiError::bad_request("invalid query parameter `offset`"))?;
+
+    let snapshot = {
+        let mut sessions = s.deploy_upload_sessions.lock().await;
+        let Some(sess) = sessions.get(&upload_id).cloned() else {
+            return Err(ApiError::bad_request("unknown upload session"));
+        };
+        if sess.project_id != project_id {
+            return Err(ApiError::bad_request("upload session does not belong to project"));
+        }
+        let now = now_ms();
+        if session_is_expired(&sess, s.deploy_upload_session_ttl_secs, now) {
+            let removed = sessions.remove(&upload_id);
+            drop(sessions);
+            if let Some(r) = removed {
+                let _ = tokio::fs::remove_file(&r.artifact_path).await;
+            }
+            return Err(ApiError::bad_request("upload session expired"));
+        }
+        sess
+    };
+
+    if offset != snapshot.received_bytes {
+        return Err(ApiError::bad_request(format!(
+            "invalid offset: expected current={} got offset={}",
+            snapshot.received_bytes, offset
+        )));
+    }
+    if body.is_empty() {
+        return Err(ApiError::bad_request("chunk body must not be empty"));
+    }
+    let next = offset.saturating_add(body.len() as u64);
+    if next > snapshot.artifact_bytes {
+        return Err(ApiError::bad_request(format!(
+            "chunk exceeds declared artifact_bytes (declared={}, attempted_end={})",
+            snapshot.artifact_bytes, next
+        )));
+    }
+    if let Some(h) = headers.get("x-chunk-sha256") {
+        let expected = h
+            .to_str()
+            .map_err(|_| ApiError::bad_request("invalid x-chunk-sha256 header"))?;
+        if !is_sha256_hex(expected) {
+            return Err(ApiError::bad_request(
+                "x-chunk-sha256 must be a 64-char hex string",
+            ));
+        }
+        let actual = format!("{:x}", Sha256::digest(&body));
+        if actual != expected.to_lowercase() {
+            return Err(ApiError::bad_request("x-chunk-sha256 mismatch"));
+        }
+    }
+
+    let mut f = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&snapshot.artifact_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("artifact append open: {e}")))?;
+    f.write_all(&body)
+        .await
+        .map_err(|e| ApiError::internal(format!("artifact append write: {e}")))?;
+    f.sync_all()
+        .await
+        .map_err(|e| ApiError::internal(format!("artifact append fsync: {e}")))?;
+
+    debug!(
+        upload_id = %upload_id,
+        project_id = %project_id,
+        offset,
+        chunk_len = body.len(),
+        "deploy_artifact session chunk stored"
+    );
+
+    let now = now_ms();
+    let updated = {
+        let mut sessions = s.deploy_upload_sessions.lock().await;
+        let Some(sess) = sessions.get_mut(&upload_id) else {
+            return Err(ApiError::bad_request("unknown upload session"));
+        };
+        if sess.received_bytes != offset {
+            return Err(ApiError::bad_request(format!(
+                "invalid offset: expected current={} got offset={}",
+                sess.received_bytes, offset
+            )));
+        }
+        sess.received_bytes = next;
+        sess.updated_at_ms = now;
+        sess.received_bytes
+    };
+    Ok(Json(DeployUploadSessionChunkOut {
+        received_bytes: updated,
+    }))
+}
+
+async fn api_deploy_artifact_session_complete(
+    State(s): State<ApiState>,
+    Path((project_id, upload_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<DeployArtifactOut>, ApiError> {
+    cleanup_expired_upload_sessions(&s).await;
+    check_api_bearer(&s, &headers)?;
+    validate_project_id(&project_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let sess = {
+        let mut sessions = s.deploy_upload_sessions.lock().await;
+        sessions
+            .remove(&upload_id)
+            .ok_or_else(|| ApiError::bad_request("unknown upload session"))?
+    };
+    if sess.project_id != project_id {
+        let _ = tokio::fs::remove_file(&sess.artifact_path).await;
+        return Err(ApiError::bad_request("upload session does not belong to project"));
+    }
+    if session_is_expired(&sess, s.deploy_upload_session_ttl_secs, now_ms()) {
+        let _ = tokio::fs::remove_file(&sess.artifact_path).await;
+        return Err(ApiError::bad_request("upload session expired"));
+    }
+    if sess.received_bytes != sess.artifact_bytes {
+        let _ = tokio::fs::remove_file(&sess.artifact_path).await;
+        return Err(ApiError::bad_request(format!(
+            "upload incomplete: received={} expected={}",
+            sess.received_bytes, sess.artifact_bytes
+        )));
+    }
+
+    let mut f = tokio::fs::File::open(&sess.artifact_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("artifact open for sha256: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .await
+            .map_err(|e| ApiError::internal(format!("artifact read for sha256: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if actual_sha256 != sess.artifact_sha256 {
+        let _ = tokio::fs::remove_file(&sess.artifact_path).await;
+        return Err(ApiError::bad_request(
+            "artifact sha256 mismatch at complete step",
+        ));
+    }
+
+    info!(
+        upload_id = %upload_id,
+        project_id = %project_id,
+        artifact_bytes = sess.artifact_bytes,
+        "deploy_artifact session complete: forwarding to deploy-server"
+    );
+
+    let (eff, _) = effective_artifact_upload_limit(&s, &sess.project_id).await;
+    let result = s
+        .plane
+        .grpc_upload_project_artifact_from_path(
+            &sess.project_id,
+            &sess.version,
+            sess.manifest_toml.as_deref(),
+            &sess.artifact_path,
+            sess.artifact_bytes,
+            s.deploy_http_chunk_bytes,
+            eff,
+        )
+        .await
+        .map_err(ApiError::from);
+    let _ = tokio::fs::remove_file(&sess.artifact_path).await;
+    let r = result?;
+
+    Ok(Json(DeployArtifactOut {
+        status: r.status,
+        deployed_version: r.deployed_version,
+    }))
+}
+
+#[derive(serde::Serialize)]
+struct OkOut {
+    ok: bool,
+}
+
+async fn api_deploy_artifact_session_delete(
+    State(s): State<ApiState>,
+    Path((project_id, upload_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<OkOut>, ApiError> {
+    cleanup_expired_upload_sessions(&s).await;
+    check_api_bearer(&s, &headers)?;
+    validate_project_id(&project_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let removed = {
+        let mut sessions = s.deploy_upload_sessions.lock().await;
+        sessions.remove(&upload_id)
+    };
+    if let Some(sess) = removed {
+        if sess.project_id != project_id {
+            return Err(ApiError::bad_request("upload session does not belong to project"));
+        }
+        let _ = tokio::fs::remove_file(&sess.artifact_path).await;
+    }
+    Ok(Json(OkOut { ok: true }))
+}
+
+async fn api_deploy_artifact_multipart(
+    State(s): State<ApiState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<DeployArtifactOut>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    validate_project_id(&project_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let (eff, grpc) = effective_artifact_upload_limit(&s, &project_id).await;
+
+    let mut version: Option<String> = None;
+    let mut manifest: Option<String> = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("multipart: {e}")))?
+    {
+        match field.name() {
+            Some("version") => {
+                if version.is_some() {
+                    return Err(ApiError::bad_request("duplicate multipart field `version`"));
+                }
+                let t = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::bad_request(format!("version field: {e}")))?;
+                validate_version(&t).map_err(|e| ApiError::bad_request(e.to_string()))?;
+                version = Some(t);
+            }
+            Some("manifest_toml") => {
+                if manifest.is_some() {
+                    return Err(ApiError::bad_request(
+                        "duplicate multipart field `manifest_toml`",
+                    ));
+                }
+                let t = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::bad_request(format!("manifest_toml field: {e}")))?;
+                if t.len() > 2 * 1024 * 1024 {
+                    return Err(ApiError::bad_request(
+                        "manifest_toml field too large (max 2 MiB)",
+                    ));
+                }
+                manifest = Some(t);
+            }
+            Some("artifact") => {
+                if version.is_none() {
+                    return Err(ApiError::bad_request(
+                        "send multipart field `version` before `artifact`",
+                    ));
+                }
+                let ver = version.clone().expect("checked");
+                let path = std::env::temp_dir().join(format!(
+                    "pirate-multipart-deploy-{}.tar.gz",
+                    uuid::Uuid::new_v4()
+                ));
+                let mut f = tokio::fs::File::create(&path)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("temp artifact: {e}")))?;
+                let mut total: u64 = 0;
+                let max = eff;
+                loop {
+                    let chunk = field.chunk()
+                        .await
+                        .map_err(|e| ApiError::bad_request(format!("artifact read: {e}")))?;
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
+                    total += chunk.len() as u64;
+                    if total > max {
+                        drop(f);
+                        let _ = tokio::fs::remove_file(&path).await;
+                        return Err(ApiError::bad_request_artifact_limit(
+                            format!("artifact exceeds limit of {} bytes", max),
+                            s.max_artifact_upload_bytes_configured,
+                            grpc,
+                            eff,
+                        ));
+                    }
+                    f.write_all(&chunk)
+                        .await
+                        .map_err(|e| ApiError::internal(format!("artifact write: {e}")))?;
+                }
+                f.sync_all()
+                    .await
+                    .map_err(|e| ApiError::internal(format!("artifact fsync: {e}")))?;
+
+                let r = s
+                    .plane
+                    .grpc_upload_project_artifact_from_path(
+                        &project_id,
+                        &ver,
+                        manifest.as_deref(),
+                        &path,
+                        total,
+                        s.deploy_http_chunk_bytes,
+                        max,
+                    )
+                    .await
+                    .map_err(ApiError::from);
+                let _ = tokio::fs::remove_file(&path).await;
+                let r = r?;
+                return Ok(Json(DeployArtifactOut {
+                    status: r.status,
+                    deployed_version: r.deployed_version,
+                }));
+            }
+            _ => {
+                let _ = field.text().await;
+            }
+        }
+    }
+
+    Err(ApiError::bad_request(
+        "missing multipart field `artifact` (and preceding `version`)",
+    ))
 }
 
 async fn api_project_telemetry(
@@ -772,7 +1350,7 @@ async fn api_host_stats_series(
 }
 
 #[derive(serde::Deserialize)]
-struct StreamAuthQuery {
+pub(crate) struct StreamAuthQuery {
     access_token: Option<String>,
 }
 
@@ -1535,6 +2113,30 @@ struct Args {
     #[arg(long, default_value_t = 28800, env = "CONTROL_API_JWT_TTL_SECS")]
     jwt_ttl_secs: u64,
 
+    /// Max project artifact size for HTTP multipart deploy (must match deploy-server). Env: `DEPLOY_MAX_UPLOAD_BYTES`.
+    #[arg(long, env = "DEPLOY_MAX_UPLOAD_BYTES", default_value_t = 256 * 1024 * 1024)]
+    max_artifact_upload_bytes: u64,
+
+    /// Chunk size when forwarding HTTP-uploaded tarball to gRPC (bytes).
+    #[arg(long, env = "CONTROL_API_DEPLOY_CHUNK_BYTES", default_value_t = 256 * 1024)]
+    deploy_http_chunk_bytes: usize,
+
+    /// Suggested chunk size for resumable deploy upload sessions (bytes).
+    #[arg(
+        long,
+        env = "CONTROL_API_DEPLOY_SESSION_CHUNK_BYTES",
+        default_value_t = 1024 * 1024
+    )]
+    deploy_upload_session_chunk_bytes: usize,
+
+    /// TTL for resumable deploy upload sessions (seconds).
+    #[arg(
+        long,
+        env = "CONTROL_API_DEPLOY_SESSION_TTL_SECS",
+        default_value_t = 3600
+    )]
+    deploy_upload_session_ttl_secs: u64,
+
     /// Ed25519 identity JSON for signed gRPC `GetStatus` to deploy-server (when server enforces auth).
     #[arg(long, env = "GRPC_SIGNING_KEY_PATH")]
     grpc_signing_key_path: Option<PathBuf>,
@@ -1550,6 +2152,22 @@ struct Args {
     /// Set to `1` to enable `GET /api/v1/host-stats/stream` (SSE) and WebSocket `/api/v1/host-stats/ws`.
     #[arg(long, env = "CONTROL_API_HOST_STATS_STREAM", default_value = "0")]
     host_stats_stream: u8,
+
+    /// Set to `1` to enable WebSocket interactive shell at `/api/v1/host-terminal/ws` (Unix; runs as the control-api OS user).
+    #[arg(long, env = "CONTROL_API_HOST_TERMINAL", default_value = "0")]
+    host_terminal: u8,
+
+    /// Shell for host terminal (absolute path). Env: `CONTROL_API_HOST_TERMINAL_SHELL`.
+    #[arg(
+        long,
+        env = "CONTROL_API_HOST_TERMINAL_SHELL",
+        default_value = "/bin/bash"
+    )]
+    host_terminal_shell: PathBuf,
+
+    /// Max WebSocket host-terminal session duration (seconds).
+    #[arg(long, env = "CONTROL_API_HOST_TERMINAL_SESSION_SECS", default_value_t = 3600)]
+    host_terminal_session_secs: u64,
 
     /// Root for credential files (PostgreSQL, etc.) and per-id dirs if server-side SMB is configured.
     /// `install.sh` creates `/var/lib/pirate/db-mounts` (SMB mounts themselves use Pirate Client, not the server).
@@ -1668,6 +2286,7 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         root = %args.deploy_root.display(),
         grpc = %args.grpc_endpoint,
+        max_artifact_upload_bytes = args.max_artifact_upload_bytes,
         port = args.listen_port,
         nginx_config = ?args.nginx_config_path,
         nginx_test_full = args.nginx_test_full_config,
@@ -1677,6 +2296,7 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         nginx_apply_site_script = %args.nginx_apply_site_script.display(),
         api_bearer = %if args.api_bearer_token.is_some() { "on" } else { "off" },
         jwt = %if args.jwt_secret.is_some() { "on" } else { "off" },
+        host_terminal = %if args.host_terminal != 0 { "on" } else { "off" },
         cors = %if std::env::var("CONTROL_API_CORS_ALLOW_ANY").ok().as_deref() == Some("1") {
             "allow_any"
         } else {
@@ -1736,6 +2356,7 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let host_stats_series_enabled = args.host_stats_series != 0;
     let host_stats_stream_enabled = args.host_stats_stream != 0;
+    let host_terminal_enabled = args.host_terminal != 0;
     let host_history = if host_stats_series_enabled {
         Some(Arc::new(Mutex::new(HostStatsHistory::default_new())))
     } else {
@@ -1815,6 +2436,9 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         host_stats_series_enabled,
         host_history,
         host_stats_stream_enabled,
+        host_terminal_enabled,
+        host_terminal_shell: args.host_terminal_shell.clone(),
+        host_terminal_session_secs: args.host_terminal_session_secs,
         explorer_connection_display,
         data_mounts_root: args.data_mounts_root.clone(),
         smb_mount_script: args.smb_mount_script.clone(),
@@ -1834,10 +2458,16 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         antiddos_state_dir: args.antiddos_state_dir.clone(),
         antiddos_apply_script: args.antiddos_apply_script.clone(),
         antiddos_limit_log_path: args.antiddos_limit_log_path.clone(),
+        max_artifact_upload_bytes_configured: args.max_artifact_upload_bytes,
+        deploy_http_chunk_bytes: args.deploy_http_chunk_bytes,
+        deploy_upload_session_chunk_bytes: args.deploy_upload_session_chunk_bytes,
+        deploy_upload_session_ttl_secs: args.deploy_upload_session_ttl_secs,
+        deploy_upload_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
     };
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/api/v1/ping", get(api_ping))
         .route("/api/v1/auth/login", post(api_login))
         .route("/api/v1/status", get(api_status))
         .route("/api/v1/projects/telemetry", get(api_project_telemetry))
@@ -1869,9 +2499,34 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/host-stats/series", get(api_host_stats_series))
         .route("/api/v1/host-stats/stream", get(api_host_stats_sse))
         .route("/api/v1/host-stats/ws", get(api_host_stats_ws))
+        .route(
+            "/api/v1/host-terminal/ws",
+            get(host_terminal::api_host_terminal_ws),
+        )
         .route("/api/v1/releases", get(api_releases))
         .route("/api/v1/projects", get(api_projects))
         .route("/api/v1/projects/allocate", post(api_projects_allocate))
+        // Register session routes before bare `deploy-artifact` (longer, static `session` path).
+        .route(
+            "/api/v1/projects/:project_id/deploy-artifact/session",
+            post(api_deploy_artifact_session_create),
+        )
+        .route(
+            "/api/v1/projects/:project_id/deploy-artifact/session/:upload_id/chunk",
+            put(api_deploy_artifact_session_chunk),
+        )
+        .route(
+            "/api/v1/projects/:project_id/deploy-artifact/session/:upload_id/complete",
+            post(api_deploy_artifact_session_complete),
+        )
+        .route(
+            "/api/v1/projects/:project_id/deploy-artifact/session/:upload_id",
+            delete(api_deploy_artifact_session_delete),
+        )
+        .route(
+            "/api/v1/projects/:project_id/deploy-artifact",
+            post(api_deploy_artifact_multipart),
+        )
         .route("/api/v1/history", get(api_history))
         .route("/api/v1/grpc-sessions", get(api_grpc_sessions))
         .route(
@@ -1983,7 +2638,11 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             put(antiddos_api::api_antiddos_project_put)
                 .delete(antiddos_api::api_antiddos_project_delete),
         )
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(
+            (args.max_artifact_upload_bytes as usize)
+                .saturating_add(64 * 1024 * 1024)
+                .max(10 * 1024 * 1024),
+        ))
         .layer(cors::build_cors_layer())
         .with_state(state);
 
@@ -1992,4 +2651,41 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!(listen = %addr, "listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod upload_limit_tests {
+    use super::effective_upload_limit_from_config_and_grpc;
+
+    #[test]
+    fn effective_min_when_grpc_smaller() {
+        assert_eq!(
+            effective_upload_limit_from_config_and_grpc(256 * 1024 * 1024, Some(100_000)),
+            100_000
+        );
+    }
+
+    #[test]
+    fn effective_min_when_config_smaller() {
+        assert_eq!(
+            effective_upload_limit_from_config_and_grpc(100_000, Some(256 * 1024 * 1024)),
+            100_000
+        );
+    }
+
+    #[test]
+    fn effective_uses_config_when_grpc_none() {
+        assert_eq!(
+            effective_upload_limit_from_config_and_grpc(100_000, None),
+            100_000
+        );
+    }
+
+    #[test]
+    fn effective_uses_config_when_grpc_zero() {
+        assert_eq!(
+            effective_upload_limit_from_config_and_grpc(100_000, Some(0)),
+            100_000
+        );
+    }
 }
