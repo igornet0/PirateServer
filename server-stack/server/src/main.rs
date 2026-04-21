@@ -83,8 +83,8 @@ struct Args {
     #[arg(short, long, default_value_t = 50051)]
     port: u16,
 
-    /// Maximum artifact size (bytes) for a single upload.
-    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    /// Maximum artifact size (bytes) for a single upload (`Upload` RPC). Env: `DEPLOY_MAX_UPLOAD_BYTES`.
+    #[arg(long, env = "DEPLOY_MAX_UPLOAD_BYTES", default_value_t = 256 * 1024 * 1024)]
     max_upload_bytes: u64,
 
     /// Maximum size (bytes) for server-stack OTA tarball (`UploadServerStack`).
@@ -318,6 +318,12 @@ async fn resource_benchmark_cmd(args: &Args) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Process-wide rustls crypto backend. Required when the workspace unifies both `ring` and
+/// `aws-lc-rs` on `rustls` (e.g. deploy-server + pirate-host-agent); otherwise QUIC TLS init panics.
+fn init_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 async fn dashboard_add_user_cmd(
     args: &Args,
     uargs: &DashboardUserArgs,
@@ -349,6 +355,7 @@ async fn dashboard_add_user_cmd(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_rustls_crypto_provider();
     let top = Top::parse();
     if matches!(top.command, Some(Commands::PrintInstallBundle)) {
         return print_install_bundle(&top.run);

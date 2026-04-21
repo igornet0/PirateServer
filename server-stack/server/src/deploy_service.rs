@@ -668,6 +668,7 @@ impl DeployServiceImpl {
             project_version,
             control_api_http_url: self.control_api_http_url.clone(),
             control_api_http_url_direct: self.control_api_http_url_direct.clone(),
+            max_upload_bytes: self.max_upload_bytes,
         }
     }
 
@@ -916,6 +917,147 @@ fn filter_busy_ports_excluding_same_project(
         .copied()
         .filter(|&p| !listen_port_owner::pid_listens_on_deploy_port(pid, p))
         .collect()
+}
+
+/// Ports to verify after stopping the managed process: runtime_state + `pirate.toml` services/proxy.
+fn collect_ports_for_remove_project(root: &Path) -> Vec<u16> {
+    let mut ports = BTreeSet::<u16>::new();
+    if let Some(rs) = process_manager::read_runtime_state(root) {
+        if rs.port > 0 {
+            ports.insert(rs.port);
+        }
+    }
+    if let Some(ver) = read_current_version_from_symlink(root) {
+        let rd = release_dir_for_version(root, &ver);
+        let p = rd.join("pirate.toml");
+        if let Ok(m) = PirateManifest::read_file(&p) {
+            for port in occupied_ports_from_manifest(&m) {
+                ports.insert(port);
+            }
+        }
+    }
+    ports.into_iter().collect()
+}
+
+/// After `stop_child`, wait until `127.0.0.1:<port>` can be bound again (or timeout). Returns ports still busy.
+async fn wait_until_listen_ports_free(ports: &[u16]) -> Vec<u16> {
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    const ATTEMPTS: u32 = 40;
+    const DELAY_MS: u64 = 50;
+    let mut busy = detect_busy_ports(ports);
+    for _ in 0..ATTEMPTS {
+        if busy.is_empty() {
+            return Vec::new();
+        }
+        tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
+        busy = detect_busy_ports(ports);
+    }
+    busy
+}
+
+/// True if `pid` is the managed process / its subtree, or clearly tied to this deploy tree (cwd,
+/// cmdline/exe path, or open files under `deploy_root`).
+fn pid_matches_this_project_deploy(
+    deploy_root: &std::path::Path,
+    rs: Option<&process_manager::RuntimeState>,
+    want_project_id: &str,
+    pid: u32,
+) -> bool {
+    if let Some(rs) = rs {
+        let got = normalize_project_id(&rs.project_id);
+        if !got.is_empty() && got != want_project_id {
+            return false;
+        }
+        if let Some(pp) = rs.pid.filter(|p| *p > 0) {
+            if pid == pp || listen_port_owner::pid_is_descendant_of(pid, pp) {
+                return true;
+            }
+        }
+    }
+    listen_port_owner::pid_cwd_starts_with_deploy_root(pid, deploy_root)
+        || listen_port_owner::pid_cmdline_or_exe_contains_deploy_root(pid, deploy_root)
+        || listen_port_owner::pid_has_open_file_under_deploy_root(pid, deploy_root)
+}
+
+fn remove_project_listeners_are_all_this_deployment(
+    deploy_root: &std::path::Path,
+    rs: &process_manager::RuntimeState,
+    want_project_id: &str,
+    port: u16,
+) -> bool {
+    let listeners = listen_port_owner::listener_pids_for_port(port);
+    if listeners.is_empty() {
+        return false;
+    }
+    listeners.iter().copied().all(|lp| {
+        pid_matches_this_project_deploy(deploy_root, Some(rs), want_project_id, lp)
+    })
+}
+
+/// When `runtime_state.json` is missing: treat listeners as "ours" only if every PID matches cwd/cmdline/fd heuristics.
+fn listeners_match_deploy_without_runtime_state(deploy_root: &std::path::Path, port: u16) -> bool {
+    let listeners = listen_port_owner::listener_pids_for_port(port);
+    if listeners.is_empty() {
+        return false;
+    }
+    listeners.iter().copied().all(|lp| {
+        pid_matches_this_project_deploy(deploy_root, None, "", lp)
+    })
+}
+
+/// After remove-project stop: drop ports that are still "busy" only because this deployment still
+/// holds them (same `project_id` in `runtime_state.json`, listener PID matches recorded PID / subtree,
+/// or process cwd / cmdline / open files under this project's deploy root). Avoids `FailedPrecondition` when e.g. Node
+/// keeps listening on 3000 after the shell parent was killed.
+fn filter_still_busy_ports_excluding_same_project_remove(
+    deploy_root: &std::path::Path,
+    want_project_id: &str,
+    still_busy: &[u16],
+) -> Vec<u16> {
+    let want = normalize_project_id(want_project_id);
+    let rs = process_manager::read_runtime_state(deploy_root);
+    match rs {
+        Some(rs) => {
+            let got = normalize_project_id(&rs.project_id);
+            if !got.is_empty() && got != want {
+                return still_busy.to_vec();
+            }
+            still_busy
+                .iter()
+                .copied()
+                .filter(|&p| {
+                    !remove_project_listeners_are_all_this_deployment(deploy_root, &rs, want.as_str(), p)
+                })
+                .collect()
+        }
+        None => still_busy
+            .iter()
+            .copied()
+            .filter(|&p| !listeners_match_deploy_without_runtime_state(deploy_root, p))
+            .collect(),
+    }
+}
+
+/// SIGKILL listener PIDs we can attribute to this deployment (after `stop_child` left Node alive).
+async fn try_sigkill_project_listeners_matching_deploy(
+    deploy_root: &std::path::Path,
+    want_project_id: &str,
+    ports: &[u16],
+) {
+    let want = normalize_project_id(want_project_id);
+    let rs = process_manager::read_runtime_state(deploy_root);
+    for &port in ports {
+        for pid in listen_port_owner::listener_pids_for_port(port) {
+            if pid_matches_this_project_deploy(deploy_root, rs.as_ref(), want.as_str(), pid) {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status()
+                    .await;
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -1524,12 +1666,52 @@ impl DeployService for DeployServiceImpl {
         let key = normalize_project_id(&inner.project_id);
         let root = project_deploy_root(&self.base_root, &inner.project_id);
 
+        let ports_to_check = collect_ports_for_remove_project(&root);
+
+        let mut had_managed_process = false;
         let mut map = self.states.lock().await;
         let st = map.entry(key.clone()).or_insert_with(AppState::default);
         if let Some(ref mut c) = st.child {
+            had_managed_process = true;
             stop_child(c).await;
             st.child = None;
         }
+        drop(map);
+
+        if !ports_to_check.is_empty() {
+            let mut still_busy = wait_until_listen_ports_free(&ports_to_check).await;
+            still_busy = filter_still_busy_ports_excluding_same_project_remove(
+                &root,
+                &key,
+                &still_busy,
+            );
+            if !still_busy.is_empty() {
+                try_sigkill_project_listeners_matching_deploy(&root, &key, &still_busy).await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                still_busy = wait_until_listen_ports_free(&ports_to_check).await;
+                still_busy = filter_still_busy_ports_excluding_same_project_remove(
+                    &root,
+                    &key,
+                    &still_busy,
+                );
+            }
+            if !still_busy.is_empty() {
+                let mut map = self.states.lock().await;
+                if let Some(st) = map.get_mut(&key) {
+                    st.state = "error".to_string();
+                    st.last_error = Some(format!(
+                        "RemoveProject: ports still listening after stop: {still_busy:?}"
+                    ));
+                }
+                drop(map);
+                return Err(Status::failed_precondition(format!(
+                    "ports still listening after stop: {still_busy:?}"
+                )));
+            }
+        }
+
+        let mut map = self.states.lock().await;
+        let st = map.entry(key.clone()).or_insert_with(AppState::default);
         st.current_version.clear();
         st.state = "stopped".to_string();
         st.last_error = None;
@@ -1558,18 +1740,30 @@ impl DeployService for DeployServiceImpl {
         }
 
         let mut removed_db_rows: u64 = 0;
+        let mut removed_deploy_events_rows: u64 = 0;
+        let mut removed_project_snapshots_rows: u64 = 0;
         if let Some(db) = self.db.clone() {
-            match db.delete_project_data(&key).await {
-                Ok(n) => removed_db_rows = n,
+            let stats = match db.delete_project_data(&key).await {
+                Ok(s) => s,
                 Err(e) => return Err(Status::internal(format!("remove db rows: {e}"))),
-            }
+            };
+            removed_db_rows = stats.total_rows();
+            removed_deploy_events_rows = stats.deploy_events;
+            removed_project_snapshots_rows = stats.project_snapshots;
         }
+
+        let verified_listen_ports: Vec<u32> = ports_to_check.iter().map(|&p| u32::from(p)).collect();
 
         Ok(Response::new(RemoveProjectResponse {
             status: "ok".to_string(),
             project_id: key,
             removed_root,
             removed_db_rows,
+            had_managed_process,
+            verified_listen_ports,
+            ports_still_busy: Vec::new(),
+            removed_deploy_events_rows,
+            removed_project_snapshots_rows,
         }))
     }
 
@@ -3919,5 +4113,78 @@ fn processes_detail_to_proto(d: &ProcessesDetail) -> ProcessesDetailProto {
         ts_ms: d.ts_ms,
         processes: d.processes.iter().map(process_row_to_proto).collect(),
         total: d.total as u64,
+    }
+}
+
+#[cfg(test)]
+mod remove_project_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn collect_ports_merges_runtime_state_port() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".pirate")).expect("mkdir");
+        let rs = process_manager::RuntimeState {
+            project_id: "p1".into(),
+            release_version: "v1".into(),
+            pid: Some(123),
+            port: 3456,
+            status: "running".into(),
+            restart_count: 0,
+            last_start_unix_ms: 0,
+            last_error: None,
+        };
+        process_manager::write_runtime_state(root, &rs).expect("write rs");
+        let ports = collect_ports_for_remove_project(root);
+        assert_eq!(ports, vec![3456]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_ports_includes_manifest_ports() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let rel = root.join("releases").join("v1");
+        std::fs::create_dir_all(&rel).expect("mkdir");
+        std::fs::write(
+            rel.join("pirate.toml"),
+            r#"[project]
+name = "p1"
+version = "1.0.0"
+
+[services.api]
+port = 8088
+"#,
+        )
+        .expect("write manifest");
+        std::os::unix::fs::symlink(
+            std::path::Path::new("releases").join("v1"),
+            root.join("current"),
+        )
+        .expect("symlink");
+        let ports = collect_ports_for_remove_project(root);
+        assert!(ports.contains(&8088));
+    }
+
+    #[test]
+    fn detect_busy_ports_sees_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let busy = detect_busy_ports(&[port]);
+        assert_eq!(busy, vec![port]);
+    }
+
+    #[tokio::test]
+    async fn wait_until_listen_ports_free_after_listener_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let still = wait_until_listen_ports_free(&[port]).await;
+        assert!(
+            still.is_empty(),
+            "expected port {port} free after drop, still busy: {still:?}"
+        );
     }
 }
