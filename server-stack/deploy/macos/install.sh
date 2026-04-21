@@ -271,7 +271,7 @@ shopt -u nullglob
 
 echo "==> libexec (launchd) -> /usr/local/libexec/pirate"
 install -d -m 0755 /usr/local/libexec/pirate
-for w in run-deploy-server.sh run-control-api.sh; do
+for w in run-deploy-server.sh run-control-api.sh run-host-agent.sh; do
   if [[ -f "$PIRATE_LIB_DIR/$w" ]]; then
     install -m 0755 "$PIRATE_LIB_DIR/$w" "/usr/local/libexec/pirate/$w"
   fi
@@ -289,7 +289,7 @@ echo "==> sudoers"
 SUDOERS_PIRATE=/etc/sudoers.d/99-pirate-smb
 cat >"$SUDOERS_PIRATE" <<'SUDOERS'
 # Pirate: non-interactive sudo for SMB helpers and stack OTA helper
-pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh
+pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh, /usr/local/lib/pirate/pirate-host-agent-reboot.sh
 SUDOERS
 chmod 0440 "$SUDOERS_PIRATE"
 if command -v visudo >/dev/null 2>&1; then
@@ -308,6 +308,27 @@ if [[ -f "$BIN_LOCAL/pirate" ]]; then
   install -m 0755 "$BIN_LOCAL/pirate" /usr/local/bin/pirate
 else
   ( cd /usr/local/bin && ln -sf client pirate )
+fi
+if [[ -f "$BIN_LOCAL/pirate-host-agent" ]]; then
+  echo "==> pirate-host-agent -> /usr/local/bin"
+  install -m 0755 "$BIN_LOCAL/pirate-host-agent" /usr/local/bin/pirate-host-agent
+  if [[ ! -f /etc/pirate-host-agent.env ]]; then
+    if command -v openssl >/dev/null 2>&1; then
+      _HA_TOKEN="$(openssl rand -hex 32)"
+    elif command -v python3 >/dev/null 2>&1; then
+      _HA_TOKEN="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+    else
+      echo "Ошибка: для токена pirate-host-agent нужен openssl или python3." >&2
+      exit 1
+    fi
+    umask 077
+    {
+      echo "PIRATE_HOST_AGENT_TOKEN=${_HA_TOKEN}"
+      echo "PIRATE_HOST_AGENT_BIND=127.0.0.1:9443"
+    } >/etc/pirate-host-agent.env
+    chmod 0600 /etc/pirate-host-agent.env
+    echo "Создан /etc/pirate-host-agent.env — сохраните токен для Pirate Client." >&2
+  fi
 fi
 
 if [[ -f "$SCRIPT_DIR/server-stack-manifest.json" ]]; then
@@ -383,7 +404,7 @@ chown root:pirate /etc/pirate-deploy.env
 
 echo "==> launchd"
 install -d -m 0755 /var/log/pirate
-for pl in com.pirate.deploy-server.plist com.pirate.control-api.plist; do
+for pl in com.pirate.deploy-server.plist com.pirate.control-api.plist com.pirate.host-agent.plist; do
   if [[ ! -f "$LAUNCHD_SRC/$pl" ]]; then
     echo "Не найдено: $LAUNCHD_SRC/$pl" >&2
     exit 1
@@ -392,8 +413,12 @@ for pl in com.pirate.deploy-server.plist com.pirate.control-api.plist; do
 done
 launchctl bootout system /Library/LaunchDaemons/com.pirate.deploy-server.plist 2>/dev/null || true
 launchctl bootout system /Library/LaunchDaemons/com.pirate.control-api.plist 2>/dev/null || true
+launchctl bootout system /Library/LaunchDaemons/com.pirate.host-agent.plist 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/com.pirate.deploy-server.plist
 launchctl bootstrap system /Library/LaunchDaemons/com.pirate.control-api.plist
+if [[ -f /usr/local/bin/pirate-host-agent ]]; then
+  launchctl bootstrap system /Library/LaunchDaemons/com.pirate.host-agent.plist
+fi
 
 if [[ "$pirate_NGINX" == "1" ]]; then
   echo "==> nginx (Homebrew)"

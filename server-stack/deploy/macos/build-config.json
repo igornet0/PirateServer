@@ -5,6 +5,7 @@
     { "src": "nginx-pirate-site.conf", "dst": "nginx/" },
     { "src": "nginx-pirate-site-domain.conf.in", "dst": "nginx/" },
     { "src": "nginx-pirate-api-only.conf", "dst": "nginx/" },
-    { "src": "nginx-pirate-api-only-domain.conf.in", "dst": "nginx/" }
+    { "src": "nginx-pirate-api-only-domain.conf.in", "dst": "nginx/" },
+    { "src": "pirate-host-agent-reboot.sh", "dst": "lib/pirate" }
   ]
 }

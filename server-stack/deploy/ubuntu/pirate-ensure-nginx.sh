@@ -39,8 +39,22 @@ server {
     root /var/lib/pirate/ui/dist;
     index index.html;
 
+    location = /login {
+        try_files /login.html =404;
+    }
+
     location / {
         try_files $uri $uri/ /index.html;
+    }
+
+    location ~ ^/api/.*/ws$ {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400s;
+        proxy_pass http://127.0.0.1:8080;
     }
 
     location /api/ {
@@ -61,6 +75,16 @@ else
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
+
+    location ~ ^/api/.*/ws$ {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400s;
+        proxy_pass http://127.0.0.1:8080;
+    }
 
     location /api/ {
         proxy_http_version 1.1;

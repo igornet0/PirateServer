@@ -74,6 +74,11 @@ if [[ -f "$BIN_DIR/pirate" ]]; then
 else
   ( cd /usr/local/bin && ln -sf client pirate )
 fi
+# Out-of-band lifecycle agent (same binary as in fresh install.sh); optional in older bundles.
+if [[ -f "$BIN_DIR/pirate-host-agent" ]]; then
+  echo "==> install pirate-host-agent -> /usr/local/bin"
+  install -m 0755 "$BIN_DIR/pirate-host-agent" /usr/local/bin/pirate-host-agent
+fi
 
 UI_SRC="$BUNDLE_ROOT/share/ui/dist"
 if [[ -f "$UI_SRC/index.html" ]]; then
@@ -89,12 +94,38 @@ fi
 
 SYSTEMD_SRC="$BUNDLE_ROOT/systemd"
 if [[ -d "$SYSTEMD_SRC" ]]; then
-  for u in deploy-server.service control-api.service; do
+  for u in deploy-server.service control-api.service pirate-host-agent.service; do
     if [[ -f "$SYSTEMD_SRC/$u" ]]; then
       install -m 0644 "$SYSTEMD_SRC/$u" "/etc/systemd/system/$u"
     fi
   done
   systemctl daemon-reload
+fi
+
+# First-time token + enable when the new bundle ships pirate-host-agent (OTA on hosts installed before host-agent existed).
+if [[ -f /usr/local/bin/pirate-host-agent ]] && [[ -f /etc/systemd/system/pirate-host-agent.service ]]; then
+  echo "==> pirate-host-agent (env + enable)"
+  if [[ ! -f /etc/pirate-host-agent.env ]]; then
+    if command -v openssl >/dev/null 2>&1; then
+      _HA_TOKEN="$(openssl rand -hex 32)"
+    elif command -v python3 >/dev/null 2>&1; then
+      _HA_TOKEN="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+    else
+      _HA_TOKEN=""
+    fi
+    if [[ -n "${_HA_TOKEN:-}" ]]; then
+      umask 077
+      {
+        echo "PIRATE_HOST_AGENT_TOKEN=${_HA_TOKEN}"
+        echo "PIRATE_HOST_AGENT_BIND=127.0.0.1:9443"
+      } >/etc/pirate-host-agent.env
+      chmod 0600 /etc/pirate-host-agent.env
+      echo "created /etc/pirate-host-agent.env — save the token for Pirate Client (host-agent)." >&2
+    else
+      echo "warning: could not generate /etc/pirate-host-agent.env (install openssl or python3), host-agent may fail to start" >&2
+    fi
+  fi
+  systemctl enable pirate-host-agent.service 2>/dev/null || true
 fi
 
 echo "$VERSION_LABEL" > /var/lib/pirate/server-stack-version
@@ -135,9 +166,9 @@ else
   cat >"$SUDOERS_PIRATE" <<'SUDOERS'
 # Pirate: non-interactive sudo for SMB helpers, stack OTA, and dashboard host env writer (control-api).
 # Legacy bundle without 99-pirate-smb.sudoers.fragment — NOPASSWD list must match install.sh.
-pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh, /usr/local/lib/pirate/pirate-write-deploy-env.sh, /usr/local/lib/pirate/pirate-ensure-nginx.sh, /usr/local/lib/pirate/pirate-nginx-apply-site.sh, /usr/local/lib/pirate/pirate-host-service.sh, /usr/local/lib/pirate/pirate-antiddos-apply.sh
+pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh, /usr/local/lib/pirate/pirate-write-deploy-env.sh, /usr/local/lib/pirate/pirate-ensure-nginx.sh, /usr/local/lib/pirate/pirate-nginx-apply-site.sh, /usr/local/lib/pirate/pirate-host-service.sh, /usr/local/lib/pirate/pirate-antiddos-apply.sh, /usr/local/lib/pirate/pirate-host-agent-reboot.sh
 SUDOERS
-chmod 0440 "$SUDOERS_PIRATE"
+  chmod 0440 "$SUDOERS_PIRATE"
 fi
 if command -v visudo >/dev/null 2>&1; then
   visudo -c -f "$SUDOERS_PIRATE" >/dev/null
@@ -306,5 +337,10 @@ systemd-run --unit="pirate-restart-stack-${STAMP}" --on-active=2s \
 
 systemd-run --unit="pirate-restart-ca-${STAMP}" --on-active=5s \
   /usr/bin/systemctl restart control-api.service
+
+if [[ -f /etc/systemd/system/pirate-host-agent.service ]] && [[ -f /usr/local/bin/pirate-host-agent ]]; then
+  systemd-run --unit="pirate-restart-ha-${STAMP}" --on-active=7s \
+    /usr/bin/systemctl restart pirate-host-agent.service
+fi
 
 echo "ok: server-stack $VERSION_LABEL staged; services will restart shortly"

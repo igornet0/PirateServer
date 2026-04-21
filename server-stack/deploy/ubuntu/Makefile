@@ -20,6 +20,11 @@ ENV_FILE ?= /etc/pirate-deploy.env
 DEPLOY_ROOT ?= /var/lib/pirate/deploy
 PROJECT ?= default
 
+# Helpers: из распакованного архива (lib/pirate/) или после install.sh → /usr/local/lib/pirate
+LIB_PIRATE := $(shell if [ -d "$(CURDIR)/lib/pirate" ]; then echo "$(CURDIR)/lib/pirate"; else echo "/usr/local/lib/pirate"; fi)
+PIRATE_DASHBOARD_ADD := $(LIB_PIRATE)/pirate-dashboard-add-user.sh
+PIRATE_API_NET_WIZ := $(LIB_PIRATE)/pirate-api-network-wizard.sh
+
 # Маркер из архива UI_BUILD=0 (make install-ui / install-all тогда недоступны).
 NO_UI := $(wildcard .bundle-no-ui)
 
@@ -29,7 +34,7 @@ CLIENT_ENDPOINT = $(if $(strip $(ENDPOINT)),$(ENDPOINT),$(if $(strip $(GRPC_ENDP
 
 EP := --endpoint $(CLIENT_ENDPOINT)
 
-.PHONY: help status pair print-bundle deploy rollback dashboard-user-add dashboard-user-add-interactive
+.PHONY: help status pair print-bundle deploy rollback dashboard-user-add dashboard-user-add-interactive api-network-wizard
 
 help:
 	@echo "Pirate — client на сервере"
@@ -46,17 +51,17 @@ help:
 	@echo "  make print-bundle    — JSON для pair (нужен установленный стек, пользователь pirate)"
 	@echo "  make deploy DIR=… VERSION=… — загрузить каталог как релиз"
 	@echo "  make rollback VERSION=… — откат на версию под releases/"
-	@echo "  make dashboard-user-add DASH_USER=… DASH_PASS=… — пользователь веб-дашборда (Argon2 в БД)"
-	@echo "  make dashboard-user-add-interactive — то же, запрос имени и пароля в терминале"
+	@echo "  make dashboard-user-add DASH_USER=… DASH_PASS=… — пользователь дашборда; JWT в env при необходимости + restart control-api"
+	@echo "  make dashboard-user-add-interactive — то же, запрос логина/пароля"
+	@echo "  sudo make api-network-wizard — доступ API/дашборда: LAN или публично (nginx vs прямой :8080, URL в env)"
 	@echo ""
 	@echo "До install.sh: CLIENT=./bin/client ENV_FILE= make status"
 	@echo "Свой endpoint: ENDPOINT=http://127.0.0.1:50051 make status"
 
 install-clear:
 	sudo ./install.sh
-
-install-nginx:
-	sudo ./install.sh --nginx
+	@echo "Установка завершена. Настройка сети API/дашборда..."
+	${MAKE} api-network-wizard
 
 install-ui:
 ifeq ($(strip $(NO_UI)),)
@@ -65,6 +70,7 @@ else
 	@echo >&2 "Этот архив собран без UI (.bundle-no-ui); установка UI недоступна."
 	@exit 1
 endif
+	${MAKE} api-network-wizard
 
 install-all:
 ifeq ($(strip $(NO_UI)),)
@@ -73,6 +79,7 @@ else
 	@echo >&2 "Этот архив собран без UI (.bundle-no-ui); установка UI недоступна. Используйте: sudo make install-nginx"
 	@exit 1
 endif
+	${MAKE} api-network-wizard
 
 status:
 	@"$(CLIENT)" $(EP) --project "$(PROJECT)" status
@@ -93,8 +100,8 @@ rollback:
 	@if [[ -z "$(VERSION)" ]]; then echo "Задайте VERSION=имя_каталога_в_releases"; exit 1; fi
 	@"$(CLIENT)" $(EP) --project "$(PROJECT)" rollback "$(VERSION)"
 
-# Имя и пароль пользователя веб-дашборда (control-api JWT + таблица dashboard_users).
-# Альтернатива: DEPLOY_DASHBOARD_PASSWORD=… sudo -u pirate … dashboard-add-user --username u (без DASH_PASS).
+# Имя и пароль пользователя веб-дашборда (Argon2 в БД). Скрипт добавляет CONTROL_API_JWT_SECRET при отсутствии и перезапускает control-api.
+# Альтернатива: DEPLOY_DASHBOARD_PASSWORD в env для deploy-server (редко нужно).
 DASH_USER ?=
 DASH_PASS ?=
 
@@ -103,10 +110,16 @@ dashboard-user-add:
 		echo >&2 "Укажите DASH_USER=логин DASH_PASS=пароль (или см. dashboard-user-add-interactive)"; \
 		exit 1; \
 	fi
-	@sudo -u pirate bash -c 'set -a; [[ -f "$(ENV_FILE)" ]] && . "$(ENV_FILE)"; set +a; exec "$(DEPLOY_SERVER)" --root "$(DEPLOY_ROOT)" dashboard-add-user --username "$(DASH_USER)" --password "$(DASH_PASS)"'
+	@test -x "$(PIRATE_DASHBOARD_ADD)" || { echo >&2 "Нет $(PIRATE_DASHBOARD_ADD) — обновите установку или скопируйте скрипты в lib/pirate/"; exit 1; }
+	@sudo PIRATE_DEPLOY_ENV="$(ENV_FILE)" DEPLOY_SERVER="$(DEPLOY_SERVER)" DEPLOY_ROOT="$(DEPLOY_ROOT)" \
+		"$(PIRATE_DASHBOARD_ADD)" "$(DASH_USER)" "$(DASH_PASS)"
 
 dashboard-user-add-interactive:
-	@sudo -u pirate bash -c 'set -a; [[ -f "$(ENV_FILE)" ]] && . "$(ENV_FILE)"; set +a; \
-	read -r -p "Имя пользователя дашборда: " _du; \
-	read -r -s -p "Пароль: " _dp; echo; \
-	exec "$(DEPLOY_SERVER)" --root "$(DEPLOY_ROOT)" dashboard-add-user --username "$$_du" --password "$$_dp"'
+	@test -x "$(PIRATE_DASHBOARD_ADD)" || { echo >&2 "Нет $(PIRATE_DASHBOARD_ADD) — обновите установку или скопируйте скрипты в lib/pirate/"; exit 1; }
+	@sudo PIRATE_DEPLOY_ENV="$(ENV_FILE)" DEPLOY_SERVER="$(DEPLOY_SERVER)" DEPLOY_ROOT="$(DEPLOY_ROOT)" \
+		"$(PIRATE_DASHBOARD_ADD)"
+
+# Интерактивно: LAN vs публичный доступ; если включён сайт nginx pirate — allow/deny в snippet; иначе bind 0.0.0.0 и URL :8080. Пишет DEPLOY_CONTROL_API_* и при необходимости DEPLOY_GRPC_PUBLIC_URL.
+api-network-wizard:
+	@test -x "$(PIRATE_API_NET_WIZ)" || { echo >&2 "Нет $(PIRATE_API_NET_WIZ) — обновите установку или скопируйте скрипты в lib/pirate/"; exit 1; }
+	@sudo PIRATE_DEPLOY_ENV="$(ENV_FILE)" "$(PIRATE_API_NET_WIZ)"

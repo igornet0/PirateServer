@@ -18,7 +18,7 @@
 # Явно задать домен: sudo pirate_DOMAIN=deploy.example.com ./install.sh  или  --domain deploy.example.com
 # Каталог: распакованный pirate-linux-amd64/ (рядом с bin/, share/, install.sh).
 # Состав бандла (см. scripts/linux-bundle-build.sh): bin/{deploy-server,control-api,client,pirate},
-#   systemd/*.service, nginx/*.conf*, lib/pirate/*.sh и 99-pirate-smb.sudoers.fragment, share/ui/dist (если не .bundle-no-ui),
+#   systemd/*.service, nginx/*.conf*, lib/pirate/*.sh и 99-pirate-smb.sudoers.fragment, bin/pirate-host-agent (если есть в архиве), share/ui/dist (если не .bundle-no-ui),
 #   server-stack-manifest.json, env.example.
 # Блок «GUI / трансляция»: сначала bin/pirate (или bin/client) gui-check из бандла, иначе pirate-gui-probe.sh;
 #   затем вопрос о display stream при gui_detected; см. PIRATE_DISPLAY_STREAM_CONSENT в /etc/pirate-deploy.env
@@ -474,7 +474,7 @@ chmod 0644 /var/lib/pirate/original-bundle-path
 echo "==> sudoers (SMB helpers + OTA server-stack apply; только фиксированные пути)"
 # NOPASSWD list: single source of truth — 99-pirate-smb.sudoers.fragment (bundled under lib/pirate for OTA).
 SUDOERS_PIRATE=/etc/sudoers.d/99-pirate-smb
-SUDOERS_FRAG="$SCRIPT_DIR/99-pirate-smb.sudoers.fragment"
+SUDOERS_FRAG="$SCRIPT_DIR/lib/pirate/99-pirate-smb.sudoers.fragment"
 if [[ ! -f "$SUDOERS_FRAG" ]]; then
   echo "Ошибка: не найден $SUDOERS_FRAG" >&2
   exit 1
@@ -501,6 +501,10 @@ if [[ -f "$BIN_LOCAL/pirate" ]]; then
   install -m 0755 "$BIN_LOCAL/pirate" /usr/local/bin/pirate
 else
   ( cd /usr/local/bin && ln -sf client pirate )
+fi
+if [[ -f "$BIN_LOCAL/pirate-host-agent" ]]; then
+  echo "==> pirate-host-agent -> /usr/local/bin (out-of-band OTA / reboot)"
+  install -m 0755 "$BIN_LOCAL/pirate-host-agent" /usr/local/bin/pirate-host-agent
 fi
 
 if [[ -f "$SCRIPT_DIR/server-stack-manifest.json" ]]; then
@@ -592,8 +596,31 @@ chown root:pirate /etc/pirate-deploy.env
 echo "==> systemd"
 install -m 0644 "$SYSTEMD_SRC/deploy-server.service" /etc/systemd/system/deploy-server.service
 install -m 0644 "$SYSTEMD_SRC/control-api.service" /etc/systemd/system/control-api.service
+if [[ -f /usr/local/bin/pirate-host-agent ]] && [[ -f "$SYSTEMD_SRC/pirate-host-agent.service" ]]; then
+  install -m 0644 "$SYSTEMD_SRC/pirate-host-agent.service" /etc/systemd/system/pirate-host-agent.service
+  if [[ ! -f /etc/pirate-host-agent.env ]]; then
+    if command -v openssl >/dev/null 2>&1; then
+      _HA_TOKEN="$(openssl rand -hex 32)"
+    elif command -v python3 >/dev/null 2>&1; then
+      _HA_TOKEN="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+    else
+      echo "Ошибка: для токена pirate-host-agent нужен openssl или python3." >&2
+      exit 1
+    fi
+    umask 077
+    {
+      echo "PIRATE_HOST_AGENT_TOKEN=${_HA_TOKEN}"
+      echo "PIRATE_HOST_AGENT_BIND=127.0.0.1:9443"
+    } >/etc/pirate-host-agent.env
+    chmod 0600 /etc/pirate-host-agent.env
+    echo "Создан /etc/pirate-host-agent.env — сохраните токен для Pirate Client (out-of-band агент на 127.0.0.1:9443)." >&2
+  fi
+fi
 systemctl daemon-reload
 systemctl enable deploy-server.service control-api.service
+if [[ -f /etc/systemd/system/pirate-host-agent.service ]]; then
+  systemctl enable pirate-host-agent.service
+fi
 
 if [[ "$pirate_NGINX" == "1" ]]; then
   echo "==> nginx"
@@ -665,6 +692,11 @@ echo "==> перезапуск deploy-server (подхват authorized_peers п
 systemctl restart deploy-server.service
 sleep 1
 systemctl restart control-api.service
+
+if [[ -f /etc/systemd/system/pirate-host-agent.service ]]; then
+  echo "==> pirate-host-agent"
+  systemctl restart pirate-host-agent.service || true
+fi
 
 echo ""
 echo "Готово."

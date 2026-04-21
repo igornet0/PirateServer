@@ -89,6 +89,8 @@ sudo /usr/local/lib/pirate/pirate-firewall-apply.sh wan 50051
 
 Проверить архив локально перед загрузкой: из корня репозитория [`scripts/verify-server-stack-bundle-tar.sh`](../../../scripts/verify-server-stack-bundle-tar.sh) — распаковывает во временный каталог и проверяет наличие обоих бинарников в ожидаемом корне.
 
+**Два канала OTA:** обычное обновление — gRPC `UploadServerStack` к `deploy-server`. Если `deploy-server` или `control-api` не отвечают, используйте отдельный сервис **`pirate-host-agent`** (HTTP, токен в `/etc/pirate-host-agent.env`) и тот же `.tar.gz`; подробнее — [`docs/HOST_AGENT.md`](../../../docs/HOST_AGENT.md).
+
 ## Makefile в каталоге бандла
 
 Удобные обёртки над `install.sh` и CLI:

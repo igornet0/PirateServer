@@ -73,6 +73,10 @@ if [[ -f "$BIN_DIR/pirate" ]]; then
 else
   ( cd /usr/local/bin && ln -sf client pirate )
 fi
+if [[ -f "$BIN_DIR/pirate-host-agent" ]]; then
+  echo "==> install pirate-host-agent -> /usr/local/bin"
+  install -m 0755 "$BIN_DIR/pirate-host-agent" /usr/local/bin/pirate-host-agent
+fi
 
 UI_SRC="$BUNDLE_ROOT/share/ui/dist"
 if [[ -f "$UI_SRC/index.html" ]]; then
@@ -89,21 +93,45 @@ fi
 LAUNCHD_SRC="$BUNDLE_ROOT/launchd"
 if [[ -d "$LAUNCHD_SRC" ]]; then
   echo "==> launchd plists + libexec"
-  install -d -m 0755 /usr/local/libexec/pirate
-  for w in run-deploy-server.sh run-control-api.sh; do
+  install -d -m 0755 /usr/local/libexec/pirate /var/log/pirate
+  for w in run-deploy-server.sh run-control-api.sh run-host-agent.sh; do
     if [[ -f "$BUNDLE_ROOT/lib/pirate/$w" ]]; then
       install -m 0755 "$BUNDLE_ROOT/lib/pirate/$w" "/usr/local/libexec/pirate/$w"
     fi
   done
-  for p in com.pirate.deploy-server.plist com.pirate.control-api.plist; do
+  for p in com.pirate.deploy-server.plist com.pirate.control-api.plist com.pirate.host-agent.plist; do
     if [[ -f "$LAUNCHD_SRC/$p" ]]; then
       install -m 0644 "$LAUNCHD_SRC/$p" "/Library/LaunchDaemons/$p"
     fi
   done
+  if [[ -f /usr/local/bin/pirate-host-agent ]] && [[ -f /Library/LaunchDaemons/com.pirate.host-agent.plist ]]; then
+    if [[ ! -f /etc/pirate-host-agent.env ]]; then
+      if command -v openssl >/dev/null 2>&1; then
+        _HA_TOKEN="$(openssl rand -hex 32)"
+      elif command -v python3 >/dev/null 2>&1; then
+        _HA_TOKEN="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+      else
+        _HA_TOKEN=""
+      fi
+      if [[ -n "${_HA_TOKEN:-}" ]]; then
+        umask 077
+        {
+          echo "PIRATE_HOST_AGENT_TOKEN=${_HA_TOKEN}"
+          echo "PIRATE_HOST_AGENT_BIND=127.0.0.1:9443"
+        } >/etc/pirate-host-agent.env
+        chmod 0600 /etc/pirate-host-agent.env
+        echo "created /etc/pirate-host-agent.env — save the token for Pirate Client." >&2
+      fi
+    fi
+  fi
   launchctl bootout system "/Library/LaunchDaemons/com.pirate.deploy-server.plist" 2>/dev/null || true
   launchctl bootout system "/Library/LaunchDaemons/com.pirate.control-api.plist" 2>/dev/null || true
+  launchctl bootout system "/Library/LaunchDaemons/com.pirate.host-agent.plist" 2>/dev/null || true
   launchctl bootstrap system "/Library/LaunchDaemons/com.pirate.deploy-server.plist"
   launchctl bootstrap system "/Library/LaunchDaemons/com.pirate.control-api.plist"
+  if [[ -f /usr/local/bin/pirate-host-agent ]] && [[ -f /Library/LaunchDaemons/com.pirate.host-agent.plist ]]; then
+    launchctl bootstrap system "/Library/LaunchDaemons/com.pirate.host-agent.plist"
+  fi
 fi
 
 echo "$VERSION_LABEL" > /var/lib/pirate/server-stack-version
