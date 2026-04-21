@@ -15,7 +15,8 @@ service DeployService {
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
   rpc ValidateDeploy(ValidateDeployRequest) returns (ValidateDeployResponse);
 
-  // Stop app process and remove all deployed data for project (DB rows + files).
+  // Stop managed app process, verify declared listen ports are free, remove deploy files + deploy DB rows.
+  // See docs/REMOVE_PROJECT_GUARANTEES.md.
   rpc RemoveProject(RemoveProjectRequest) returns (RemoveProjectResponse);
 
   // Stop managed child without changing the active release (symlink unchanged).
@@ -122,6 +123,8 @@ message StatusResponse {
   string control_api_http_url = 7;
   // Direct control-api bind (e.g. `http://host:8080`) when it differs from the public URL (DEPLOY_CONTROL_API_DIRECT_URL or derived from gRPC host).
   string control_api_http_url_direct = 8;
+  // Maximum allowed size (bytes) for one project artifact upload (`Upload`); matches deploy-server policy.
+  uint64 max_upload_bytes = 9;
 }
 
 message RollbackRequest {
@@ -153,7 +156,18 @@ message RemoveProjectResponse {
   string status = 1;
   string project_id = 2;
   string removed_root = 3;
+  // Sum of rows deleted from deploy_events + project_snapshots (same as removed_deploy_events_rows + removed_project_snapshots_rows).
   uint64 removed_db_rows = 4;
+  // True if a tracked managed child existed and was stopped (kill + wait).
+  bool had_managed_process = 5;
+  // TCP ports probed after stop (127.0.0.1 bind); empty if nothing to check.
+  repeated uint32 verified_listen_ports = 6;
+  // If non-empty, removal aborted: listeners still present on these ports after stop/wait.
+  repeated uint32 ports_still_busy = 7;
+  // Rows deleted from deploy_events for this project_id.
+  uint64 removed_deploy_events_rows = 8;
+  // Rows deleted from project_snapshots for this project_id (0 or 1).
+  uint64 removed_project_snapshots_rows = 9;
 }
 
 message StopProcessRequest {
