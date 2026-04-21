@@ -37,12 +37,28 @@ function controlApiAuthLostMessage(msg: string): boolean {
   );
 }
 
+function isNetworkTimeoutLike(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return (
+    m.includes("timed out") ||
+    m.includes("timeout") ||
+    m.includes("operation timed out") ||
+    m.includes("connect error")
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 export type ServerProjectRow = {
   id: string;
   deployRoot: string;
   state: string;
   currentVersion: string;
   source: string;
+  /** deploy-server max artifact bytes (GetStatus) when available */
+  maxUploadBytes?: number | null;
   statusError?: string;
 };
 
@@ -250,14 +266,40 @@ export function ServerProjectsOverview({
     }
     setLoading(true);
     try {
-      await invoke("control_api_login", { baseUrl: base, username: u, password: p });
+      let lastErr: unknown = null;
+      for (let i = 0; i < 3; i += 1) {
+        try {
+          await invoke("control_api_login", { baseUrl: base, username: u, password: p });
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (!isNetworkTimeoutLike(String(e)) || i === 2) break;
+          await sleep(450 * (i + 1));
+        }
+      }
+      if (lastErr) throw lastErr;
       setPassword("");
       setUsername("");
       setSessionActive(true);
       setLoginMsg(null);
       await refresh();
     } catch (e) {
-      setLoginMsg(String(e));
+      const raw = String(e);
+      let probe = "";
+      let restartHint = false;
+      try {
+        probe = await invoke<string>("control_api_health_probe", { baseUrl: base });
+      } catch (probeErr) {
+        probe = `health_probe_error=${String(probeErr)}`;
+      }
+      try {
+        restartHint = await invoke<boolean>("control_api_recent_restart_hint");
+      } catch {
+        restartHint = false;
+      }
+      const suffix = ` (base=${base}; ${probe}; restart_recent=${restartHint})`;
+      setLoginMsg(raw.includes("(base=") ? raw : `${raw}${suffix}`);
     } finally {
       setLoading(false);
     }
@@ -462,6 +504,16 @@ export function ServerProjectsOverview({
                         <Copy className="h-4 w-4" />
                       </button>
                     </div>
+                    {selectedProject.maxUploadBytes != null && selectedProject.maxUploadBytes > 0 ? (
+                      <div className="rounded-lg border border-white/10 bg-black/30 px-2.5 py-1.5">
+                        <p className="text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                          {tr("Лимит загрузки артефакта", "Max artifact upload")}
+                        </p>
+                        <p className="font-mono text-[11px] text-slate-400">
+                          {selectedProject.maxUploadBytes.toLocaleString()} {tr("байт", "bytes")}
+                        </p>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
                 <button

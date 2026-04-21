@@ -1,8 +1,7 @@
 /**
  * Best-effort control-api HTTP base from a deploy-server gRPC URL.
- * Prefer the same host without an explicit port (nginx / TLS on :80 or :443).
- * Use an explicit `:8080` only when control-api listens on all interfaces without a reverse proxy
- * (see `DEPLOY_CONTROL_API_PUBLIC_URL` and `CONTROL_API_BIND` in server `env.example`).
+ * Standard gRPC port `:50051` is mapped to control-api `:8080` (same as server `derive_control_api_url_from_grpc`).
+ * Other authorities without a port stay host-only (nginx on :80 / :443).
  */
 export function suggestControlApiFromGrpcUrl(endpoint: string): string | null {
   const s = endpoint.trim();
@@ -18,8 +17,10 @@ export function suggestControlApiFromGrpcUrl(endpoint: string): string | null {
   authority = authority.trim();
   if (!authority) return null;
 
+  let strippedStandardGrpc = false;
   if (authority.endsWith(":50051")) {
     authority = authority.slice(0, authority.length - ":50051".length);
+    strippedStandardGrpc = true;
   } else if (authority.startsWith("[")) {
     const close = authority.indexOf("]");
     if (close > 0) {
@@ -35,5 +36,8 @@ export function suggestControlApiFromGrpcUrl(endpoint: string): string | null {
     }
   }
 
+  if (strippedStandardGrpc) {
+    return `${scheme}://${authority}:8080`;
+  }
   return `${scheme}://${authority}`;
 }

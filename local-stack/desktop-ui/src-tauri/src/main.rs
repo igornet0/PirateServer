@@ -277,6 +277,16 @@ fn set_control_api_base(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn mark_control_api_recent_restart(seconds: Option<i64>) -> Result<(), String> {
+    pirate_desktop::mark_control_api_recent_restart(seconds.unwrap_or(90))
+}
+
+#[tauri::command]
+fn control_api_recent_restart_hint() -> bool {
+    pirate_desktop::control_api_recent_restart_hint()
+}
+
+#[tauri::command]
 fn fetch_remote_host_stats() -> Result<String, String> {
     pirate_desktop::fetch_host_stats_json()
 }
@@ -363,17 +373,28 @@ fn pick_deploy_directory() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn deploy_from_directory(
+async fn deploy_from_directory(
+    app: tauri::AppHandle,
     directory: String,
     version: String,
     chunk_size: Option<u32>,
 ) -> Result<pirate_desktop::DeployOutcome, String> {
     let chunk = chunk_size.unwrap_or(64 * 1024) as usize;
-    pirate_desktop::deploy::run_deploy(
-        std::path::PathBuf::from(directory),
-        version,
-        chunk,
-    )
+    let dir = PathBuf::from(directory);
+    let app2 = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let rt = pirate_desktop::deploy::runtime().map_err(|e| e.to_string())?;
+        rt.block_on(pirate_desktop::deploy::run_deploy_with_progress_events(
+            dir,
+            version,
+            chunk,
+            move |ev| {
+                let _ = app2.emit("deploy-progress", &ev);
+            },
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -397,8 +418,11 @@ fn remove_server_project(project_id: String) -> Result<pirate_desktop::RemovePro
 }
 
 #[tauri::command]
-fn analyze_network_access(directory: String) -> Result<pirate_desktop::NetworkAccessAnalysis, String> {
-    pirate_desktop::analyze_network_access(PathBuf::from(directory))
+fn analyze_network_access(
+    directory: String,
+    overrides: Option<pirate_desktop::AnalyzeNetworkAccessOverrides>,
+) -> Result<pirate_desktop::NetworkAccessAnalysis, String> {
+    pirate_desktop::analyze_network_access(PathBuf::from(directory), overrides)
 }
 
 #[tauri::command]
@@ -459,6 +483,11 @@ fn control_api_login(base_url: String, username: String, password: String) -> Re
 }
 
 #[tauri::command]
+fn control_api_health_probe(base_url: String) -> Result<String, String> {
+    pirate_desktop::control_api_health_probe(&base_url)
+}
+
+#[tauri::command]
 fn control_api_logout() -> Result<(), String> {
     pirate_desktop::control_api_logout()
 }
@@ -466,6 +495,11 @@ fn control_api_logout() -> Result<(), String> {
 #[tauri::command]
 fn control_api_session_active() -> bool {
     pirate_desktop::control_api_session_active()
+}
+
+#[tauri::command]
+fn control_api_bearer_token() -> Result<String, String> {
+    pirate_desktop::control_api_bearer_token()
 }
 
 #[tauri::command]
@@ -657,6 +691,45 @@ fn activate_server_bookmark(url: String) -> Result<pirate_desktop::GrpcConnectRe
 #[tauri::command]
 fn rename_server_bookmark(id: String, label: String) -> Result<(), String> {
     pirate_desktop::set_bookmark_label(&id, label)
+}
+
+#[tauri::command]
+fn save_bookmark_host_agent(
+    id: String,
+    host_agent_base_url: String,
+    host_agent_token: String,
+) -> Result<(), String> {
+    pirate_desktop::set_bookmark_host_agent(&id, &host_agent_base_url, &host_agent_token)
+}
+
+#[tauri::command]
+fn host_agent_health_json(base_url: String) -> Result<String, String> {
+    pirate_desktop::host_agent_health_json(&base_url)
+}
+
+#[tauri::command]
+fn host_agent_status_json(base_url: String, token: String) -> Result<String, String> {
+    pirate_desktop::host_agent_status_json(&base_url, &token)
+}
+
+#[tauri::command]
+fn host_agent_reboot_json(base_url: String, token: String, delay_sec: u64) -> Result<String, String> {
+    pirate_desktop::host_agent_reboot_json(&base_url, &token, delay_sec, None)
+}
+
+#[tauri::command]
+fn host_agent_upload_server_stack_cmd(
+    base_url: String,
+    token: String,
+    path: String,
+    version: String,
+) -> Result<String, String> {
+    pirate_desktop::host_agent_upload_server_stack(
+        &base_url,
+        &token,
+        std::path::Path::new(&path),
+        &version,
+    )
 }
 
 #[tauri::command]
@@ -881,6 +954,8 @@ fn main() {
             refresh_grpc_status, // refresh gRPC endpoint status
             get_control_api_base, // control-api base URL
             set_control_api_base, // set control-api base URL
+            mark_control_api_recent_restart, // mark restart window for diagnostics/retry
+            control_api_recent_restart_hint, // true while restart window is active
             get_active_project, // active project ID
             set_active_project, // set active project ID
             pick_deploy_directory, // pick deploy directory
@@ -900,8 +975,10 @@ fn main() {
             local_dev_status, // local stack: status
             probe_local_toolchain, // local CLI toolchain probe
             control_api_login, // control-api JWT login
+            control_api_health_probe, // quick GET /health probe
             control_api_logout, // clear control-api JWT
             control_api_session_active, // JWT present and not expired (for UI)
+            control_api_bearer_token, // JWT for WebSocket access_token (host terminal)
             control_api_fetch_status_json, // GET /api/v1/status (JWT)
             control_api_fetch_project_telemetry_json, // GET /api/v1/projects/telemetry (JWT)
             control_api_clear_project_runtime_log, // POST /api/v1/projects/telemetry/clear (JWT)
@@ -937,6 +1014,11 @@ fn main() {
             add_server_bookmark, // add server bookmark
             activate_server_bookmark, // activate server bookmark
             rename_server_bookmark, // rename server bookmark
+            save_bookmark_host_agent, // out-of-band host-agent URL + token
+            host_agent_health_json,
+            host_agent_status_json,
+            host_agent_reboot_json,
+            host_agent_upload_server_stack_cmd,
             monitoring_api_base, // monitoring API base URL
             monitoring_set_economy, // set monitoring economy mode
             start_display_ingest, // start display ingest

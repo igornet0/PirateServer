@@ -11,6 +11,7 @@
  * - `projects_preflight` — проверки перед деплоем (JSON)
  * - `list_registered_projects` / `register_project_from_directory` / `remove_registered_project` — локальный реестр папок
  * - `deploy_upload_cancel` / `server_stack_upload_cancel` — прерывание потока чанков (best-effort)
+ * - `deploy-progress` — этапы деплоя (prepare/archive/upload/apply) и байты при отправке
  * - `pick_server_stack_tar_gz` / `apply_server_stack_update` / `fetch_server_stack_info_cmd` (OTA host bundle)
  * - `start_display_ingest` / `display_ingest_base` / `display_ingest_export_consumer_config` — display stream receive
  * - `get_display_stream_prefs` / `set_display_stream_prefs` — local stream send/receive flags
@@ -85,6 +86,8 @@ type ServerBookmark = {
   id: string;
   label: string;
   url: string;
+  host_agent_base_url?: string | null;
+  host_agent_token?: string | null;
 };
 
 type DeployOutcome = {
@@ -92,7 +95,48 @@ type DeployOutcome = {
   deployedVersion: string;
   artifactBytes: number;
   chunkCount: number;
+  /** `grpc` | `http_chunked` | `http_multipart` when the desktop chose a transport */
+  uploadChannel?: string;
 };
+
+function formatArtifactSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return String(bytes);
+  const mib = bytes / (1024 * 1024);
+  if (mib >= 0.01 && mib < 1024) return `${mib.toFixed(2)} MiB (${bytes} B)`;
+  const gib = bytes / (1024 * 1024 * 1024);
+  if (gib >= 1) return `${gib.toFixed(2)} GiB (${bytes} B)`;
+  return `${bytes} B`;
+}
+
+/** Payload from Tauri `deploy-progress` (Rust `DeployProgressEvent`, camelCase). */
+type DeployProgressPayload = {
+  phase: string;
+  uploadSent?: number;
+  uploadTotal?: number;
+  /** Sub-status from desktop (resumable session, chunk retries, finalize). */
+  detail?: string;
+};
+
+function deployUiPercent(ev: DeployProgressPayload): number {
+  const p = ev.phase;
+  if (p === "prepare") return 8;
+  if (p === "archive") return 24;
+  if (p === "upload") {
+    const s = ev.uploadSent ?? 0;
+    const t = ev.uploadTotal ?? 0;
+    if (t > 0) return 30 + Math.min(62, Math.round((62 * s) / t));
+    return 34;
+  }
+  if (p === "apply") return 96;
+  return 4;
+}
+
+/** Default stack version label from bundle path: filename without `.tar.gz` (or `.tgz`). */
+function stackVersionLabelFromBundlePath(filePath: string): string {
+  const trimmed = filePath.trim();
+  const base = trimmed.split(/[/\\]/).pop() ?? trimmed;
+  return base.replace(/\.tar\.gz$/i, "").replace(/\.tgz$/i, "");
+}
 
 type ServerStackOutcome = {
   status: string;
@@ -245,8 +289,35 @@ export function Dashboard() {
   const [deployVersion, setDeployVersion] = useState("v1.0.0");
   const [deploying, setDeploying] = useState(false);
   const [deployProgress, setDeployProgress] = useState(0);
+  /** Current deploy pipeline stage from backend (`prepare` → `apply`). */
+  const [deployPhaseKey, setDeployPhaseKey] = useState<string | null>(null);
+  const [deployPhaseDetail, setDeployPhaseDetail] = useState<string | null>(null);
   const [deployMsg, setDeployMsg] = useState<string | null>(null);
   const [deployCancelRequested, setDeployCancelRequested] = useState(false);
+  const deployingRef = useRef(false);
+  useEffect(() => {
+    deployingRef.current = deploying;
+  }, [deploying]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<DeployProgressPayload>("deploy-progress", (event) => {
+      if (!deployingRef.current) return;
+      const ev = event.payload;
+      setDeployPhaseKey(ev.phase);
+      const d = ev.detail?.trim();
+      setDeployPhaseDetail(d ? d : null);
+      setDeployProgress(deployUiPercent(ev));
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const [paasMsg, setPaasMsg] = useState<string | null>(null);
   const [paasBusy, setPaasBusy] = useState(false);
@@ -676,12 +747,13 @@ export function Dashboard() {
       /* proceed with deploy if analysis fails */
     }
     setDeploying(true);
-    setDeployProgress(0);
+    setDeployProgress(4);
+    setDeployPhaseKey("prepare");
+    setDeployPhaseDetail(null);
     setDeployCancelRequested(false);
-    setDeployMsg("Packaging and uploading…");
-    const steps = window.setInterval(() => {
-      setDeployProgress((p) => Math.min(92, p + 6));
-    }, 220);
+    setDeployMsg(
+      tr("Идёт деплой на сервер…", "Deploying to server…"),
+    );
     try {
       // await invoke<DeployOutcome>("deploy_from_directory", { directory, version, chunkSize: null });
       const r = await invoke<DeployOutcome>("deploy_from_directory", {
@@ -696,7 +768,7 @@ export function Dashboard() {
         });
       } else {
         setDeployMsg(
-          `OK: ${r.status} → ${r.deployedVersion} (${r.artifactBytes} bytes, ${r.chunkCount} chunks)`,
+          `OK: ${r.status} → ${r.deployedVersion} (${formatArtifactSize(r.artifactBytes)}, ${r.chunkCount} chunks${r.uploadChannel ? `, ${r.uploadChannel}` : ""})`,
         );
         toast.success(t("auto.Dashboard_tsx.4"), { description: r.deployedVersion });
       }
@@ -712,9 +784,12 @@ export function Dashboard() {
       setDeployMsg(msg);
       toast.error(t("auto.Dashboard_tsx.5"), { description: msg });
     } finally {
-      window.clearInterval(steps);
       setDeploying(false);
-      setTimeout(() => setDeployProgress(0), 800);
+      setDeployPhaseKey(null);
+      setDeployPhaseDetail(null);
+      setTimeout(() => {
+        setDeployProgress(0);
+      }, 800);
     }
   };
 
@@ -814,7 +889,10 @@ export function Dashboard() {
       const p = await invoke<string | null>("pick_server_stack_tar_gz");
       setStackPath(p ?? null);
       if (!p) setStackMsg("No bundle file selected.");
-      else setStackMsg(null);
+      else {
+        setStackMsg(null);
+        setStackVersion(stackVersionLabelFromBundlePath(p));
+      }
     } catch (e) {
       setStackMsg(String(e));
     }
@@ -1055,6 +1133,8 @@ export function Dashboard() {
                     deployVersion={deployVersion}
                     deploying={deploying}
                     deployProgress={deployProgress}
+                    deployPhaseKey={deployPhaseKey}
+                    deployPhaseDetail={deployPhaseDetail}
                     deployMsg={deployMsg}
                     deployCancelRequested={deployCancelRequested}
                     paasBusy={paasBusy}
@@ -1769,7 +1849,7 @@ export function Dashboard() {
                 value={stackVersion}
                 onChange={(e) => setStackVersion(e.target.value)}
                 className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35"
-                placeholder="20260411"
+                placeholder={tr("из имени .tar.gz при выборе файла", "from .tar.gz filename when you pick")}
               />
             </label>
             <div className="mt-4 flex flex-wrap gap-2">

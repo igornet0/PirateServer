@@ -87,6 +87,12 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
         type: "string",
       },
       {
+        key: "DEPLOY_MAX_UPLOAD_BYTES",
+        label: "Макс. размер артефакта проекта (байты)",
+        hint: "gRPC и HTTP (control-api: chunked session + legacy multipart); совпадает с --max-upload-bytes deploy-server. Пример: 268435456 = 256 MiB. Задайте одинаково для deploy-server и control-api, затем перезапустите оба сервиса.",
+        type: "string",
+      },
+      {
         key: "DEPLOY_KEYS_DIR",
         label: "Каталог ключей",
         hint: "По умолчанию DEPLOY_ROOT/.keys",

@@ -71,6 +71,26 @@ type DeployValidationReport = {
 type AccessMode = "local" | "lan" | "public";
 type RouteRow = { path: string; target: string };
 
+function formatServerNginxFetchErr(raw: string, language: string): string {
+  const m = raw.toLowerCase();
+  if (language === "ru") {
+    if (m.includes("control-api base url is not set")) {
+      return `${raw}\n\nПодключитесь к deploy-server (GetStatus подставит HTTP base) или задайте control-api URL в настройках закладки.`;
+    }
+    if (m.includes("401") || m.includes("sign in") || m.includes("session expired")) {
+      return `${raw}\n\nВойдите в разделе «Проекты на сервере» (JWT для control-api).`;
+    }
+  } else {
+    if (m.includes("control-api base url is not set")) {
+      return `${raw}\n\nConnect to deploy-server (GetStatus sets the HTTP base) or set the control-api URL in bookmark settings.`;
+    }
+    if (m.includes("401") || m.includes("sign in") || m.includes("session expired")) {
+      return `${raw}\n\nSign in under Server projects (JWT for control-api).`;
+    }
+  }
+  return raw;
+}
+
 function ProgressBarMini({ ratio }: { ratio: number }) {
   const w = Math.min(100, Math.max(0, ratio * 100));
   return (
@@ -117,11 +137,15 @@ function StepDot({
   );
 }
 
+const DEPLOY_PHASE_ORDER = ["prepare", "archive", "upload", "apply"] as const;
+
 export function ProjectsPanel({
   deployDir,
   deployVersion,
   deploying,
   deployProgress,
+  deployPhaseKey,
+  deployPhaseDetail,
   deployMsg,
   deployCancelRequested,
   paasBusy,
@@ -146,6 +170,10 @@ export function ProjectsPanel({
   deployVersion: string;
   deploying: boolean;
   deployProgress: number;
+  /** Server-side deploy stage key (`prepare` … `apply`); only set while `deploying`. */
+  deployPhaseKey: string | null;
+  /** Optional line from desktop (upload session / retries / finalize). */
+  deployPhaseDetail: string | null;
   deployMsg: string | null;
   deployCancelRequested: boolean;
   paasBusy: boolean;
@@ -190,7 +218,8 @@ export function ProjectsPanel({
   const [networkMsg, setNetworkMsg] = useState<string | null>(null);
   const [hostSvcInstallBusyId, setHostSvcInstallBusyId] = useState<string | null>(null);
   const [nginxConfigModalOpen, setNginxConfigModalOpen] = useState(false);
-  const [nginxConfigTab, setNginxConfigTab] = useState<"local" | "server">("local");
+  const [controlApiBase, setControlApiBase] = useState<string | null>(null);
+  const nginxModalLocalRefreshDoneRef = useRef(false);
   const [serverNginxContent, setServerNginxContent] = useState<string | null>(null);
   const [serverNginxPath, setServerNginxPath] = useState<string | null>(null);
   const [serverNginxLoading, setServerNginxLoading] = useState(false);
@@ -324,8 +353,17 @@ export function ProjectsPanel({
     setNetworkBusy(true);
     setNetworkMsg(null);
     try {
+      const overrides: { domain?: string; routes?: { path: string; target: string }[] } = {};
+      if (accessMode === "public" && domain.trim()) {
+        overrides.domain = domain.trim();
+      }
+      if (routeRows.length > 0) {
+        overrides.routes = routeRows.map((r) => ({ path: r.path, target: r.target }));
+      }
+      const hasOverrides = Boolean(overrides.domain || (overrides.routes && overrides.routes.length > 0));
       const analysis = await invoke<NetworkAccessAnalysis>("analyze_network_access", {
         directory: deployDir,
+        ...(hasOverrides ? { overrides } : {}),
       });
       setNetworkAnalysis(analysis);
       if (endpoint) {
@@ -345,7 +383,25 @@ export function ProjectsPanel({
     } finally {
       setNetworkBusy(false);
     }
-  }, [deployDir, endpoint]);
+  }, [deployDir, endpoint, accessMode, domain, routeRows]);
+
+  useEffect(() => {
+    void invoke<string | null>("get_control_api_base")
+      .then((b) => setControlApiBase(b?.trim() ? b : null))
+      .catch(() => setControlApiBase(null));
+  }, [endpoint, nginxConfigModalOpen]);
+
+  useEffect(() => {
+    if (!nginxConfigModalOpen) {
+      nginxModalLocalRefreshDoneRef.current = false;
+      return;
+    }
+    if (!deployDir?.trim()) return;
+    if (networkAnalysis?.nginxPreview) return;
+    if (nginxModalLocalRefreshDoneRef.current) return;
+    nginxModalLocalRefreshDoneRef.current = true;
+    void refreshNetworkAccess();
+  }, [nginxConfigModalOpen, deployDir, networkAnalysis?.nginxPreview, refreshNetworkAccess]);
 
   const installMissingHostService = useCallback(
     async (id: string) => {
@@ -382,8 +438,9 @@ export function ProjectsPanel({
   }, [deployDir, refreshNetworkAccess, language]);
 
   useEffect(() => {
-    if (!nginxConfigModalOpen || nginxConfigTab !== "server") return;
-    if (!endpoint) {
+    if (!nginxConfigModalOpen) return;
+    const base = controlApiBase?.trim();
+    if (!base) {
       setServerNginxLoading(false);
       setServerNginxErr(null);
       setServerNginxContent(null);
@@ -408,7 +465,7 @@ export function ProjectsPanel({
       })
       .catch((e: unknown) => {
         if (!cancelled) {
-          setServerNginxErr(String(e));
+          setServerNginxErr(formatServerNginxFetchErr(String(e), language));
           setServerNginxContent(null);
           setServerNginxPath(null);
         }
@@ -419,11 +476,20 @@ export function ProjectsPanel({
     return () => {
       cancelled = true;
     };
-  }, [nginxConfigModalOpen, nginxConfigTab, endpoint, language]);
+  }, [nginxConfigModalOpen, controlApiBase, language]);
+
+  /** Latest refresh impl for effects that must not depend on `routeRows` / wizard fields (avoids analyze→setRouteRows→refresh loop). */
+  const refreshNetworkAccessRef = useRef(refreshNetworkAccess);
+  refreshNetworkAccessRef.current = refreshNetworkAccess;
 
   useEffect(() => {
-    void refreshNetworkAccess();
-  }, [refreshNetworkAccess]);
+    if (!deployDir?.trim()) {
+      setNetworkAnalysis(null);
+      setNetworkValidation(null);
+      return;
+    }
+    void refreshNetworkAccessRef.current();
+  }, [deployDir, endpoint]);
 
   useEffect(() => {
     const services = networkAnalysis?.detection.services ?? [];
@@ -432,7 +498,15 @@ export function ProjectsPanel({
     const nextRoutes: RouteRow[] = [];
     if (web) nextRoutes.push({ path: "/", target: `web:${web.port}` });
     if (api) nextRoutes.push({ path: "/api", target: `api:${api.port}` });
-    setRouteRows(nextRoutes);
+    setRouteRows((prev) => {
+      if (
+        prev.length === nextRoutes.length &&
+        prev.every((p, i) => p.path === nextRoutes[i]?.path && p.target === nextRoutes[i]?.target)
+      ) {
+        return prev;
+      }
+      return nextRoutes;
+    });
   }, [networkAnalysis]);
 
   useEffect(() => {
@@ -458,10 +532,19 @@ export function ProjectsPanel({
         projectId: string;
         removedRoot: string;
         removedDbRows: number;
+        hadManagedProcess: boolean;
+        verifiedListenPorts: number[];
+        portsStillBusy: number[];
+        removedDeployEventsRows: number;
+        removedProjectSnapshotsRows: number;
       }>("remove_server_project", {
         projectId: deleteCheck.projectId,
       });
-      const msg = `OK: ${r.status}, project=${r.projectId}, dbRows=${r.removedDbRows}`;
+      const ports =
+        r.verifiedListenPorts?.length > 0
+          ? `, portsVerified=${r.verifiedListenPorts.join(",")}`
+          : "";
+      const msg = `OK: ${r.status}, project=${r.projectId}, dbRows=${r.removedDbRows} (events=${r.removedDeployEventsRows}, snapshots=${r.removedProjectSnapshotsRows}), stopped=${r.hadManagedProcess}${ports}`;
       setDeleteMsg(msg);
       setDeleteConfirm(false);
       toast.success(t("auto.ProjectsPanel_tsx.6"), { description: r.projectId });
@@ -659,16 +742,63 @@ export function ProjectsPanel({
     </div>
   );
 
+  const deployPhaseLabel = (key: string) => {
+    switch (key) {
+      case "prepare":
+        return tr("Подготовка", "Prepare");
+      case "archive":
+        return tr("Архивация", "Archive");
+      case "upload":
+        return tr("Отправка", "Upload");
+      case "apply":
+        return tr("Запуск на сервере", "Apply on server");
+      default:
+        return key;
+    }
+  };
+
+  const deployPhaseIndex = deployPhaseKey
+    ? DEPLOY_PHASE_ORDER.indexOf(deployPhaseKey as (typeof DEPLOY_PHASE_ORDER)[number])
+    : -1;
+
   const contextDeploy = (
     <div className="border-b border-border-subtle px-3 py-3">
       <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">{t("auto.ProjectsPanel_tsx.27")}</p>
       {deploying ? (
-        <div className="mt-2">
+        <div className="mt-2 space-y-2">
           <div className="mb-1 flex justify-between text-[11px] text-slate-500">
-            <span>{t("auto.ProjectsPanel_tsx.28")}</span>
+            <span className="text-slate-300">
+              {deployPhaseKey ? deployPhaseLabel(deployPhaseKey) : t("auto.ProjectsPanel_tsx.28")}
+            </span>
             <span>{Math.round(deployProgress)}%</span>
           </div>
+          {deployPhaseDetail ? (
+            <p className="text-[10px] leading-snug text-slate-500" title={deployPhaseDetail}>
+              {deployPhaseDetail}
+            </p>
+          ) : null}
           <ProgressBarMini ratio={deployProgress / 100} />
+          <ol className="flex flex-wrap gap-1.5" aria-label={tr("Этапы деплоя", "Deploy stages")}>
+            {DEPLOY_PHASE_ORDER.map((k, i) => {
+              const done = deployPhaseIndex > i;
+              const current = deployPhaseIndex === i;
+              return (
+                <li
+                  key={k}
+                  className={`rounded-md border px-2 py-0.5 text-[10px] font-medium ${
+                    current
+                      ? "border-red-600/55 bg-red-950/40 text-red-100"
+                      : done
+                        ? "border-emerald-800/40 bg-emerald-950/25 text-emerald-200/90"
+                        : "border-border-subtle bg-black/20 text-slate-500"
+                  }`}
+                >
+                  {done && !current ? "✓ " : null}
+                  {deployPhaseLabel(k)}
+                </li>
+              );
+            })}
+          </ol>
         </div>
       ) : null}
       {deployMsg ? <p className="mt-2 font-mono text-[11px] text-slate-400">{deployMsg}</p> : null}
@@ -1365,11 +1495,8 @@ export function ProjectsPanel({
                   </button>
                   <button
                     type="button"
-                    disabled={!deployDir && !endpoint}
-                    onClick={() => {
-                      setNginxConfigModalOpen(true);
-                      setNginxConfigTab(deployDir ? "local" : "server");
-                    }}
+                    disabled={!deployDir && !endpoint && !controlApiBase}
+                    onClick={() => setNginxConfigModalOpen(true)}
                     className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200`}
                   >
                     {t("auto.ProjectsPanel_tsx.100")}
@@ -1622,68 +1749,71 @@ export function ProjectsPanel({
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <div className="flex gap-2 border-b border-white/10 px-5 py-2">
-              <button
-                type="button"
-                disabled={!deployDir}
-                onClick={() => setNginxConfigTab("local")}
-                className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
-                  nginxConfigTab === "local"
-                    ? "bg-red-950/50 text-red-100 ring-1 ring-red-800/50"
-                    : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
-                }`}
-              >
-                {tr("Локальное превью", "Local preview")}
-              </button>
-              <button
-                type="button"
-                disabled={!endpoint}
-                onClick={() => setNginxConfigTab("server")}
-                className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
-                  nginxConfigTab === "server"
-                    ? "bg-red-950/50 text-red-100 ring-1 ring-red-800/50"
-                    : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
-                }`}
-              >
-                {tr("На сервере", "On server")}
-              </button>
-            </div>
-            <div className="max-h-[min(70vh,560px)] overflow-auto px-5 py-4">
-              {nginxConfigTab === "local" ? (
-                <>
-                  {!deployDir ? (
-                    <p className="text-sm text-slate-500">{tr("Выберите каталог проекта.", "Pick a project folder.")}</p>
-                  ) : networkAnalysis?.nginxPreview ? (
-                    <pre className="whitespace-pre-wrap break-words rounded-lg bg-black/40 p-3 font-mono text-[11px] leading-relaxed text-slate-200">
-                      {networkAnalysis.nginxPreview}
-                    </pre>
-                  ) : (
-                    <p className="text-sm text-slate-400">
-                      {tr(
-                        "Превью пустое: нажмите «Обновить анализ» ниже или задайте маршруты в pirate.toml и сервисы.",
-                        "No preview yet: use “Refresh analysis” below or set routes in pirate.toml and services.",
-                      )}
-                    </p>
+            <div className="max-h-[min(70vh,560px)] space-y-5 overflow-auto px-5 py-4">
+              <section className="rounded-xl border border-white/10 bg-black/25 p-3">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  {tr("Локальное превью", "Local preview")}
+                </h4>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                  {tr(
+                    "Сгенерировано из pirate.toml и детекта сервисов; домен и маршруты из мастера сети (публичный режим и таблица маршрутов) подмешиваются в превью до сохранения в файл. Отдельно от глобального vhost на хосте и от релизного сниппета в «Проекты на сервере».",
+                    "Generated from pirate.toml and detected services; the network wizard domain and route table are merged into this preview before you save the file. Separate from the host vhost and the release snippet under Server projects.",
                   )}
-                </>
-              ) : !endpoint ? (
-                <p className="text-sm text-orange-200/90">{t("auto.ProjectsPanel_tsx.115")}</p>
-              ) : serverNginxLoading ? (
-                <div className="flex justify-center py-12 text-slate-500">
-                  <Loader2 className="h-8 w-8 animate-spin opacity-70" />
-                </div>
-              ) : serverNginxErr ? (
-                <p className="text-sm text-rose-300/90">{serverNginxErr}</p>
-              ) : (
-                <>
-                  {serverNginxPath ? (
-                    <p className="mb-2 font-mono text-[11px] text-slate-500">{serverNginxPath}</p>
-                  ) : null}
-                  <pre className="whitespace-pre-wrap break-words rounded-lg bg-black/40 p-3 font-mono text-[11px] leading-relaxed text-slate-200">
-                    {serverNginxContent ?? ""}
+                </p>
+                {!deployDir ? (
+                  <p className="mt-2 text-sm text-slate-500">{tr("Выберите каталог проекта.", "Pick a project folder.")}</p>
+                ) : networkBusy && !networkAnalysis?.nginxPreview ? (
+                  <div className="mt-3 flex justify-center py-8 text-slate-500">
+                    <Loader2 className="h-7 w-7 animate-spin opacity-70" />
+                  </div>
+                ) : networkAnalysis?.nginxPreview ? (
+                  <pre className="mt-3 whitespace-pre-wrap break-words rounded-lg bg-black/40 p-3 font-mono text-[11px] leading-relaxed text-slate-200">
+                    {networkAnalysis.nginxPreview}
                   </pre>
-                </>
-              )}
+                ) : (
+                  <p className="mt-2 text-sm text-slate-400">
+                    {tr(
+                      "Превью пустое: нажмите «Обновить анализ» в мастере сети или задайте маршруты в pirate.toml и сервисы.",
+                      "No preview yet: use “Refresh analysis” in the network wizard or set routes in pirate.toml and services.",
+                    )}
+                  </p>
+                )}
+              </section>
+
+              <section className="rounded-xl border border-white/10 bg-black/25 p-3">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  {tr("Nginx на сервере (control-api)", "Nginx on server (control-api)")}
+                </h4>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                  {tr(
+                    "Текущий файл сайта на хосте (обычно /etc/nginx/sites-available/pirate): UI дашборда и /api/ → control-api. Это общий vhost Pirate, не фрагмент из releases/…/pirate-nginx-snippet.conf.",
+                    "The site file on the host (typically /etc/nginx/sites-available/pirate): dashboard UI and /api/ to control-api. This is the shared Pirate vhost, not the per-release snippet under releases/…/pirate-nginx-snippet.conf.",
+                  )}
+                </p>
+                {!controlApiBase?.trim() ? (
+                  <p className="mt-2 text-sm text-orange-200/90">
+                    {tr(
+                      "HTTP base для control-api не задан: подключитесь к deploy-server или укажите URL в настройках закладки. Нужен JWT — войдите в «Проекты на сервере».",
+                      "control-api HTTP base is not set: connect to deploy-server or set the URL in bookmark settings. JWT required — sign in under Server projects.",
+                    )}
+                  </p>
+                ) : serverNginxLoading ? (
+                  <div className="mt-3 flex justify-center py-8 text-slate-500">
+                    <Loader2 className="h-7 w-7 animate-spin opacity-70" />
+                  </div>
+                ) : serverNginxErr ? (
+                  <p className="mt-2 whitespace-pre-wrap text-sm text-rose-300/90">{serverNginxErr}</p>
+                ) : (
+                  <>
+                    {serverNginxPath ? (
+                      <p className="mt-3 font-mono text-[11px] text-slate-500">{serverNginxPath}</p>
+                    ) : null}
+                    <pre className="mt-2 whitespace-pre-wrap break-words rounded-lg bg-black/40 p-3 font-mono text-[11px] leading-relaxed text-slate-200">
+                      {serverNginxContent ?? ""}
+                    </pre>
+                  </>
+                )}
+              </section>
             </div>
           </div>
         </div>

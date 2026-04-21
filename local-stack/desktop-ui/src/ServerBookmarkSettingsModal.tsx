@@ -12,6 +12,7 @@ import { HostServicesPanel } from "./HostServicesPanel";
 import { useI18n } from "./i18n";
 import { CopyablePre } from "./ui/CopyablePre";
 import { ModalDialog } from "./ui/ModalDialog";
+import { HostTerminalPanel } from "./HostTerminalPanel";
 
 const btnBase =
   "inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050204] active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50";
@@ -20,6 +21,9 @@ export type ServerBookmark = {
   id: string;
   label: string;
   url: string;
+  /** Out-of-band host-agent (optional). */
+  host_agent_base_url?: string | null;
+  host_agent_token?: string | null;
 };
 
 function normalizeGrpcUrl(s: string): string {
@@ -30,7 +34,29 @@ function waitForNextFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
-type TabId = "connect" | "info" | "env" | "services" | "antiddos" | "nginx" | "process";
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isNetworkTimeoutLike(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return (
+    m.includes("timed out") ||
+    m.includes("timeout") ||
+    m.includes("operation timed out") ||
+    m.includes("connect error")
+  );
+}
+
+type TabId =
+  | "connect"
+  | "terminal"
+  | "info"
+  | "env"
+  | "services"
+  | "antiddos"
+  | "nginx"
+  | "process";
 
 type Props = {
   open: boolean;
@@ -67,6 +93,7 @@ export function ServerBookmarkSettingsModal({
   const [loginBusy, setLoginBusy] = useState(false);
   const [sessionOk, setSessionOk] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [restartPendingUntil, setRestartPendingUntil] = useState(0);
 
   const [projectId, setProjectId] = useState("default");
   const [projectsLoading, setProjectsLoading] = useState(false);
@@ -120,6 +147,14 @@ export function ServerBookmarkSettingsModal({
   const [restartBusy, setRestartBusy] = useState(false);
   const [restartOut, setRestartOut] = useState<string | null>(null);
 
+  const [haBase, setHaBase] = useState("");
+  const [haToken, setHaToken] = useState("");
+  const [haOut, setHaOut] = useState<string | null>(null);
+  const [haBusy, setHaBusy] = useState(false);
+  const [haSaveBusy, setHaSaveBusy] = useState(false);
+  const [haStackVersion, setHaStackVersion] = useState("");
+  const restartPending = restartPendingUntil > Date.now();
+
   const sameServerAsActive = useMemo(() => {
     if (!activeEndpoint) return false;
     return normalizeGrpcUrl(bookmark.url) === normalizeGrpcUrl(activeEndpoint);
@@ -156,6 +191,10 @@ export function ServerBookmarkSettingsModal({
     setNginxProgressOpen(false);
     setNginxProgressValue(0);
     setNginxCancelRequested(false);
+    setHaBase((bookmark.host_agent_base_url ?? "").trim());
+    setHaToken(bookmark.host_agent_token ?? "");
+    setHaOut(null);
+    setHaStackVersion("");
     void (async () => {
       try {
         if (sameServerAsActive) {
@@ -177,7 +216,7 @@ export function ServerBookmarkSettingsModal({
         setSessionOk(false);
       }
     })();
-  }, [open, prefillBase, sameServerAsActive, bookmark.label]);
+  }, [open, prefillBase, sameServerAsActive, bookmark.label, bookmark.host_agent_base_url, bookmark.host_agent_token]);
 
   const saveListLabel = async () => {
     const label = listLabelDraft.trim();
@@ -198,6 +237,127 @@ export function ServerBookmarkSettingsModal({
       setListLabelErr(String(e));
     } finally {
       setListLabelBusy(false);
+    }
+  };
+
+  const saveHostAgentFields = async () => {
+    setHaSaveBusy(true);
+    setErr(null);
+    try {
+      await invoke("save_bookmark_host_agent", {
+        id: bookmark.id,
+        host_agent_base_url: haBase.trim(),
+        host_agent_token: haToken,
+      });
+      await onBookmarkRenamed?.();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setHaSaveBusy(false);
+    }
+  };
+
+  const hostAgentPingHealth = async () => {
+    if (!haBase.trim()) {
+      setErr(tr("Укажите base URL host-agent.", "Set host-agent base URL."));
+      return;
+    }
+    setHaBusy(true);
+    setHaOut(null);
+    setErr(null);
+    try {
+      const j = await invoke<string>("host_agent_health_json", { base_url: haBase.trim() });
+      setHaOut(j);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setHaBusy(false);
+    }
+  };
+
+  const hostAgentFetchStatus = async () => {
+    if (!haBase.trim() || !haToken.trim()) {
+      setErr(tr("Нужны base URL и токен.", "Base URL and token required."));
+      return;
+    }
+    setHaBusy(true);
+    setHaOut(null);
+    setErr(null);
+    try {
+      const j = await invoke<string>("host_agent_status_json", {
+        base_url: haBase.trim(),
+        token: haToken.trim(),
+      });
+      setHaOut(j);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setHaBusy(false);
+    }
+  };
+
+  const hostAgentReboot = async () => {
+    if (!haBase.trim() || !haToken.trim()) {
+      setErr(tr("Нужны base URL и токен.", "Base URL and token required."));
+      return;
+    }
+    if (
+      !window.confirm(
+        tr(
+          "Запланировать перезагрузку хоста через host-agent?",
+          "Schedule host reboot via host-agent?",
+        ),
+      )
+    ) {
+      return;
+    }
+    setHaBusy(true);
+    setHaOut(null);
+    setErr(null);
+    try {
+      const j = await invoke<string>("host_agent_reboot_json", {
+        base_url: haBase.trim(),
+        token: haToken.trim(),
+        delay_sec: 60,
+      });
+      setHaOut(j);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setHaBusy(false);
+    }
+  };
+
+  const hostAgentUploadStack = async () => {
+    if (!haBase.trim() || !haToken.trim()) {
+      setErr(tr("Нужны base URL и токен.", "Base URL and token required."));
+      return;
+    }
+    const ver = haStackVersion.trim();
+    if (!ver) {
+      setErr(tr("Укажите версию бандла (как в OTA).", "Enter bundle version label (as for OTA)."));
+      return;
+    }
+    setHaBusy(true);
+    setHaOut(null);
+    setErr(null);
+    try {
+      const path = await invoke<string | null>("pick_server_stack_tar_gz");
+      if (!path) {
+        setHaBusy(false);
+        return;
+      }
+      const j = await invoke<string>("host_agent_upload_server_stack_cmd", {
+        base_url: haBase.trim(),
+        token: haToken.trim(),
+        path,
+        version: ver,
+      });
+      setHaOut(j);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setHaBusy(false);
     }
   };
 
@@ -223,11 +383,37 @@ export function ServerBookmarkSettingsModal({
     setErr(null);
     try {
       await invoke("set_control_api_base", { url: controlBase.trim() });
-      await invoke("control_api_login", {
-        baseUrl: controlBase.trim(),
-        username: user.trim(),
-        password: pass,
-      });
+      const waitUntilReady = async () => {
+        if (!restartPending) return;
+        const base = controlBase.trim();
+        for (let i = 0; i < 8; i += 1) {
+          try {
+            const probe = await invoke<string>("control_api_health_probe", { baseUrl: base });
+            if (probe.includes("health_http=200")) return;
+          } catch {
+            // keep waiting inside restart window
+          }
+          await sleep(600);
+        }
+      };
+      await waitUntilReady();
+      let lastErr: unknown = null;
+      for (let i = 0; i < 3; i += 1) {
+        try {
+          await invoke("control_api_login", {
+            baseUrl: controlBase.trim(),
+            username: user.trim(),
+            password: pass,
+          });
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (!isNetworkTimeoutLike(String(e)) || i === 2) break;
+          await sleep(450 * (i + 1));
+        }
+      }
+      if (lastErr) throw lastErr;
       setPass("");
       setSessionOk(true);
       await loadProjectsHint();
@@ -347,6 +533,10 @@ export function ServerBookmarkSettingsModal({
               "File saved. If systemd/helper script is unavailable, restart services manually.",
             ),
       );
+      if (scheduled) {
+        setRestartPendingUntil(Date.now() + 90_000);
+        await invoke("mark_control_api_recent_restart", { seconds: 90 });
+      }
       setHostEnvDirty(false);
       await loadHostEnv();
     } catch (e) {
@@ -490,6 +680,10 @@ export function ServerBookmarkSettingsModal({
           };
         };
         setNginxEnvUpdate(parsed.env_update ?? null);
+        if (parsed.env_update?.restart_scheduled) {
+          setRestartPendingUntil(Date.now() + 90_000);
+          await invoke("mark_control_api_recent_restart", { seconds: 90 });
+        }
       } catch {
         setNginxEnvUpdate(null);
       }
@@ -544,6 +738,7 @@ export function ServerBookmarkSettingsModal({
 
   const tabs: { id: TabId; label: string }[] = [
     { id: "connect", label: t("auto.ServerBookmarkSettingsModal_tsx.4") },
+    { id: "terminal", label: tr("Терминал", "Terminal") },
     { id: "info", label: t("auto.ServerBookmarkSettingsModal_tsx.5") },
     { id: "env", label: t("auto.ServerBookmarkSettingsModal_tsx.6") },
     { id: "services", label: tr("Сервисы", "Services") },
@@ -566,7 +761,11 @@ export function ServerBookmarkSettingsModal({
         zClassName="z-modalServerSettings"
         closeOnBackdrop={false}
         closeOnEscape={!nginxProgressOpen}
-        panelClassName="w-full max-w-2xl max-h-[90vh] min-h-0"
+        panelClassName={
+          tab === "terminal"
+            ? "w-full max-w-5xl max-h-[90vh] min-h-0"
+            : "w-full max-w-2xl max-h-[90vh] min-h-0"
+        }
         aria-labelledby="srv-settings-title"
       >
         <div className="max-h-[90vh] w-full overflow-hidden rounded-2xl border border-white/10 bg-[#0a0908] shadow-2xl shadow-black/60">
@@ -734,7 +933,105 @@ export function ServerBookmarkSettingsModal({
                   {sessionOk ? t("auto.ServerBookmarkSettingsModal_tsx.19") : t("auto.ServerBookmarkSettingsModal_tsx.20")}
                 </span>
               </div>
+
+              <div className="rounded-xl border border-amber-900/35 bg-amber-950/20 p-4">
+                <p className="text-sm font-semibold text-amber-100/95">
+                  {tr("Host-agent (вне control-api / gRPC)", "Host-agent (bypasses control-api / gRPC)")}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  {tr(
+                    "Отдельный HTTP-сервис на хосте: OTA бандла и перезагрузка, если deploy-server или control-api недоступны. Токен в /etc/pirate-host-agent.env на сервере.",
+                    "Separate on-host HTTP service: stack tarball and reboot when deploy-server or control-api are down. Token is in /etc/pirate-host-agent.env on the server.",
+                  )}
+                </p>
+                <label className="mt-3 block text-xs text-slate-500" htmlFor="ha-base">
+                  {tr("Base URL", "Base URL")}
+                </label>
+                <input
+                  id="ha-base"
+                  value={haBase}
+                  onChange={(e) => setHaBase(e.target.value)}
+                  placeholder="http://127.0.0.1:9443"
+                  className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-amber-700/45 focus:outline-none"
+                  autoComplete="off"
+                />
+                <label className="mt-2 block text-xs text-slate-500" htmlFor="ha-token">
+                  Bearer token
+                </label>
+                <input
+                  id="ha-token"
+                  type="password"
+                  value={haToken}
+                  onChange={(e) => setHaToken(e.target.value)}
+                  placeholder="••••••••"
+                  className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-slate-100 focus:border-amber-700/45 focus:outline-none"
+                  autoComplete="off"
+                />
+                <label className="mt-2 block text-xs text-slate-500" htmlFor="ha-ver">
+                  {tr("Версия для OTA-архива (server-stack)", "Bundle version label (server-stack)")}
+                </label>
+                <input
+                  id="ha-ver"
+                  value={haStackVersion}
+                  onChange={(e) => setHaStackVersion(e.target.value)}
+                  placeholder="1.2.3"
+                  className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none"
+                  autoComplete="off"
+                />
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={haSaveBusy}
+                    onClick={() => void saveHostAgentFields()}
+                    className={`${btnBase} border border-amber-800/40 bg-amber-950/40 text-amber-50 hover:bg-amber-950/55`}
+                  >
+                    {haSaveBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                    {tr("Сохранить в закладке", "Save on bookmark")}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={haBusy || !haBase.trim()}
+                    onClick={() => void hostAgentPingHealth()}
+                    className={`${btnBase} border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10`}
+                  >
+                    GET /health
+                  </button>
+                  <button
+                    type="button"
+                    disabled={haBusy || !haBase.trim() || !haToken.trim()}
+                    onClick={() => void hostAgentFetchStatus()}
+                    className={`${btnBase} border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10`}
+                  >
+                    /v1/status
+                  </button>
+                  <button
+                    type="button"
+                    disabled={haBusy || !haBase.trim() || !haToken.trim()}
+                    onClick={() => void hostAgentReboot()}
+                    className={`${btnBase} border border-rose-900/50 bg-rose-950/35 text-rose-100 hover:bg-rose-950/50`}
+                  >
+                    {tr("Перезагрузка хоста", "Reboot host")}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={haBusy || !haBase.trim() || !haToken.trim() || !haStackVersion.trim()}
+                    onClick={() => void hostAgentUploadStack()}
+                    className={`${btnBase} border border-amber-800/40 bg-amber-900/30 text-amber-50 hover:bg-amber-900/45`}
+                  >
+                    {tr("Загрузить бандл (OTA)", "Upload bundle (OTA)")}
+                  </button>
+                </div>
+                {haOut ? (
+                  <pre className="mt-3 max-h-40 overflow-auto rounded-lg border border-white/10 bg-black/40 p-2 text-xs text-slate-300">
+                    {haOut}
+                  </pre>
+                ) : null}
+              </div>
             </div>
+          ) : null}
+
+          {tab === "terminal" && sessionOk ? (
+            <HostTerminalPanel controlBase={controlBase} tr={tr} restartPending={restartPending} />
           ) : null}
 
           {tab === "info" && sessionOk ? (
