@@ -13,6 +13,7 @@
  * - `deploy_upload_cancel` / `server_stack_upload_cancel` — прерывание потока чанков (best-effort)
  * - `deploy-progress` — этапы деплоя (prepare/archive/upload/apply) и байты при отправке
  * - `pick_server_stack_tar_gz` / `apply_server_stack_update` / `fetch_server_stack_info_cmd` (OTA host bundle)
+ * - `pirate_cli_path_info` / `install_pirate_cli` — сравнение версии CLI в PATH с встроенной; напоминание обновить после апдейта приложения
  * - `start_display_ingest` / `display_ingest_base` / `display_ingest_export_consumer_config` — display stream receive
  * - `get_display_stream_prefs` / `set_display_stream_prefs` — local stream send/receive flags
  * - `internet_proxy_start` / `internet_proxy_stop` / `internet_proxy_status` — локальный CONNECT-прокси
@@ -70,6 +71,14 @@ import { ModalDialog } from "./ui/ModalDialog";
 // -----------------------------------------------------------------------------
 // Types & mock data (used when Tauri is unavailable or for Storybook-style preview)
 // -----------------------------------------------------------------------------
+
+/** Tauri `pirate_cli_path_info` (camelCase). */
+type PirateCliPathInfo = {
+  pathInPath: string | null;
+  pathVersion: string | null;
+  bundledVersion: string | null;
+  needsUpdate: boolean;
+};
 
 type GrpcConnectResult = {
   endpoint: string;
@@ -373,6 +382,8 @@ export function Dashboard() {
   const [serverSettingsBookmark, setServerSettingsBookmark] = useState<ServerBookmark | null>(null);
 
   const [pirateCliPromptOpen, setPirateCliPromptOpen] = useState(false);
+  const [pirateCliUpdatePromptOpen, setPirateCliUpdatePromptOpen] = useState(false);
+  const [pirateCliUpdateInfo, setPirateCliUpdateInfo] = useState<PirateCliPathInfo | null>(null);
   const [pirateCliInstallBusy, setPirateCliInstallBusy] = useState(false);
   const [pirateCliInstallResult, setPirateCliInstallResult] = useState<string | null>(null);
   const [pirateCliInstallResultErr, setPirateCliInstallResultErr] = useState(false);
@@ -490,14 +501,30 @@ export function Dashboard() {
     let cancelled = false;
     (async () => {
       try {
-        if (localStorage.getItem("pirateDesktop.pirateCliPromptDismissed") === "1") {
+        const dismissedMissing = localStorage.getItem("pirateDesktop.pirateCliPromptDismissed") === "1";
+        const available = await invoke<boolean>("is_pirate_cli_available");
+        if (cancelled) return;
+        if (!available) {
+          if (!dismissedMissing) {
+            setPirateCliInstallResult(null);
+            setPirateCliInstallResultErr(false);
+            setPirateCliPromptOpen(true);
+          }
           return;
         }
-        const available = await invoke<boolean>("is_pirate_cli_available");
-        if (cancelled || available) return;
-        setPirateCliInstallResult(null);
-        setPirateCliInstallResultErr(false);
-        setPirateCliPromptOpen(true);
+        const info = await invoke<PirateCliPathInfo>("pirate_cli_path_info");
+        if (cancelled) return;
+        const dismissedUp = localStorage.getItem("pirateDesktop.pirateCliUpdateDismissedFor") ?? "";
+        if (
+          info.needsUpdate &&
+          info.bundledVersion &&
+          dismissedUp !== info.bundledVersion
+        ) {
+          setPirateCliUpdateInfo(info);
+          setPirateCliInstallResult(null);
+          setPirateCliInstallResultErr(false);
+          setPirateCliUpdatePromptOpen(true);
+        }
       } catch {
         /* Tauri unavailable (browser dev) or command missing */
       }
@@ -1660,6 +1687,120 @@ export function Dashboard() {
                 className={`${btnBase} border border-white/10 bg-white/5`}
               >
                 {tr("Не напоминать", "Do not remind")}
+              </button>
+            </div>
+          </div>
+        </ModalDialog>
+      ) : null}
+
+      {/* Modal: PATH pirate older than bundled CLI (after app update) */}
+      {pirateCliUpdatePromptOpen && pirateCliUpdateInfo ? (
+        <ModalDialog
+          open
+          zClassName="z-modalElevated"
+          onClose={() => setPirateCliUpdatePromptOpen(false)}
+          aria-labelledby="pirate-cli-update-title"
+        >
+          <div className="rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-lg bg-amber-500/15 p-2 text-amber-200">
+                <RefreshCw className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 id="pirate-cli-update-title" className="text-lg font-semibold text-slate-100">
+                  {tr("Обновить команду pirate в терминале", "Update the pirate terminal command")}
+                </h3>
+                <p className="mt-2 text-sm text-slate-400">
+                  {tr(
+                    "В PATH всё ещё старая версия CLI. Обновите установку, чтобы она совпадала с этим приложением.",
+                    "The CLI on your PATH is still an older build. Refresh the install so it matches this app.",
+                  )}
+                </p>
+                <dl className="mt-3 space-y-1 rounded-xl border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs text-slate-300">
+                  <div className="flex flex-wrap gap-x-2">
+                    <dt className="text-slate-500">{tr("В приложении", "Bundled")}</dt>
+                    <dd>{pirateCliUpdateInfo.bundledVersion ?? "—"}</dd>
+                  </div>
+                  <div className="flex flex-wrap gap-x-2">
+                    <dt className="text-slate-500">{tr("В терминале (PATH)", "On PATH")}</dt>
+                    <dd>{pirateCliUpdateInfo.pathVersion ?? "—"}</dd>
+                  </div>
+                  {pirateCliUpdateInfo.pathInPath ? (
+                    <div className="break-all text-slate-500">
+                      {pirateCliUpdateInfo.pathInPath}
+                    </div>
+                  ) : null}
+                </dl>
+                {pirateCliInstallResult ? (
+                  <p
+                    className={`mt-3 rounded-xl border px-3 py-2 text-sm ${
+                      pirateCliInstallResultErr
+                        ? "border-rose-500/30 bg-rose-950/30 text-rose-100/90"
+                        : "border-emerald-600/35 bg-emerald-950/25 text-emerald-100/90"
+                    }`}
+                  >
+                    {pirateCliInstallResult}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                disabled={pirateCliInstallBusy}
+                onClick={() => {
+                  setPirateCliInstallResult(null);
+                  setPirateCliInstallResultErr(false);
+                  setPirateCliInstallBusy(true);
+                  void (async () => {
+                    try {
+                      const msg = await invoke<string>("install_pirate_cli");
+                      setPirateCliInstallResultErr(false);
+                      setPirateCliInstallResult(msg);
+                      const info = await invoke<PirateCliPathInfo>("pirate_cli_path_info");
+                      if (!info.needsUpdate) {
+                        setPirateCliUpdatePromptOpen(false);
+                        setPirateCliUpdateInfo(null);
+                      }
+                    } catch (e) {
+                      setPirateCliInstallResultErr(true);
+                      setPirateCliInstallResult(String(e));
+                    } finally {
+                      setPirateCliInstallBusy(false);
+                    }
+                  })();
+                }}
+                className={`${btnBase} bg-gradient-to-r from-amber-700 to-amber-950 text-white shadow-md shadow-amber-950/50 disabled:opacity-60`}
+              >
+                {pirateCliInstallBusy ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4" />
+                )}
+                {tr("Обновить pirate в PATH", "Update pirate in PATH")}
+              </button>
+              <button
+                type="button"
+                disabled={pirateCliInstallBusy}
+                onClick={() => setPirateCliUpdatePromptOpen(false)}
+                className={`${btnBase} border border-white/10 bg-white/5`}
+              >
+                {tr("Позже", "Later")}
+              </button>
+              <button
+                type="button"
+                disabled={pirateCliInstallBusy}
+                onClick={() => {
+                  const v = pirateCliUpdateInfo.bundledVersion;
+                  if (v) {
+                    localStorage.setItem("pirateDesktop.pirateCliUpdateDismissedFor", v);
+                  }
+                  setPirateCliUpdatePromptOpen(false);
+                  setPirateCliUpdateInfo(null);
+                }}
+                className={`${btnBase} border border-white/10 bg-white/5`}
+              >
+                {tr("Не напоминать для этой версии", "Do not remind for this app version")}
               </button>
             </div>
           </div>

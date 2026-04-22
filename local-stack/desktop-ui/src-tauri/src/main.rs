@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::path::BaseDirectory;
@@ -59,6 +60,113 @@ fn is_pirate_cli_available() -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
+}
+
+/// `pirate --version` prints a `client=` line; used to detect stale PATH installs after app updates.
+fn parse_pirate_client_version(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let t = line.trim();
+        t.strip_prefix("client=")
+            .map(|s| s.trim().to_string())
+    })
+}
+
+fn pirate_version_from_bin(bin: &Path) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_pirate_client_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn path_to_pirate_in_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "where", "pirate"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&out.stdout).lines().next()?.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(line);
+        if p.is_file() { Some(p) } else { None }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v pirate 2>/dev/null")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(s);
+        if p.is_file() { Some(p) } else { None }
+    }
+}
+
+fn same_executable(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PirateCliPathInfo {
+    path_in_path: Option<String>,
+    path_version: Option<String>,
+    bundled_version: Option<String>,
+    needs_update: bool,
+}
+
+#[tauri::command]
+fn pirate_cli_path_info(app: tauri::AppHandle) -> Result<PirateCliPathInfo, String> {
+    let bundled = resolve_pirate_cli_source(&app)?;
+    verify_cli_blob(&bundled)?;
+    let bundled_version = pirate_version_from_bin(&bundled);
+    let path_bin = path_to_pirate_in_path();
+    let path_in_path = path_bin
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+    let path_version = path_bin
+        .as_ref()
+        .and_then(|p| pirate_version_from_bin(p));
+
+    let needs_update = match (&path_bin, &bundled_version) {
+        (Some(pb), Some(bv)) => {
+            if same_executable(pb, &bundled) {
+                false
+            } else {
+                match &path_version {
+                    Some(pv) => pv != bv,
+                    None => true,
+                }
+            }
+        }
+        _ => false,
+    };
+
+    Ok(PirateCliPathInfo {
+        path_in_path,
+        path_version,
+        bundled_version,
+        needs_update,
+    })
 }
 
 fn sh_single_quote(s: &str) -> String {
@@ -944,6 +1052,7 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             is_pirate_cli_available,
+            pirate_cli_path_info,
             install_pirate_cli,
             get_status, // app status
             parse_grpc_bundle, // parse install JSON from bundle

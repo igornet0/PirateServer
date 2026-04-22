@@ -33,6 +33,15 @@ host_unix_cross_windows() {
 }
 
 ensure_clang_for_xwin() {
+  local p
+  # Prefer Homebrew LLVM clang on macOS: Apple clang trips on aws-lc-sys hrss.c
+  # for windows-msvc cross builds.
+  for p in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+    if [[ -x "$p/clang" ]]; then
+      export PATH="$p:$PATH"
+      return 0
+    fi
+  done
   if command -v clang >/dev/null 2>&1; then
     return 0
   fi
@@ -55,6 +64,16 @@ ensure_cargo_xwin() {
   cargo install --locked cargo-xwin
 }
 
+sanitize_windows_cc_env() {
+  # Avoid mixed toolchain mode (clang + clang-cl flags like `/imsvc`) inherited
+  # from user shell/CI env. ring/aws-lc build scripts invoke plain `clang` for
+  # some objects and fail hard if /imsvc leaks via CFLAGS_*.
+  unset CC_x86_64_pc_windows_msvc
+  unset CC_aarch64_pc_windows_msvc
+  unset CFLAGS_x86_64_pc_windows_msvc
+  unset CFLAGS_aarch64_pc_windows_msvc
+}
+
 cargo_windows_release() {
   local -a cmd
   if host_windows_native; then
@@ -64,7 +83,9 @@ cargo_windows_release() {
     ensure_clang_for_xwin
     rustup component add llvm-tools >/dev/null 2>&1 || true
     ensure_cargo_xwin
-    export XWIN_CROSS_COMPILER="${XWIN_CROSS_COMPILER:-clang}"
+    # Force clang mode even if parent shell exported clang-cl.
+    export XWIN_CROSS_COMPILER="clang"
+    sanitize_windows_cc_env
     cmd=(cargo xwin build)
   else
     echo "warning: unknown host OS; trying plain cargo build (may fail for ring/msvc)." >&2

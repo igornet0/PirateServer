@@ -90,6 +90,15 @@ host_unix_for_win_cross() {
 }
 
 ensure_clang_for_client_win_cross() {
+  local p
+  # Prefer Homebrew LLVM clang on macOS: Apple clang can fail in aws-lc-sys
+  # C sources for windows-msvc cross builds.
+  for p in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+    if [[ -x "$p/clang" ]]; then
+      export PATH="$p:$PATH"
+      return 0
+    fi
+  done
   if command -v clang >/dev/null 2>&1; then
     return 0
   fi
@@ -151,13 +160,14 @@ prepare_windows_cross_nsis_build() {
   # cargo-xwin's default is clang-cl (MSVC /imsvc in CFLAGS). Crates like ring call plain `clang` for
   # aarch64-pc-windows-msvc; `/imsvc` is only valid for clang-cl. Apply before *every* `cargo xwin`
   # (pirate CLI build runs before tauri and previously missed this — ring failed with `/imsvc`).
-  export XWIN_CROSS_COMPILER="${XWIN_CROSS_COMPILER:-clang}"
+  # Force clang mode even if parent shell exported clang-cl.
+  export XWIN_CROSS_COMPILER="clang"
 }
 
 run_tauri_build_win_cross() {
   local target="$1"
   shift
-  export XWIN_CROSS_COMPILER="${XWIN_CROSS_COMPILER:-clang}"
+  export XWIN_CROSS_COMPILER="clang"
   ( cd "$DESKTOP_UI" && npx tauri build --ci --runner cargo-xwin --target "$target" --config "$(tauri_cfg_version)" "$@" )
 }
 

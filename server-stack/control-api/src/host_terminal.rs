@@ -5,13 +5,14 @@ use crate::{check_api_bearer_with_query, ApiState, StreamAuthQuery};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::mpsc::Sender as StdSender;
 use std::time::Duration;
 use tokio::sync::mpsc;
+#[cfg(unix)]
 use uuid::Uuid;
 
 /// GET `/api/v1/host-terminal/ws?access_token=…`
@@ -20,7 +21,7 @@ pub async fn api_host_terminal_ws(
     State(s): State<ApiState>,
     headers: HeaderMap,
     Query(q): Query<StreamAuthQuery>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     check_api_bearer_with_query(&s, &headers, q.access_token.as_deref())?;
     if !s.host_terminal_enabled {
         return Err(ApiError::service_unavailable(
@@ -36,7 +37,7 @@ pub async fn api_host_terminal_ws(
         }
         let shell = s.host_terminal_shell.clone();
         let session = Duration::from_secs(s.host_terminal_session_secs);
-        Ok(ws.on_upgrade(move |socket| host_terminal_ws_task(socket, shell, session)))
+        Ok(ws.on_upgrade(move |socket| host_terminal_ws_task(socket, shell, session)).into_response())
     }
     #[cfg(not(unix))]
     {
