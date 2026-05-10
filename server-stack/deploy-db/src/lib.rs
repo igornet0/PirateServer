@@ -2,6 +2,7 @@
 
 mod data_sources;
 mod explorer;
+mod pirate_file_storage;
 
 pub use data_sources::DataSourceRow;
 pub use explorer::{
@@ -1706,6 +1707,137 @@ impl DbStore {
             }
         }
     }
+
+    /// Insert or replace SSL cert metadata (no private keys).
+    pub async fn ssl_upsert_certificate(
+        &self,
+        primary_domain: &str,
+        cert_name: &str,
+        domains: &[String],
+        live_path: &str,
+        expiry_utc_ms: i64,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), DbError> {
+        let domains_json = serde_json::to_string(domains).map_err(|e| DbError::InvalidIdentifier(e.to_string()))?;
+        let now = Utc::now();
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query(
+                    r#"
+            INSERT INTO ssl_certificates (primary_domain, cert_name, domains_json, live_path, expiry_utc_ms, status, last_error, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (primary_domain) DO UPDATE SET
+              cert_name = EXCLUDED.cert_name,
+              domains_json = EXCLUDED.domains_json,
+              live_path = EXCLUDED.live_path,
+              expiry_utc_ms = EXCLUDED.expiry_utc_ms,
+              status = EXCLUDED.status,
+              last_error = EXCLUDED.last_error,
+              updated_at = EXCLUDED.updated_at
+            "#,
+                )
+                .bind(primary_domain)
+                .bind(cert_name)
+                .bind(&domains_json)
+                .bind(live_path)
+                .bind(expiry_utc_ms)
+                .bind(status)
+                .bind(last_error)
+                .bind(now)
+                .execute(pool)
+                .await?;
+            }
+            Self::Sqlite(pool) => {
+                let now_s = now.to_rfc3339();
+                sqlx::query(
+                    r#"
+            INSERT INTO ssl_certificates (primary_domain, cert_name, domains_json, live_path, expiry_utc_ms, status, last_error, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (primary_domain) DO UPDATE SET
+              cert_name = excluded.cert_name,
+              domains_json = excluded.domains_json,
+              live_path = excluded.live_path,
+              expiry_utc_ms = excluded.expiry_utc_ms,
+              status = excluded.status,
+              last_error = excluded.last_error,
+              updated_at = excluded.updated_at
+            "#,
+                )
+                .bind(primary_domain)
+                .bind(cert_name)
+                .bind(&domains_json)
+                .bind(live_path)
+                .bind(expiry_utc_ms)
+                .bind(status)
+                .bind(last_error)
+                .bind(now_s)
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn ssl_list_certificates(&self) -> Result<Vec<SslCertificateRow>, DbError> {
+        match self {
+            Self::Postgres(pool) => {
+                let rows = sqlx::query_as::<_, SslCertificateRowPg>(
+                    r#"SELECT primary_domain, cert_name, domains_json, live_path, expiry_utc_ms, status, last_error, updated_at FROM ssl_certificates ORDER BY primary_domain"#,
+                )
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter()
+                    .map(SslCertificateRow::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+            }
+            Self::Sqlite(pool) => {
+                let rows = sqlx::query_as::<_, SslCertificateRowSqlite>(
+                    r#"SELECT primary_domain, cert_name, domains_json, live_path, expiry_utc_ms, status, last_error, updated_at FROM ssl_certificates ORDER BY primary_domain"#,
+                )
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter()
+                    .map(SslCertificateRow::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+            }
+        }
+    }
+
+    pub async fn ssl_insert_renewal_event(
+        &self,
+        primary_domain: &str,
+        event_kind: &str,
+        message: &str,
+    ) -> Result<(), DbError> {
+        let now = Utc::now();
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query(
+                    r#"INSERT INTO ssl_renewal_events (primary_domain, event_kind, message, created_at) VALUES ($1, $2, $3, $4)"#,
+                )
+                .bind(primary_domain)
+                .bind(event_kind)
+                .bind(message)
+                .bind(now)
+                .execute(pool)
+                .await?;
+            }
+            Self::Sqlite(pool) => {
+                let now_s = now.to_rfc3339();
+                sqlx::query(
+                    r#"INSERT INTO ssl_renewal_events (primary_domain, event_kind, message, created_at) VALUES ($1, $2, $3, $4)"#,
+                )
+                .bind(primary_domain)
+                .bind(event_kind)
+                .bind(message)
+                .bind(now_s)
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1717,6 +1849,82 @@ pub struct GrpcProxySessionAggregate {
     pub created_at_max: Option<DateTime<Utc>>,
     pub expires_at_min: Option<DateTime<Utc>>,
     pub session_count: u64,
+}
+
+/// Parsed SSL certificate row (ACME metadata only; see `ssl_certificates` table).
+#[derive(Debug, Clone)]
+pub struct SslCertificateRow {
+    pub primary_domain: String,
+    pub cert_name: String,
+    pub domains: Vec<String>,
+    pub live_path: String,
+    pub expiry_utc_ms: i64,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SslCertificateRowPg {
+    primary_domain: String,
+    cert_name: String,
+    domains_json: String,
+    live_path: String,
+    expiry_utc_ms: i64,
+    status: String,
+    last_error: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SslCertificateRowSqlite {
+    primary_domain: String,
+    cert_name: String,
+    domains_json: String,
+    live_path: String,
+    expiry_utc_ms: i64,
+    status: String,
+    last_error: Option<String>,
+    updated_at: String,
+}
+
+impl TryFrom<SslCertificateRowPg> for SslCertificateRow {
+    type Error = DbError;
+    fn try_from(r: SslCertificateRowPg) -> Result<Self, DbError> {
+        let domains: Vec<String> = serde_json::from_str(&r.domains_json)
+            .map_err(|e: serde_json::Error| DbError::InvalidIdentifier(e.to_string()))?;
+        Ok(Self {
+            primary_domain: r.primary_domain,
+            cert_name: r.cert_name,
+            domains,
+            live_path: r.live_path,
+            expiry_utc_ms: r.expiry_utc_ms,
+            status: r.status,
+            last_error: r.last_error,
+            updated_at: r.updated_at,
+        })
+    }
+}
+
+impl TryFrom<SslCertificateRowSqlite> for SslCertificateRow {
+    type Error = DbError;
+    fn try_from(r: SslCertificateRowSqlite) -> Result<Self, DbError> {
+        let domains: Vec<String> = serde_json::from_str(&r.domains_json)
+            .map_err(|e: serde_json::Error| DbError::InvalidIdentifier(e.to_string()))?;
+        let updated_at = DateTime::parse_from_rfc3339(&r.updated_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        Ok(Self {
+            primary_domain: r.primary_domain,
+            cert_name: r.cert_name,
+            domains,
+            live_path: r.live_path,
+            expiry_utc_ms: r.expiry_utc_ms,
+            status: r.status,
+            last_error: r.last_error,
+            updated_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -1983,6 +2191,37 @@ mod grpc_session_tests {
             .expect("agg");
         assert_eq!(agg.len(), 1);
         assert_eq!(agg[0].client_pubkey_b64, "abckey");
+    }
+}
+
+#[cfg(test)]
+mod ssl_cert_tests {
+    use super::{DbStore, SslCertificateRow};
+
+    #[tokio::test]
+    async fn ssl_upsert_and_list_sqlite() {
+        let db = DbStore::connect("sqlite::memory:").await.expect("connect");
+        db.migrate().await.expect("migrate");
+        db.ssl_upsert_certificate(
+            "a.example.com",
+            "a.example.com",
+            &["a.example.com".to_string(), "www.a.example.com".to_string()],
+            "/etc/letsencrypt/live/a.example.com",
+            1_700_000_000_000,
+            "valid",
+            None,
+        )
+        .await
+        .expect("upsert");
+        let rows = db.ssl_list_certificates().await.expect("list");
+        assert_eq!(rows.len(), 1);
+        let SslCertificateRow {
+            primary_domain,
+            domains,
+            ..
+        } = &rows[0];
+        assert_eq!(primary_domain, "a.example.com");
+        assert_eq!(domains.len(), 2);
     }
 }
 
