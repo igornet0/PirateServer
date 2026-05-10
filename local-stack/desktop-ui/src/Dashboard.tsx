@@ -51,6 +51,7 @@ import { DisplayStreamPanel } from "./DisplayStreamPanel";
 import { InternetTrafficPanel } from "./InternetTrafficPanel";
 import { HostMetricsPanel } from "./HostMetricsPanel";
 import { OverviewContextPanel } from "./OverviewContextPanel";
+import { StoragePanel } from "./StoragePanel";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 import { ProjectsPanel } from "./ProjectsPanel";
 import { ServerProjectsOverview } from "./ServerProjectsOverview";
@@ -514,16 +515,34 @@ export function Dashboard() {
         }
         const info = await invoke<PirateCliPathInfo>("pirate_cli_path_info");
         if (cancelled) return;
-        const dismissedUp = localStorage.getItem("pirateDesktop.pirateCliUpdateDismissedFor") ?? "";
-        if (
-          info.needsUpdate &&
-          info.bundledVersion &&
-          dismissedUp !== info.bundledVersion
-        ) {
-          setPirateCliUpdateInfo(info);
+        if (info.needsUpdate) {
+          // Try to refresh PATH copy immediately so users get the new CLI right after app update.
           setPirateCliInstallResult(null);
           setPirateCliInstallResultErr(false);
-          setPirateCliUpdatePromptOpen(true);
+          setPirateCliInstallBusy(true);
+          try {
+            const msg = await invoke<string>("install_pirate_cli");
+            if (cancelled) return;
+            const after = await invoke<PirateCliPathInfo>("pirate_cli_path_info");
+            if (cancelled) return;
+            if (after.needsUpdate) {
+              setPirateCliUpdateInfo(after);
+              setPirateCliInstallResultErr(false);
+              setPirateCliInstallResult(msg);
+              setPirateCliUpdatePromptOpen(true);
+            } else {
+              setPirateCliUpdatePromptOpen(false);
+              setPirateCliUpdateInfo(null);
+            }
+          } catch (e) {
+            if (cancelled) return;
+            setPirateCliUpdateInfo(info);
+            setPirateCliInstallResultErr(true);
+            setPirateCliInstallResult(String(e));
+            setPirateCliUpdatePromptOpen(true);
+          } finally {
+            if (!cancelled) setPirateCliInstallBusy(false);
+          }
         }
       } catch {
         /* Tauri unavailable (browser dev) or command missing */
@@ -1269,6 +1288,7 @@ export function Dashboard() {
                       />
                     </div>
                     {mainTab === "internet" ? <InternetTrafficPanel /> : null}
+                    {mainTab === "storage" ? <StoragePanel /> : null}
                     {mainTab === "overview" ? (
                       <div className="mt-6 flex flex-col gap-6">
                         <HostMetricsPanel
@@ -1554,8 +1574,17 @@ export function Dashboard() {
                     deployedVersionUi?.value ?? grpcLive?.currentVersion?.trim() ?? ""
                   }
                   projectVersion={grpcLive?.projectVersion?.trim() ?? null}
-                  tab={mainTab === "overview" ? "overview" : mainTab === "connection" ? "connection" : "internet"}
+                  tab={
+                    mainTab === "overview"
+                      ? "overview"
+                      : mainTab === "connection"
+                        ? "connection"
+                        : mainTab === "storage"
+                          ? "storage"
+                          : "internet"
+                  }
                   onOpenConnection={() => setMainTab("connection")}
+                  onOpenStorage={() => setMainTab("storage")}
                 />
               ) : null}
             </div>
@@ -1786,21 +1815,6 @@ export function Dashboard() {
                 className={`${btnBase} border border-white/10 bg-white/5`}
               >
                 {tr("Позже", "Later")}
-              </button>
-              <button
-                type="button"
-                disabled={pirateCliInstallBusy}
-                onClick={() => {
-                  const v = pirateCliUpdateInfo.bundledVersion;
-                  if (v) {
-                    localStorage.setItem("pirateDesktop.pirateCliUpdateDismissedFor", v);
-                  }
-                  setPirateCliUpdatePromptOpen(false);
-                  setPirateCliUpdateInfo(null);
-                }}
-                className={`${btnBase} border border-white/10 bg-white/5`}
-              >
-                {tr("Не напоминать для этой версии", "Do not remind for this app version")}
               </button>
             </div>
           </div>

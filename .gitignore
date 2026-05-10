@@ -26,6 +26,7 @@ __pycache__/
 **/node_modules/
 frontend/dist/
 dist/
+.cache
 
 .DS_Store
 PirateMarket/
@@ -36,3 +37,4 @@ tmp/
 
 # Proxy E2E JSON reports (keep artifacts/.gitkeep)
 artifacts/*.json
+examples/Mail/

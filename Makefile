@@ -8,13 +8,13 @@
 	desktop-ui deploy-dashboard-dev deploy-dashboard-build \
 	pirate-desktop pirate-desktop-release pirate-desktop-bundle \
 	build-local build-stack-release dist dist-manifest dist-all\
-	dist-linux dist-macos dist-macos-dmg dist-windows dist-windows-msi \
+	dist-linux dist-macos dist-macos-dmg dist-dmg-macos dist-windows dist-windows-msi \
 	dist-only-windows dist-only-client-windows-msi dist-only-linux dist-only-macos dist-only-macos-dmg \
 	dist-client-all dist-client-linux dist-client-macos dist-client-macos-dmg dist-client-windows dist-client-windows-msi \
 	dist-desktop-linux dist-desktop-macos dist-desktop-macos-dmg dist-desktop-windows \
 	install install-release dist-server \
 	bootstrap bootstrap-phase6 e2e local-e2e docker-client-help build-desktop-ui \
-	test-dist-arm64-docker-install up-version server-stack-ota server-stack-ota-upload
+	test-dist-arm64-docker-install up-version server-stack-ota server-stack-ota-full server-stack-ota-upload
 
 CARGO       ?= cargo
 NPM         ?= npm
@@ -53,8 +53,9 @@ help:
 	@echo "  make dist                                                     - rust-release + frontend + dist/release-manifest.json (see VERSION)"
 	@echo "  make dist-linux [ARCH=amd64|arm64] [UI_BUILD=1]               - Linux tar.gz (pirate-linux-<ARCH>-<VERSION>-<date>.tar.gz)"
 	@echo "  make server-stack-ota DEPLOY_URL=http://host:50051 [ARCH=arm64] [UI_BUILD=0]  - dist-linux + pirate update (OTA)"
+	@echo "  make server-stack-ota-full DEPLOY_URL=http://host:50051 [ARCH=amd64] [UI_BUILD=1]  - like above + stdin /dev/null (non-interactive); server runs pirate-ensure-file-storage.sh"
 	@echo "  make server-stack-ota-upload DEPLOY_URL=...  — same upload, skip rebuild (use newest dist/*.tar.gz)"
-	@echo "    macOS: uses Docker (rust:bookworm) for Rust link; LINUX_BUNDLE_HOST_BUILD=1 forces host cargo/zigbuild"
+	@echo "    macOS: Docker (rust:bookworm) links deploy-client (xcb). Apple M-series + ARCH=amd64 now tries auto-fallback (run rust container on arm64 + cross-link to x86_64). If your Docker setup is broken, use Colima x86_64 (see scripts/preflight-linux-rust-docker.sh) or build on x86/CI. LINUX_BUNDLE_HOST_BUILD=1 = host cargo/zigbuild (zig cannot link -lxcb for target Linux; usually fails)"
 	@echo "  make dist-macos [ARCH=amd64|arm64] [UI_BUILD=1]               - macOS tar.gz (pirate-macos-<ARCH>-<VERSION>-<date>.tar.gz)"
 	@echo "  make dist-macos-dmg [ARCH=amd64|arm64] [UI_BUILD=1]           - macOS DMG (pirate-macos-<ARCH>-<VERSION>-<date>.dmg)"
 	@echo "  make dist-windows [ARCH=amd64|arm64] [UI_BUILD=1]             - Windows zip (pirate-windows-<ARCH>-<VERSION>-<date>.zip)"
@@ -64,6 +65,7 @@ help:
 	@echo "  make dist-client-linux [ARCH=amd64|arm64] [UI_BUILD=1]        - Linux bundle (pirate-client-linux-<ARCH>-<VERSION>-<date>.tar.gz; macOS: Docker)"
 	@echo "  make dist-client-macos [ARCH=amd64|arm64] [UI_BUILD=1]        - macOS bundle (pirate-client-macos-<ARCH>-<VERSION>-<date>.tar.gz)"
 	@echo "  make dist-client-macos-dmg [ARCH=amd64|arm64] [UI_BUILD=1]    - macOS DMG (pirate-client-macos-<ARCH>-<VERSION>-<date>.dmg)"
+	@echo "  make dist-dmg-macos [ARCH=amd64|arm64] [UI_BUILD=1]           - fast DMG repack from existing target/*/bundle/dmg (no Rust/UI rebuild)"
 	@echo "  make dist-client-windows [ARCH=amd64|arm64] [UI_BUILD=1]      - Windows bundle (pirate-client-windows-<ARCH>-<VERSION>-<date>.zip)"
 	@echo "  make dist-client-windows-msi [ARCH=amd64|arm64] [UI_BUILD=1]  - Windows: WiX MSI (.msi); macOS/Linux: NSIS cross → *-nsis.zip (clang + cargo-xwin + makensis)"
 	@echo "  note: UI_BUILD=0 — без статики дашборда, архив с .bundle-no-ui (установка UI недоступна)"
@@ -254,7 +256,7 @@ dist-manifest:
 	./scripts/write-release-manifest.sh
 
 dist-linux:
-	@chmod +x scripts/build-linux-bundle.sh scripts/linux-bundle-build.sh scripts/linux-bundle-build-rust-in-docker.sh scripts/linux-bundle-rust-docker-entry.sh scripts/read-version.sh scripts/write-server-stack-manifest.sh
+	@chmod +x scripts/build-linux-bundle.sh scripts/linux-bundle-build.sh scripts/preflight-linux-rust-docker.sh scripts/linux-bundle-build-rust-in-docker.sh scripts/linux-bundle-rust-docker-entry.sh scripts/read-version.sh scripts/write-server-stack-manifest.sh
 	UI_BUILD=$(UI_BUILD) ARCH=$(ARCH) ./scripts/build-linux-bundle.sh
 
 # Build Linux server bundle and push to deploy-server (gRPC URL). Requires network to DEPLOY_URL.
@@ -263,6 +265,14 @@ server-stack-ota: dist-linux
 	@chmod +x scripts/pirate-server-stack-update.sh
 	@test -n "$(DEPLOY_URL)" || (echo "Set DEPLOY_URL, e.g. DEPLOY_URL=http://192.168.0.30:50051" >&2; exit 1)
 	ARCH="$(ARCH)" ./scripts/pirate-server-stack-update.sh "$(DEPLOY_URL)"
+
+# Same as server-stack-ota, but `make dist-linux` is inside the script and stdin is /dev/null for non-interactive `pirate update`.
+# On the server, OTA apply runs pirate-ensure-file-storage.sh (PIRATE_STORAGE_ROOT + .pirate-tmp) — no manual mkdir.
+# Example: make server-stack-ota-full DEPLOY_URL=http://192.168.0.30:50051 ARCH=amd64 UI_BUILD=1
+server-stack-ota-full:
+	@chmod +x scripts/pirate-ota-linux-full.sh
+	@test -n "$(DEPLOY_URL)" || (echo "Set DEPLOY_URL, e.g. DEPLOY_URL=http://192.168.0.30:50051" >&2; exit 1)
+	ARCH="$(ARCH)" UI_BUILD="$(UI_BUILD)" ./scripts/pirate-ota-linux-full.sh "$(DEPLOY_URL)"
 
 server-stack-ota-upload:
 	@chmod +x scripts/pirate-server-stack-update.sh
@@ -427,6 +437,11 @@ dist-client: dist-client-all
 dist-all: 
 	$(MAKE) dist-server-all
 	$(MAKE) dist-client-all
+
+dist-dmg-macos:
+	@chmod +x scripts/build-desktop-client-dist.sh scripts/read-version.sh
+	ARCH=$(ARCH) UI_BUILD=$(UI_BUILD) ./scripts/build-desktop-client-dist.sh macos-dmg-fast
+
 
 # --- Install artifacts ---
 

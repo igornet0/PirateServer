@@ -82,7 +82,40 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
     migrate_connection_control_api(&c)?;
     migrate_control_api_jwt(&c)?;
     migrate_display_stream_prefs(&c)?;
+    migrate_db_direct(&c)?;
     Ok(c)
+}
+
+fn migrate_db_direct(c: &Connection) -> Result<(), rusqlite::Error> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS db_direct_profile (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            engine TEXT NOT NULL DEFAULT 'postgres',
+            host TEXT NOT NULL DEFAULT '127.0.0.1',
+            port INTEGER NOT NULL DEFAULT 5432,
+            database_name TEXT,
+            username TEXT,
+            ssl_mode TEXT NOT NULL DEFAULT 'prefer',
+            group_tag TEXT,
+            order_index INTEGER NOT NULL DEFAULT 0,
+            last_ok_at_ms INTEGER,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS db_direct_query_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            connection_id TEXT NOT NULL,
+            sql_text TEXT NOT NULL,
+            ts_ms INTEGER NOT NULL,
+            duration_ms INTEGER,
+            ok INTEGER NOT NULL,
+            err TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_db_direct_qhist_conn
+            ON db_direct_query_history(connection_id, ts_ms DESC);",
+    )?;
+    Ok(())
 }
 
 fn migrate_control_api_jwt(c: &Connection) -> Result<(), rusqlite::Error> {
@@ -157,5 +190,12 @@ fn migrate_connection_control_api(c: &Connection) -> Result<(), rusqlite::Error>
             [],
         )?;
     }
+    if !cols.iter().any(|n| n == "control_api_direct_url") {
+        c.execute(
+            "ALTER TABLE connection ADD COLUMN control_api_direct_url TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     Ok(())
 }
+

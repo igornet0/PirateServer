@@ -131,11 +131,20 @@ export function HostServerEnvPanel({
   const { language, t } = useI18n();
   const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
   const [viewMode, setViewMode] = useState<"form" | "raw">("form");
+  const [searchQuery, setSearchQuery] = useState("");
   const [extraKeyDraft, setExtraKeyDraft] = useState("");
   const [extraValDraft, setExtraValDraft] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(initialCategoryCollapsed);
 
   const map = useMemo(() => parseDotEnv(value), [value]);
+  const search = searchQuery.trim().toLowerCase();
+  const hasSearch = search.length > 0;
+
+  const categoryLabel = (cat: { id: string; title: string }) => {
+    const k = `envCategory.${cat.id}`;
+    const x = t(k);
+    return x === k ? cat.title : x;
+  };
 
   const setKey = (key: string, val: string) => {
     const next = new Map(map);
@@ -209,9 +218,42 @@ export function HostServerEnvPanel({
         />
       ) : (
         <div className="space-y-2">
+          <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+            <label className={labelClass} htmlFor="host-env-search">
+              {tr("Поиск аргумента", "Find argument")}
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                id="host-env-search"
+                disabled={disabled}
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={tr("Например: SSL_EMAIL, storage, nginx", "For example: SSL_EMAIL, storage, nginx")}
+                className={`${fieldClass} min-w-[14rem] flex-1`}
+                spellCheck={false}
+                autoComplete="off"
+              />
+              {hasSearch ? (
+                <button
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => setSearchQuery("")}
+                  className="rounded-lg border border-white/15 bg-white/5 px-3 py-2 text-xs text-slate-200 hover:bg-white/10 disabled:opacity-40"
+                >
+                  {tr("Сбросить", "Clear")}
+                </button>
+              ) : null}
+            </div>
+          </div>
           {SERVER_DEPLOY_ENV_SCHEMA.map((cat) => {
-            const isOpen = !collapsed[cat.id];
-            const visibleVars = cat.vars.filter((v) => !(hiddenKeys?.has(v.key) ?? false));
+            const visibleVars = cat.vars
+              .filter((v) => !(hiddenKeys?.has(v.key) ?? false))
+              .filter((v) => {
+                if (!hasSearch) return true;
+                const haystack = `${v.key}\n${v.label}\n${v.hint ?? ""}`.toLowerCase();
+                return haystack.includes(search);
+              });
+            const isOpen = hasSearch || !collapsed[cat.id];
             if (visibleVars.length === 0) return null;
             return (
               <div
@@ -223,7 +265,7 @@ export function HostServerEnvPanel({
                   onClick={() => toggleCategory(cat.id)}
                   className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm font-semibold text-slate-200 hover:bg-white/5"
                 >
-                  {cat.title}
+                  {categoryLabel(cat)}
                   {isOpen ? (
                     <ChevronsUp className="h-4 w-4 shrink-0 text-slate-500" />
                   ) : (
@@ -239,6 +281,19 @@ export function HostServerEnvPanel({
                           <span className="ml-2 font-sans text-slate-400">{def.label}</span>
                         </label>
                         {def.hint ? <p className={hintClass}>{def.hint}</p> : null}
+                        {def.defaultValue !== undefined ? (
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              disabled={disabled || (map.get(def.key) ?? "") === def.defaultValue}
+                              onClick={() => setKey(def.key, def.defaultValue ?? "")}
+                              className="rounded-md border border-emerald-800/35 bg-emerald-950/20 px-2 py-1 text-[11px] text-emerald-200 hover:bg-emerald-950/35 disabled:opacity-40"
+                            >
+                              {tr("Установить по умолчанию", "Set default")}
+                            </button>
+                            <code className="text-[11px] text-slate-500">{def.defaultValue}</code>
+                          </div>
+                        ) : null}
                         <div id={`env-${def.key}`}>
                           <FieldInput
                             def={def}
@@ -265,7 +320,13 @@ export function HostServerEnvPanel({
             </p>
             {unknownKeys.length ? (
               <div className="mb-3 space-y-2">
-                {unknownKeys.map((key) => (
+                {unknownKeys
+                  .filter((key) => {
+                    if (!hasSearch) return true;
+                    const val = map.get(key) ?? "";
+                    return `${key}\n${val}`.toLowerCase().includes(search);
+                  })
+                  .map((key) => (
                   <div key={key} className="flex flex-wrap items-start gap-2">
                     <code className="mt-2 shrink-0 text-[11px] text-emerald-200/85">{key}</code>
                     <input

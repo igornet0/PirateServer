@@ -179,6 +179,15 @@ fn load_stored() -> Option<StoredConnection> {
 }
 
 fn apply_control_api_hint_from_status(r: &StatusResponse) {
+    // Always keep direct URL in sync (used as fallback for bootstrap, e.g. `ensure_nginx` when HTTPS is not up yet).
+    let direct = r.control_api_http_url_direct.trim();
+    if !direct.is_empty() && validate_endpoint(direct).is_ok() {
+        let n = normalize_endpoint(direct);
+        let _ = save_control_api_direct_url_hint(&n);
+    } else {
+        let _ = save_control_api_direct_url_hint("");
+    }
+
     let chosen_raw = r.control_api_http_url.trim();
     let chosen_raw = if !chosen_raw.is_empty() {
         chosen_raw
@@ -198,6 +207,34 @@ fn apply_control_api_hint_from_status(r: &StatusResponse) {
         return;
     }
     let _ = set_control_api_base_with_mode(&chosen, CONTROL_API_BASE_MODE_AUTO);
+}
+
+fn save_control_api_direct_url_hint(direct: &str) -> Result<(), String> {
+    let c = desktop_store::open().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE connection SET control_api_direct_url = ?1 WHERE id = 1",
+        params![direct.trim().to_string()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Last known `GetStatus` `control_api_http_url_direct` (e.g. `http://host:8080`); for fallback when the public base is unreachable.
+pub fn load_control_api_direct_url() -> Option<String> {
+    let c = desktop_store::open().ok()?;
+    let s: String = c
+        .query_row(
+            "SELECT control_api_direct_url FROM connection WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(normalize_endpoint(t))
+    }
 }
 
 fn grpc_connect_result(endpoint: String, r: StatusResponse) -> GrpcConnectResult {
@@ -516,7 +553,7 @@ pub fn add_bookmark_from_input(raw: &str) -> Result<String, String> {
 pub fn clear_endpoint() -> Result<(), String> {
     let c = desktop_store::open().map_err(|e| e.to_string())?;
     c.execute(
-        "UPDATE connection SET url = '', server_pubkey_b64 = NULL, paired = 0, control_api_base_url = '', control_api_base_mode = 'auto', control_api_jwt = '', control_api_jwt_expires_at_ms = 0, control_api_recent_restart_until_ms = 0 WHERE id = 1",
+        "UPDATE connection SET url = '', server_pubkey_b64 = NULL, paired = 0, control_api_base_url = '', control_api_base_mode = 'auto', control_api_direct_url = '', control_api_jwt = '', control_api_jwt_expires_at_ms = 0, control_api_recent_restart_until_ms = 0 WHERE id = 1",
         [],
     )
     .map_err(|e| e.to_string())?;

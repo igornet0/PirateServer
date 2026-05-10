@@ -1,4 +1,4 @@
-import { Activity, AlertCircle, Link2 } from "lucide-react";
+import { Activity, AlertCircle, HardDrive, Link2 } from "lucide-react";
 import React from "react";
 import { useI18n } from "./i18n";
 
@@ -14,6 +14,7 @@ export function OverviewContextPanel({
   projectVersion,
   tab,
   onOpenConnection,
+  onOpenStorage,
 }: {
   endpoint: string | null;
   grpcErr: string | null;
@@ -23,8 +24,9 @@ export function OverviewContextPanel({
   deployedLabel: string | null;
   deployedValue: string;
   projectVersion: string | null;
-  tab: "overview" | "connection" | "internet";
+  tab: "overview" | "connection" | "internet" | "storage";
   onOpenConnection: () => void;
+  onOpenStorage: () => void;
 }) {
   const { language, t } = useI18n();
   const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
@@ -79,6 +81,16 @@ export function OverviewContextPanel({
           <Link2 className="mr-1.5 inline h-3.5 w-3.5" />
           {t("context.connectionSettings")}
         </button>
+        {endpoint ? (
+          <button
+            type="button"
+            onClick={onOpenStorage}
+            className="mt-2 w-full rounded-lg border border-amber-900/35 bg-amber-950/25 px-3 py-2 text-xs font-medium text-amber-100 hover:bg-amber-950/45 hover:shadow-glow"
+          >
+            <HardDrive className="mr-1.5 inline h-3.5 w-3.5" />
+            {t("context.openStorage")}
+          </button>
+        ) : null}
       </div>
       <div className="px-3 py-3 text-[11px] leading-relaxed text-slate-500">
         {tab === "overview" ? (
@@ -88,6 +100,11 @@ export function OverviewContextPanel({
           </p>
         ) : tab === "connection" ? (
           <p>{t("context.connectionTip")}</p>
+        ) : tab === "storage" ? (
+          <p>
+            {t("context.storageTip")}{" "}
+            {t("context.dbExplorerInStorageNote")}
+          </p>
         ) : (
           <p>{t("context.internetTip")}</p>
         )}

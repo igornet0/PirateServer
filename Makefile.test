@@ -77,3 +77,9 @@ start-local-server-macos-minimal:
 	DEPLOY_LOCAL_ROOT="$(DEPLOY_LOCAL_ROOT)" \
 	LOCAL_STACK_MINIMAL=1 \
 	bash scripts/start-local-macos-stack.sh
+
+
+	[{"id":"e7c72ef4-6faa-4b16-99bd-c5685f3e2660",
+	"direction":"inbound","from_addr":"vladvarenko@24ai-spbconsult.ru","to_addr":"igormikhailets@24ai-spbconsult.ru","subject":"hii","body_preview":"<p>hii</p>\r\n\r\n","body_size_bytes":282,"thread_id":null,"message_status":"active","created_at":"2026-04-24T14:35:42.906155Z"},
+	{"id":"b68d42c6-3dd7-455b-bcf5-6963b16664dc",
+	"direction":"inbound","from_addr":"vladvarenko@24ai-spbconsult.ru","to_addr":"igormikhailets@24ai-spbconsult.ru","subject":"hii","body_preview":"<p>hii</p>\r\n\r\n","body_size_bytes":282,"thread_id":null,"message_status":"active","created_at":"2026-04-24T14:35:31.962830Z"}]

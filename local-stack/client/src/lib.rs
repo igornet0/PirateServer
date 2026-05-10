@@ -24,6 +24,7 @@ pub mod project_control;
 pub mod local_pipeline;
 pub mod project_registry;
 pub mod network_access;
+pub mod ssl;
 
 /// Stable API for the desktop shell: local HTTP CONNECT proxy (`board`) and settings.
 pub mod internet_proxy {

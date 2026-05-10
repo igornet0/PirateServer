@@ -409,7 +409,10 @@ export function ProjectsPanel({
       if (!trimmed) return;
       setHostSvcInstallBusyId(trimmed);
       try {
-        const r = await invoke<string>("control_api_host_service_install", { id: trimmed });
+        const r = await invoke<string>("control_api_host_service_install", {
+          id: trimmed,
+          installEnvJson: JSON.stringify({ env: {} }),
+        });
         toast.success(language === "ru" ? "Установка выполнена" : "Install finished", {
           description: r.length > 320 ? `${r.slice(0, 320)}…` : r,
         });
@@ -1298,6 +1301,28 @@ export function ProjectsPanel({
                                 );
                               })}
                             </div>
+                            {hostSvcInstallBusyId ? (
+                              <div
+                                className="space-y-2 rounded-lg border border-amber-900/35 bg-amber-950/20 px-2.5 py-2"
+                                role="status"
+                                aria-live="polite"
+                                aria-busy="true"
+                              >
+                                <p className="text-xs text-amber-100/90">
+                                  {tr("Установка сервиса", "Installing service")}:{" "}
+                                  <code className="font-mono text-amber-200">{hostSvcInstallBusyId}</code>
+                                </p>
+                                <div className="host-svc-progress-track" aria-hidden>
+                                  <div className="host-svc-progress-bar" />
+                                </div>
+                                <p className="text-[10px] text-slate-500">
+                                  {tr(
+                                    "Ожидание ответа сервера (sudo-скрипт). Это может занять несколько минут.",
+                                    "Waiting for the server (sudo script). This may take several minutes.",
+                                  )}
+                                </p>
+                              </div>
+                            ) : null}
                             {networkAnalysis.hostServices.dispatchScriptPresent === false ? (
                               <p className="text-[11px] text-amber-200/90">
                                 {tr(

@@ -32,6 +32,8 @@ postgres = false
 redis = false
 mysql = false
 mongodb = false
+# minio = true   # → preflight требует MinIO (см. install-minio / вкладка «Сервисы»)
+# meilisearch = true
 
 [services.web]
 type = "http"

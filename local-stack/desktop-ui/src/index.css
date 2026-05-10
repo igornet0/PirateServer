@@ -35,4 +35,28 @@
   .text-code-pirate {
     @apply text-orange-200/90;
   }
+
+  /* Indeterminate progress for host service install/remove (no server-side %). */
+  @keyframes host-svc-indeterminate {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(280%);
+    }
+  }
+  .host-svc-progress-track {
+    @apply h-1.5 w-full overflow-hidden rounded-full bg-white/10;
+  }
+  .host-svc-progress-bar {
+    @apply h-full w-[38%] rounded-full bg-gradient-to-r from-amber-700/50 via-amber-400/95 to-amber-700/50;
+    animation: host-svc-indeterminate 1.15s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .host-svc-progress-bar {
+      animation: none;
+      width: 100%;
+      background: rgba(180, 83, 9, 0.4);
+    }
+  }
 }

@@ -13,9 +13,106 @@ import { useI18n } from "./i18n";
 import { CopyablePre } from "./ui/CopyablePre";
 import { ModalDialog } from "./ui/ModalDialog";
 import { HostTerminalPanel } from "./HostTerminalPanel";
+import { SslManagementPanel } from "./SslManagementPanel";
 
 const btnBase =
   "inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050204] active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50";
+
+type NginxSiteRow = {
+  site_id: string;
+  file_name: string;
+  path: string;
+  entry_kind: string;
+  active: boolean;
+  enabled: boolean;
+  enabled_path?: string | null;
+  domains: string[];
+  ssl_enabled: boolean;
+  listen_ports: number[];
+  managed_by: string;
+  is_ui_stack: boolean;
+  parse_warnings: string[];
+};
+
+type NginxSitesPayload = {
+  ok: boolean;
+  nginx_test_output?: string | null;
+  global_warnings: string[];
+  global_conflicts: { level: string; code: string; message: string }[];
+  sites: NginxSiteRow[];
+};
+
+type NginxPreflightPayload = {
+  ok: boolean;
+  inventory: NginxSitesPayload;
+  blockers: { level: string; code: string; message: string }[];
+};
+
+function normalizeNginxSiteRow(raw: unknown, index: number): NginxSiteRow {
+  const row = raw as Partial<NginxSiteRow> | null;
+  return {
+    site_id: typeof row?.site_id === "string" && row.site_id.length > 0 ? row.site_id : `row-${index}`,
+    file_name: typeof row?.file_name === "string" ? row.file_name : "unknown.conf",
+    path: typeof row?.path === "string" ? row.path : "",
+    entry_kind: typeof row?.entry_kind === "string" ? row.entry_kind : "vhost",
+    active: Boolean(row?.active),
+    enabled: Boolean(row?.enabled),
+    enabled_path: typeof row?.enabled_path === "string" ? row.enabled_path : null,
+    domains: Array.isArray(row?.domains) ? row.domains.filter((v): v is string => typeof v === "string") : [],
+    ssl_enabled: Boolean(row?.ssl_enabled),
+    listen_ports: Array.isArray(row?.listen_ports)
+      ? row.listen_ports.filter((v): v is number => typeof v === "number")
+      : [],
+    managed_by: typeof row?.managed_by === "string" ? row.managed_by : "unknown",
+    is_ui_stack: Boolean(row?.is_ui_stack),
+    parse_warnings: Array.isArray(row?.parse_warnings)
+      ? row.parse_warnings.filter((v): v is string => typeof v === "string")
+      : [],
+  };
+}
+
+function normalizeNginxSitesPayload(raw: unknown): NginxSitesPayload {
+  const payload = raw as Partial<NginxSitesPayload> | null;
+  return {
+    ok: Boolean(payload?.ok),
+    nginx_test_output:
+      typeof payload?.nginx_test_output === "string" || payload?.nginx_test_output === null
+        ? payload.nginx_test_output
+        : null,
+    global_warnings: Array.isArray(payload?.global_warnings)
+      ? payload.global_warnings.filter((v): v is string => typeof v === "string")
+      : [],
+    global_conflicts: Array.isArray(payload?.global_conflicts)
+      ? payload.global_conflicts.filter(
+          (v): v is { level: string; code: string; message: string } =>
+            typeof v === "object" &&
+            v !== null &&
+            typeof (v as { message?: unknown }).message === "string" &&
+            typeof (v as { level?: unknown }).level === "string" &&
+            typeof (v as { code?: unknown }).code === "string",
+        )
+      : [],
+    sites: Array.isArray(payload?.sites) ? payload.sites.map((row, index) => normalizeNginxSiteRow(row, index)) : [],
+  };
+}
+
+function normalizeNginxPreflightPayload(raw: unknown): NginxPreflightPayload {
+  const payload = raw as Partial<NginxPreflightPayload> | null;
+  return {
+    ok: Boolean(payload?.ok),
+    inventory: normalizeNginxSitesPayload(payload?.inventory),
+    blockers: Array.isArray(payload?.blockers)
+      ? payload.blockers.filter(
+          (v): v is { level: string; code: string; message: string } =>
+            typeof v === "object" &&
+            v !== null &&
+            typeof (v as { message?: unknown }).message === "string" &&
+            typeof (v as { level?: unknown }).level === "string" &&
+            typeof (v as { code?: unknown }).code === "string",
+        )
+      : [],
+  };
+}
 
 export type ServerBookmark = {
   id: string;
@@ -56,6 +153,7 @@ type TabId =
   | "services"
   | "antiddos"
   | "nginx"
+  | "ssl"
   | "process";
 
 type Props = {
@@ -124,6 +222,7 @@ export function ServerBookmarkSettingsModal({
     site_enabled?: boolean;
     ensure_script_present?: boolean;
     apply_site_script_present?: boolean;
+    ops_script_present?: boolean;
   } | null>(null);
   const [nginxSiteText, setNginxSiteText] = useState("");
   const [nginxSitePath, setNginxSitePath] = useState<string | null>(null);
@@ -143,6 +242,24 @@ export function ServerBookmarkSettingsModal({
   const [nginxCancelRequested, setNginxCancelRequested] = useState(false);
   const nginxProgressTimer = useRef<number | null>(null);
   const nginxOpSeq = useRef(0);
+  const [nginxSitesPayload, setNginxSitesPayload] = useState<NginxSitesPayload | null>(null);
+  const [nginxPreflightBlockers, setNginxPreflightBlockers] = useState<
+    { level: string; code: string; message: string }[]
+  >([]);
+  /** Tauri WebView often blocks `window.prompt` / `window.confirm`; use inline UI instead. */
+  const [nginxMiniDialog, setNginxMiniDialog] = useState<
+    | { kind: "domain"; path: string; draft: string }
+    | { kind: "ssl"; path: string; enable: boolean }
+    | null
+  >(null);
+  const [nginxFileEditor, setNginxFileEditor] = useState<{
+    path: string;
+    content: string;
+    dirty: boolean;
+    loading: boolean;
+    readOnly: boolean;
+    readOnlyReason: string | null;
+  } | null>(null);
 
   const [restartBusy, setRestartBusy] = useState(false);
   const [restartOut, setRestartOut] = useState<string | null>(null);
@@ -191,6 +308,8 @@ export function ServerBookmarkSettingsModal({
     setNginxProgressOpen(false);
     setNginxProgressValue(0);
     setNginxCancelRequested(false);
+    setNginxSitesPayload(null);
+    setNginxPreflightBlockers([]);
     setHaBase((bookmark.host_agent_base_url ?? "").trim());
     setHaToken(bookmark.host_agent_token ?? "");
     setHaOut(null);
@@ -620,6 +739,87 @@ export function ServerBookmarkSettingsModal({
     }
   }, [controlBase]);
 
+  const loadNginxInventory = useCallback(async () => {
+    setNginxSiteBusy(true);
+    setErr(null);
+    try {
+      await invoke("set_control_api_base", { url: controlBase.trim() });
+      const raw = await invoke<string>("control_api_fetch_nginx_sites_json");
+      const parsed = normalizeNginxSitesPayload(JSON.parse(raw));
+      setNginxSitesPayload(parsed);
+    } catch (e) {
+      setNginxSitesPayload(null);
+      setErr(String(e));
+    } finally {
+      setNginxSiteBusy(false);
+    }
+  }, [controlBase]);
+
+  const runNginxPreflight = useCallback(async () => {
+    setNginxSiteBusy(true);
+    setErr(null);
+    try {
+      await invoke("set_control_api_base", { url: controlBase.trim() });
+      const raw = await invoke<string>("control_api_nginx_preflight_json", { body: "{}" });
+      const parsed = normalizeNginxPreflightPayload(JSON.parse(raw));
+      setNginxSitesPayload(parsed.inventory);
+      setNginxPreflightBlockers(parsed.blockers ?? []);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setNginxSiteBusy(false);
+    }
+  }, [controlBase]);
+
+  const runNginxAction = useCallback(
+    async (body: Record<string, unknown>) => {
+      setNginxSiteBusy(true);
+      setErr(null);
+      setNginxOut(null);
+      try {
+        await invoke("set_control_api_base", { url: controlBase.trim() });
+        const raw = await invoke<string>("control_api_nginx_action_json", { body: JSON.stringify(body) });
+        setNginxOut(raw);
+        try {
+          const j = JSON.parse(raw) as {
+            ok?: boolean;
+            message?: string;
+            detail?: string | null;
+            post_check?: {
+              classified?: string;
+              summary?: string;
+              probe_host?: string | null;
+              curl_exit?: number | null;
+            };
+          };
+          if (typeof j.ok === "boolean" && j.ok === false) {
+            const detail =
+              j.detail != null && String(j.detail).trim() !== "" ? `\n${String(j.detail).trim()}` : "";
+            let msg = `${j.message ?? tr("Операция nginx не удалась", "Nginx action failed")}${detail}`;
+            if (j.post_check?.classified === "tls_name_mismatch") {
+              msg += `\n${tr(
+                "Сертификат не соответствует имени хоста (SNI). Проверьте server_name в vhost и CN/SAN сертификата, либо задайте post_check_host.",
+                "Certificate does not match the hostname (SNI). Check server_name in the vhost and the certificate CN/SAN, or set post_check_host explicitly.",
+              )}`;
+            }
+            setErr(msg);
+          }
+        } catch {
+          /* non-JSON body */
+        }
+        await loadNginxInventory();
+        setNginxPreflightBlockers([]);
+        await loadNginxStatus();
+        await loadNginxSite();
+      } catch (e) {
+        setErr(String(e));
+      } finally {
+        setNginxSiteBusy(false);
+      }
+    },
+    [controlBase, loadNginxInventory, loadNginxStatus, loadNginxSite, tr, nginxSitesPayload],
+  );
+
   const saveNginxSite = async () => {
     setNginxSiteBusy(true);
     setErr(null);
@@ -690,6 +890,8 @@ export function ServerBookmarkSettingsModal({
       setNginxProgressValue(100);
       await loadNginxStatus();
       await loadNginxSite();
+      await loadNginxInventory();
+      setNginxPreflightBlockers([]);
       await loadHostEnv();
     } catch (e) {
       if (opId !== nginxOpSeq.current || nginxCancelRequested) {
@@ -722,7 +924,8 @@ export function ServerBookmarkSettingsModal({
     if (!open || tab !== "nginx" || !sessionOk) return;
     void loadNginxStatus();
     void loadNginxSite();
-  }, [open, tab, sessionOk, loadNginxStatus, loadNginxSite]);
+    void loadNginxInventory();
+  }, [open, tab, sessionOk, loadNginxStatus, loadNginxSite, loadNginxInventory]);
 
   const allowApiWithUiMode = hostUiBundled !== false;
   const hiddenHostEnvKeys = useMemo(() => {
@@ -744,14 +947,130 @@ export function ServerBookmarkSettingsModal({
     { id: "services", label: tr("Сервисы", "Services") },
     { id: "antiddos", label: tr("Anti-DDoS", "Anti-DDoS") },
     { id: "nginx", label: "nginx" },
+    { id: "ssl", label: tr("SSL", "SSL") },
     { id: "process", label: t("auto.ServerBookmarkSettingsModal_tsx.7") },
   ];
   const nginxInstalled = Boolean(nginxStatus?.installed);
 
   const goTab = (id: TabId) => {
     setErr(null);
+    if (id !== "nginx") {
+      setNginxMiniDialog(null);
+      setNginxFileEditor(null);
+    }
     setTab(id);
   };
+
+  const openNginxFileEditor = useCallback(
+    (filePath: string) => {
+      const readOnly = filePath.includes("/sites-enabled/");
+      setNginxFileEditor({
+        path: filePath,
+        content: "",
+        dirty: false,
+        loading: true,
+        readOnly,
+        readOnlyReason: readOnly
+          ? tr(
+              "Это запись в sites-enabled (симлинк) — только просмотр. Редактируйте файл в sites-available.",
+              "This is a sites-enabled symlink — read-only. Edit the file under sites-available.",
+            )
+          : null,
+      });
+      void (async () => {
+        try {
+          setErr(null);
+          await invoke("set_control_api_base", { url: controlBase.trim() });
+          const raw = await invoke<string>("control_api_fetch_nginx_file_json", { path: filePath });
+          const j = JSON.parse(raw) as { content?: string };
+          setNginxFileEditor((prev) =>
+            prev && prev.path === filePath
+              ? {
+                  ...prev,
+                  content: typeof j.content === "string" ? j.content : "",
+                  loading: false,
+                  dirty: false,
+                }
+              : prev,
+          );
+        } catch (e) {
+          setErr(String(e));
+          setNginxFileEditor(null);
+        }
+      })();
+    },
+    [controlBase, tr],
+  );
+
+  const reloadNginxFileEditor = useCallback(() => {
+    const p = nginxFileEditor?.path;
+    if (!p) return;
+    setNginxFileEditor((prev) => (prev ? { ...prev, loading: true } : null));
+    void (async () => {
+      try {
+        setErr(null);
+        await invoke("set_control_api_base", { url: controlBase.trim() });
+        const raw = await invoke<string>("control_api_fetch_nginx_file_json", { path: p });
+        const j = JSON.parse(raw) as { content?: string };
+        setNginxFileEditor((prev) =>
+          prev && prev.path === p
+            ? {
+                ...prev,
+                content: typeof j.content === "string" ? j.content : "",
+                loading: false,
+                dirty: false,
+              }
+            : prev,
+        );
+      } catch (e) {
+        setErr(String(e));
+        setNginxFileEditor((prev) => (prev ? { ...prev, loading: false } : null));
+      }
+    })();
+  }, [nginxFileEditor?.path, controlBase]);
+
+  const saveNginxInventoryFile = useCallback(async () => {
+    if (!nginxFileEditor || nginxFileEditor.readOnly || !nginxFileEditor.dirty) return;
+    setNginxSiteBusy(true);
+    setErr(null);
+    setNginxOut(null);
+    try {
+      await invoke("set_control_api_base", { url: controlBase.trim() });
+      const raw = await invoke<string>("control_api_put_nginx_file_json", {
+        path: nginxFileEditor.path,
+        content: nginxFileEditor.content,
+      });
+      setNginxOut(raw);
+      try {
+        const j = JSON.parse(raw) as { ok?: boolean; message?: string; detail?: string | null };
+        if (typeof j.ok === "boolean" && j.ok === false) {
+          const detail =
+            j.detail != null && String(j.detail).trim() !== "" ? `\n${String(j.detail).trim()}` : "";
+          setErr(
+            `${j.message ?? tr("Сохранение nginx не удалось", "Saving nginx config failed")}${detail}`,
+          );
+        } else {
+          setNginxFileEditor((prev) => (prev ? { ...prev, dirty: false } : null));
+        }
+      } catch {
+        setNginxFileEditor((prev) => (prev ? { ...prev, dirty: false } : null));
+      }
+      await loadNginxInventory();
+      await loadNginxStatus();
+      await loadNginxSite();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setNginxSiteBusy(false);
+    }
+  }, [
+    nginxFileEditor,
+    controlBase,
+    loadNginxInventory,
+    loadNginxStatus,
+    loadNginxSite,
+    tr,
+  ]);
 
   return (
     <>
@@ -763,12 +1082,14 @@ export function ServerBookmarkSettingsModal({
         closeOnEscape={!nginxProgressOpen}
         panelClassName={
           tab === "terminal"
-            ? "w-full max-w-5xl max-h-[90vh] min-h-0"
-            : "w-full max-w-2xl max-h-[90vh] min-h-0"
+            ? "w-full max-w-7xl max-h-[90vh] min-h-0"
+            : tab === "ssl"
+              ? "w-full max-w-5xl max-h-[90vh] min-h-0"
+              : "w-full max-w-4xl max-h-[90vh] min-h-0"
         }
         aria-labelledby="srv-settings-title"
       >
-        <div className="max-h-[90vh] w-full overflow-hidden rounded-2xl border border-white/10 bg-[#0a0908] shadow-2xl shadow-black/60">
+        <div className="max-h-[100vh] w-full overflow-hidden rounded-2xl border border-white/10 bg-[#0a0908] shadow-2xl shadow-black/60">
         <div className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
           <div className="min-w-0">
             <h2 id="srv-settings-title" className="flex items-center gap-2 text-lg font-semibold text-slate-100">
@@ -1244,6 +1565,34 @@ export function ServerBookmarkSettingsModal({
             </div>
           ) : null}
 
+          {tab === "ssl" && sessionOk ? (
+            <div className="space-y-3">
+              <p className="text-xs leading-relaxed text-slate-500">
+                {tr(
+                  "Let’s Encrypt через gRPC: статус, выпуск, renew. Нужен активный gRPC, совпадающий с этой закладкой, и сопряжённый identity.",
+                  "Let’s Encrypt over gRPC: status, issue, renew. Requires the active gRPC to match this bookmark and a paired identity.",
+                )}
+              </p>
+              <SslManagementPanel
+                grpcUrl={bookmark.url}
+                projectId={projectId}
+                controlBase={controlBase}
+                sessionOk={sessionOk}
+                sameServerAsActive={sameServerAsActive}
+                language={language === "ru" ? "ru" : "en"}
+                onHostRestartHint={setHostRestartHint}
+                onRestartPending={async () => {
+                  setRestartPendingUntil(Date.now() + 90_000);
+                  try {
+                    await invoke("mark_control_api_recent_restart", { seconds: 90 });
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+              />
+            </div>
+          ) : null}
+
           {tab === "process" && sessionOk ? (
             <div className="space-y-4">
               <p className="text-sm text-slate-400">
@@ -1269,7 +1618,118 @@ export function ServerBookmarkSettingsModal({
           ) : null}
 
           {tab === "nginx" && sessionOk ? (
-            <div className="space-y-4">
+            <div className="relative space-y-4">
+              {nginxMiniDialog ? (
+                <div
+                  className="absolute inset-0 z-20 flex items-center justify-center rounded-xl bg-black/70 p-3 backdrop-blur-[2px]"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="nginx-mini-dialog-title"
+                >
+                  <div className="w-full max-w-sm rounded-xl border border-white/15 bg-[#0f0e0d] p-4 shadow-xl">
+                    {nginxMiniDialog.kind === "domain" ? (
+                      <>
+                        <h3 id="nginx-mini-dialog-title" className="text-sm font-semibold text-slate-100">
+                          {tr("Новый server_name", "New server_name")}
+                        </h3>
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          {tr("Один домен для первого блока server { } в этом файле.", "One domain for the first server { } block in this file.")}
+                        </p>
+                        <input
+                          type="text"
+                          value={nginxMiniDialog.draft}
+                          onChange={(e) =>
+                            setNginxMiniDialog({
+                              kind: "domain",
+                              path: nginxMiniDialog.path,
+                              draft: e.target.value,
+                            })
+                          }
+                          className="mt-3 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 font-mono text-sm text-slate-100 focus:border-amber-600/45 focus:outline-none"
+                          autoFocus
+                        />
+                        <div className="mt-3 flex justify-end gap-2">
+                          <button
+                            type="button"
+                            className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5"
+                            onClick={() => setNginxMiniDialog(null)}
+                          >
+                            {tr("Отмена", "Cancel")}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={nginxSiteBusy}
+                            className="rounded-lg border border-amber-800/40 bg-amber-950/40 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-950/60 disabled:opacity-50"
+                            onClick={() => {
+                              const d = nginxMiniDialog.draft.trim();
+                              const p = nginxMiniDialog.path;
+                              if (!d) return;
+                              setNginxMiniDialog(null);
+                              void runNginxAction({
+                                action: "set_server_name",
+                                path: p,
+                                server_name: d,
+                              });
+                            }}
+                          >
+                            {tr("Применить", "Apply")}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <h3 id="nginx-mini-dialog-title" className="text-sm font-semibold text-slate-100">
+                          {nginxMiniDialog.enable
+                            ? tr("Включить SSL?", "Enable SSL?")
+                            : tr("Отключить SSL?", "Disable SSL?")}
+                        </h3>
+                        <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                          {nginxMiniDialog.enable
+                            ? tr(
+                                "Будут добавлены listen 443 ssl и пути к сертификату. Если PEM ещё нет, будет запущен certbot (нужны SSL_EMAIL или acme_email, SSL_MODE, sudo для certbot).",
+                                "Adds listen 443 ssl and certificate paths. If the PEM is missing, certbot will run (set SSL_EMAIL or rely on request email, SSL_MODE, sudo for certbot).",
+                              )
+                            : tr(
+                                "Будут удалены listen 443 / ssl_* в первом server-блоке.",
+                                "Removes listen 443 / ssl_* in the first server block.",
+                              )}
+                        </p>
+                        <div className="mt-3 flex justify-end gap-2">
+                          <button
+                            type="button"
+                            className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5"
+                            onClick={() => setNginxMiniDialog(null)}
+                          >
+                            {tr("Отмена", "Cancel")}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={nginxSiteBusy}
+                            className="rounded-lg border border-amber-800/40 bg-amber-950/40 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-950/60 disabled:opacity-50"
+                            onClick={() => {
+                              const { path, enable } = nginxMiniDialog;
+                              setNginxMiniDialog(null);
+                              const site = nginxSitesPayload?.sites.find((s) => s.path === path);
+                              const post_check_host = site?.domains?.find(
+                                (d) => d && d !== "_" && !d.startsWith("*."),
+                              );
+                              void runNginxAction({
+                                action: "set_ssl",
+                                path,
+                                ssl_enabled: enable,
+                                ...(post_check_host ? { post_check_host } : {}),
+                                ...(enable ? { issue_certificate_if_missing: true } : {}),
+                              });
+                            }}
+                          >
+                            {tr("Подтвердить", "Confirm")}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ) : null}
               <div className="rounded-xl border border-white/10 bg-black/25 p-3 text-sm text-slate-300">
                 <p className="font-semibold text-slate-100">{t("auto.ServerBookmarkSettingsModal_tsx.51")}</p>
                 <p className="mt-2 text-xs text-slate-400">
@@ -1289,7 +1749,8 @@ export function ServerBookmarkSettingsModal({
                   {t("auto.ServerBookmarkSettingsModal_tsx.54")}: {nginxStatus?.site_file_exists ? t("auto.ServerBookmarkSettingsModal_tsx.55") : t("auto.ServerBookmarkSettingsModal_tsx.56")}; enabled:{" "}
                   {nginxStatus?.site_enabled ? t("auto.ServerBookmarkSettingsModal_tsx.57") : t("auto.ServerBookmarkSettingsModal_tsx.58")}; ensure-script:{" "}
                   {nginxStatus?.ensure_script_present ? "ok" : t("auto.ServerBookmarkSettingsModal_tsx.59")}; apply-script:{" "}
-                  {nginxStatus?.apply_site_script_present ? "ok" : t("auto.ServerBookmarkSettingsModal_tsx.60")}
+                  {nginxStatus?.apply_site_script_present ? "ok" : t("auto.ServerBookmarkSettingsModal_tsx.60")}; ops:{" "}
+                  {nginxStatus?.ops_script_present ? "ok" : "—"}
                 </p>
                 <p className="mt-2 text-xs text-slate-500">
                   {nginxInstalled
@@ -1361,38 +1822,358 @@ export function ServerBookmarkSettingsModal({
                   onClick={() => {
                     void loadNginxStatus();
                     void loadNginxSite();
+                    void loadNginxInventory();
                   }}
                   className={`${btnBase} border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10`}
                 >
                   {nginxSiteBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
                   {t("auto.ServerBookmarkSettingsModal_tsx.64")}
                 </button>
-              </div>
-
-              <p className="text-xs text-slate-500">
-                Конфиг сайта nginx: <code className="text-slate-400">{nginxSitePath ?? "—"}</code>
-              </p>
-              <textarea
-                value={nginxSiteText}
-                onChange={(e) => {
-                  setNginxSiteText(e.target.value);
-                  setNginxSiteDirty(true);
-                }}
-                rows={14}
-                className="w-full rounded-xl border border-white/10 bg-black/35 px-3 py-2 font-mono text-xs text-slate-100 focus:border-amber-600/45 focus:outline-none"
-                spellCheck={false}
-              />
-              <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
-                  disabled={nginxSiteBusy || !nginxSiteDirty}
-                  onClick={() => void saveNginxSite()}
-                  className={`${btnBase} bg-gradient-to-r from-red-700 to-red-900 text-white shadow-lg shadow-red-950/40 hover:brightness-110 disabled:opacity-40`}
+                  disabled={nginxSiteBusy}
+                  onClick={() => void runNginxPreflight()}
+                  className={`${btnBase} border border-amber-800/30 bg-amber-950/25 text-amber-100 hover:bg-amber-950/45`}
                 >
                   {nginxSiteBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  {t("auto.ServerBookmarkSettingsModal_tsx.65")}
+                  {tr("Проверка конфликтов (preflight)", "Conflict check (preflight)")}
+                </button>
+                <button
+                  type="button"
+                  disabled={nginxSiteBusy}
+                  onClick={() => void runNginxAction({ action: "validate" })}
+                  className={`${btnBase} border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10`}
+                >
+                  {tr("nginx -t (validate)", "nginx -t (validate)")}
+                </button>
+                <button
+                  type="button"
+                  disabled={nginxSiteBusy}
+                  onClick={() => void runNginxAction({ action: "reload" })}
+                  className={`${btnBase} border border-emerald-800/30 bg-emerald-950/25 text-emerald-100 hover:bg-emerald-950/45`}
+                >
+                  {tr("Перезагрузить nginx", "Reload nginx")}
                 </button>
               </div>
+
+              {nginxSitesPayload && !nginxSitesPayload.ok && nginxSitesPayload.nginx_test_output ? (
+                <p className="text-xs text-amber-200/90">
+                  {tr("Предупреждение: последний nginx -t на сервере не прошёл (см. вывод).", "Warning: last nginx -t on server failed (see output).")}{" "}
+                  <code className="text-[10px] text-slate-400 break-all">
+                    {nginxSitesPayload.nginx_test_output.slice(0, 400)}
+                  </code>
+                </p>
+              ) : null}
+
+              {nginxSitesPayload && nginxSitesPayload.global_warnings.length > 0 ? (
+                <div className="rounded-xl border border-amber-800/30 bg-amber-950/15 p-3 text-xs text-amber-100/90">
+                  <p className="font-semibold text-amber-200">
+                    {tr("Предупреждения", "Warnings")}
+                  </p>
+                  <ul className="mt-1 list-inside list-disc space-y-0.5 text-[11px] text-amber-100/80">
+                    {nginxSitesPayload.global_warnings.map((w) => (
+                      <li key={w}>{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {nginxSitesPayload && nginxSitesPayload.global_conflicts.length > 0 ? (
+                <div className="rounded-xl border border-rose-800/40 bg-rose-950/20 p-3 text-xs text-rose-100/90">
+                  <p className="font-semibold text-rose-200">
+                    {tr("Конфликты (домены / дубликаты)", "Conflicts (domains / duplicates)")}
+                  </p>
+                  <ul className="mt-1 list-inside list-disc space-y-0.5 text-[11px]">
+                    {nginxSitesPayload.global_conflicts.map((c) => (
+                      <li key={c.message}>{c.message}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {nginxPreflightBlockers.length > 0 ? (
+                <div className="rounded-xl border border-rose-800/40 bg-rose-950/20 p-3 text-xs text-rose-100/90">
+                  <p className="font-semibold text-rose-200">
+                    {tr("Блокирующие проверки preflight", "Preflight blockers")}
+                  </p>
+                  <ul className="mt-1 list-inside list-disc space-y-0.5 text-[11px]">
+                    {nginxPreflightBlockers.map((b) => (
+                      <li key={b.message}>{b.message}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {nginxSitesPayload ? (
+                <>
+                <div className="overflow-x-auto rounded-xl border border-white/10">
+                  <table className="min-w-full border-collapse text-left text-[11px] text-slate-200">
+                    <thead className="bg-black/40 text-slate-400">
+                      <tr>
+                        <th className="border-b border-white/10 px-2 py-2 font-medium">
+                          {tr("Файл / путь", "File / path")}
+                        </th>
+                        <th className="border-b border-white/10 px-2 py-2 font-medium">kind</th>
+                        <th className="border-b border-white/10 px-2 py-2 font-medium">
+                          {tr("Активен", "Active")}
+                        </th>
+                        <th className="border-b border-white/10 px-2 py-2 font-medium">managed</th>
+                        <th className="border-b border-white/10 px-2 py-2 font-medium">SSL</th>
+                        <th className="border-b border-white/10 px-2 py-2 font-medium">UI</th>
+                        <th className="border-b border-white/10 px-2 py-2 font-medium">
+                          {tr("Домены", "Domains")}
+                        </th>
+                        <th className="border-b border-white/10 px-2 py-2 font-medium">
+                          {tr("Действия", "Actions")}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {nginxSitesPayload.sites.length === 0 ? (
+                        <tr>
+                          <td colSpan={8} className="px-2 py-4 text-center text-slate-500">
+                            {tr("Нет файлов в известных каталогах.", "No files found in scanned paths.")}
+                          </td>
+                        </tr>
+                      ) : null}
+                      {nginxSitesPayload.sites.map((row) => {
+                        const vhost = row.entry_kind === "vhost";
+                        const activeLabel = vhost
+                          ? row.active
+                            ? tr("да (sites-enabled)", "yes (enabled)")
+                            : tr("нет", "no")
+                          : tr("вкл. в main", "via main");
+                        return (
+                          <tr
+                            key={row.site_id}
+                            className={`border-b border-white/5 hover:bg-white/[0.03] ${
+                              nginxFileEditor?.path === row.path
+                                ? "bg-cyan-950/20 ring-1 ring-inset ring-cyan-700/30"
+                                : ""
+                            }`}
+                          >
+                            <td className="px-2 py-1.5 align-top">
+                              <button
+                                type="button"
+                                disabled={nginxSiteBusy}
+                                onClick={() => openNginxFileEditor(row.path)}
+                                title={tr("Открыть содержимое файла", "Open file contents")}
+                                className="w-full max-w-[240px] rounded-lg border border-transparent px-1 py-0.5 text-left transition-colors hover:border-white/15 hover:bg-white/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-600/50 disabled:opacity-50"
+                              >
+                                <div className="font-mono text-[10px] text-amber-100/80 break-all">
+                                  {row.file_name}
+                                </div>
+                                <div className="mt-0.5 break-all text-[9px] text-slate-500">{row.path}</div>
+                              </button>
+                            </td>
+                            <td className="px-2 py-1.5 align-top text-slate-400">{row.entry_kind}</td>
+                            <td className="px-2 py-1.5 align-top text-slate-300">{activeLabel}</td>
+                            <td className="px-2 py-1.5 align-top">
+                              <span
+                                className={
+                                  row.managed_by === "pirate"
+                                    ? "rounded border border-cyan-700/50 bg-cyan-950/40 px-1.5 py-0.5 text-cyan-200"
+                                    : "text-slate-500"
+                                }
+                              >
+                                {row.managed_by}
+                              </span>
+                            </td>
+                            <td className="px-2 py-1.5 align-top">
+                              {row.ssl_enabled ? (
+                                <span className="text-emerald-300">on</span>
+                              ) : (
+                                <span className="text-slate-500">off</span>
+                              )}
+                            </td>
+                            <td className="px-2 py-1.5 align-top">
+                              {row.is_ui_stack ? (
+                                <span className="text-violet-300">UI</span>
+                              ) : (
+                                "—"
+                              )}
+                            </td>
+                            <td className="px-2 py-1.5 align-top break-all text-slate-400">
+                              {row.domains.join(", ")}
+                            </td>
+                            <td className="px-2 py-1.5 align-top">
+                              <div className="flex max-w-[280px] flex-wrap gap-1">
+                                {vhost && !row.active ? (
+                                  <button
+                                    type="button"
+                                    disabled={nginxSiteBusy}
+                                    onClick={() =>
+                                      void runNginxAction({ action: "enable_site", available_path: row.path })
+                                    }
+                                    className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
+                                  >
+                                    {tr("Вкл.", "Enable")}
+                                  </button>
+                                ) : null}
+                                {vhost && row.active ? (
+                                  <button
+                                    type="button"
+                                    disabled={nginxSiteBusy}
+                                    onClick={() => {
+                                      const ep =
+                                        row.enabled_path && row.enabled_path.length > 0
+                                          ? row.enabled_path
+                                          : `/etc/nginx/sites-enabled/${row.file_name}`;
+                                      void runNginxAction({ action: "disable_site", enabled_path: ep });
+                                    }}
+                                    className="rounded border border-rose-800/30 bg-rose-950/30 px-1.5 py-0.5 text-[10px] text-rose-100"
+                                  >
+                                    {tr("Выкл.", "Disable")}
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  disabled={nginxSiteBusy}
+                                  onClick={() => {
+                                    const initial =
+                                      row.domains[0] && row.domains[0] !== "_" ? row.domains[0] : "";
+                                    setNginxMiniDialog({
+                                      kind: "domain",
+                                      path: row.path,
+                                      draft: initial,
+                                    });
+                                  }}
+                                  className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
+                                >
+                                  {tr("Домен", "Domain")}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={nginxSiteBusy}
+                                  onClick={() => {
+                                    setNginxMiniDialog({
+                                      kind: "ssl",
+                                      path: row.path,
+                                      enable: !row.ssl_enabled,
+                                    });
+                                  }}
+                                  className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
+                                >
+                                  SSL {row.ssl_enabled ? tr("off", "off") : tr("on", "on")}
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                {nginxFileEditor ? (
+                  <div className="mt-3 rounded-xl border border-cyan-800/40 bg-[#0c0b0a] p-4 space-y-3">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-semibold text-slate-200">
+                          {tr("Файл nginx", "Nginx file")}
+                        </p>
+                        <code className="mt-1 block break-all text-[10px] leading-snug text-amber-200/85">
+                          {nginxFileEditor.path}
+                        </code>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={nginxSiteBusy || nginxFileEditor.loading}
+                          onClick={() => reloadNginxFileEditor()}
+                          className={`${btnBase} border border-white/15 bg-white/5 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10`}
+                        >
+                          {nginxSiteBusy || nginxFileEditor.loading ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : null}
+                          {tr("Обновить с сервера", "Reload from server")}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            nginxSiteBusy ||
+                            nginxFileEditor.loading ||
+                            nginxFileEditor.readOnly ||
+                            !nginxFileEditor.dirty
+                          }
+                          onClick={() => void saveNginxInventoryFile()}
+                          className={`${btnBase} border border-emerald-800/35 bg-emerald-950/30 px-3 py-1.5 text-xs text-emerald-100 hover:bg-emerald-950/50 disabled:opacity-40`}
+                        >
+                          {nginxSiteBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                          {tr("Сохранить", "Save")}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={nginxSiteBusy}
+                          onClick={() => setNginxFileEditor(null)}
+                          className={`${btnBase} border border-white/10 bg-transparent px-3 py-1.5 text-xs text-slate-400 hover:bg-white/5`}
+                        >
+                          {tr("Закрыть", "Close")}
+                        </button>
+                      </div>
+                    </div>
+                    {nginxFileEditor.readOnlyReason ? (
+                      <p className="text-[11px] leading-relaxed text-amber-200/90">{nginxFileEditor.readOnlyReason}</p>
+                    ) : null}
+                    {nginxFileEditor.loading ? (
+                      <div className="flex items-center gap-2 py-8 text-sm text-slate-500">
+                        <Loader2 className="h-5 w-5 animate-spin shrink-0" />
+                        {tr("Загрузка…", "Loading…")}
+                      </div>
+                    ) : (
+                      <textarea
+                        value={nginxFileEditor.content}
+                        readOnly={nginxFileEditor.readOnly}
+                        onChange={(e) =>
+                          setNginxFileEditor((prev) =>
+                            prev ? { ...prev, content: e.target.value, dirty: true } : null,
+                          )
+                        }
+                        rows={18}
+                        spellCheck={false}
+                        className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 font-mono text-[11px] leading-relaxed text-slate-100 focus:border-cyan-700/45 focus:outline-none read-only:opacity-80"
+                      />
+                    )}
+                  </div>
+                ) : null}
+                </>
+              ) : !nginxSiteBusy ? (
+                <p className="text-xs text-slate-500">
+                  {tr(
+                    "Список конфигов недоступен: обновите control-api на сервере (нужен GET /api/v1/nginx/sites) или нажмите «Обновить».",
+                    "Config list unavailable: upgrade control-api (GET /api/v1/nginx/sites) or press refresh.",
+                  )}
+                </p>
+              ) : null}
+
+              <details className="rounded-xl border border-white/10 bg-black/20 p-3">
+                <summary className="cursor-pointer text-sm text-slate-200">
+                  {tr("Расширенно: сырой vhost (Pirate site)", "Advanced: raw vhost (Pirate site file)")}
+                </summary>
+                <p className="mt-2 text-xs text-slate-500">
+                  {tr("Путь", "Path")}: <code className="text-slate-400">{nginxSitePath ?? "—"}</code>
+                </p>
+                <textarea
+                  value={nginxSiteText}
+                  onChange={(e) => {
+                    setNginxSiteText(e.target.value);
+                    setNginxSiteDirty(true);
+                  }}
+                  rows={10}
+                  className="mt-2 w-full rounded-xl border border-white/10 bg-black/35 px-3 py-2 font-mono text-xs text-slate-100 focus:border-amber-600/45 focus:outline-none"
+                  spellCheck={false}
+                />
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={nginxSiteBusy || !nginxSiteDirty}
+                    onClick={() => void saveNginxSite()}
+                    className={`${btnBase} bg-gradient-to-r from-red-700 to-red-900 text-white shadow-lg shadow-red-950/40 hover:brightness-110 disabled:opacity-40`}
+                  >
+                    {nginxSiteBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                    {t("auto.ServerBookmarkSettingsModal_tsx.65")}
+                  </button>
+                </div>
+              </details>
               <CopyablePre
                 value={nginxOut}
                 placeholder="—"

@@ -147,19 +147,33 @@ fn pirate_cli_path_info(app: tauri::AppHandle) -> Result<PirateCliPathInfo, Stri
         .as_ref()
         .and_then(|p| pirate_version_from_bin(p));
 
-    let needs_update = match (&path_bin, &bundled_version) {
-        (Some(pb), Some(bv)) => {
+    let needs_update = match &path_bin {
+        None => false,
+        Some(pb) => {
             if same_executable(pb, &bundled) {
                 false
             } else {
-                match &path_version {
-                    Some(pv) => pv != bv,
-                    None => true,
+                match (&path_version, &bundled_version) {
+                    // Normal path: compare semantic versions from `pirate --version`.
+                    (Some(pv), Some(bv)) => pv != bv,
+                    // If PATH binary can't report version, still force refresh.
+                    (None, _) => true,
+                    // If bundled binary version can't be read (e.g. platform execution restrictions),
+                    // still force refresh because PATH points to a different executable.
+                    (Some(_), None) => true,
                 }
             }
         }
-        _ => false,
     };
+
+    tracing::info!(
+        path_in_path = ?path_in_path,
+        path_version = ?path_version,
+        bundled = %bundled.display(),
+        bundled_version = ?bundled_version,
+        needs_update,
+        "pirate_cli_path_info"
+    );
 
     Ok(PirateCliPathInfo {
         path_in_path,
@@ -407,6 +421,60 @@ fn fetch_remote_host_stats_detail(
     limit: u32,
 ) -> Result<String, String> {
     pirate_desktop::fetch_host_stats_detail_json(kind, top, q, limit)
+}
+
+#[tauri::command]
+fn ssl_status_json(grpc_url: String, project_id: String) -> Result<String, String> {
+    pirate_desktop::ssl_status_json(&grpc_url, &project_id)
+}
+
+#[tauri::command]
+fn ssl_create(
+    grpc_url: String,
+    project_id: String,
+    domains: Vec<String>,
+    mode: i32,
+    webroot_path: String,
+    dry_run: bool,
+    staging: bool,
+) -> Result<String, String> {
+    pirate_desktop::ssl_create_json(
+        &grpc_url,
+        &project_id,
+        domains,
+        mode,
+        &webroot_path,
+        dry_run,
+        staging,
+    )
+}
+
+#[tauri::command]
+fn ssl_update(
+    grpc_url: String,
+    project_id: String,
+    exact_domain: String,
+    glob_pattern: String,
+    regex: String,
+    dry_run: bool,
+) -> Result<String, String> {
+    pirate_desktop::ssl_update_json(
+        &grpc_url,
+        &project_id,
+        &exact_domain,
+        &glob_pattern,
+        &regex,
+        dry_run,
+    )
+}
+
+#[tauri::command]
+fn ssl_check_and_renew(
+    grpc_url: String,
+    project_id: String,
+    force_all: bool,
+) -> Result<String, String> {
+    pirate_desktop::ssl_check_and_renew_json(&grpc_url, &project_id, force_all)
 }
 
 /// `GET {base}/api/v1/host-stats/series` for `net_rx` and `net_tx` (control-api; requires
@@ -664,13 +732,589 @@ fn control_api_fetch_host_services_json() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn control_api_host_service_install(id: String) -> Result<String, String> {
-    pirate_desktop::control_api_host_service_install(&id)
+fn control_api_host_service_install(
+    id: String,
+    install_env_json: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_service_install(&id, install_env_json.as_deref())
 }
 
 #[tauri::command]
 fn control_api_host_service_remove(id: String) -> Result<String, String> {
     pirate_desktop::control_api_host_service_remove(&id)
+}
+
+#[tauri::command]
+fn control_api_host_service_runtime_get_json(id: String) -> Result<String, String> {
+    pirate_desktop::control_api_host_service_runtime_get_json(&id)
+}
+
+#[tauri::command]
+fn control_api_host_service_runtime_put_json(id: String, body_json: String) -> Result<String, String> {
+    pirate_desktop::control_api_host_service_runtime_put_json(&id, &body_json)
+}
+
+#[tauri::command]
+fn control_api_host_service_restart(id: String) -> Result<String, String> {
+    pirate_desktop::control_api_host_service_restart(&id)
+}
+
+#[tauri::command]
+fn control_api_host_databases_list_json() -> Result<String, String> {
+    pirate_desktop::control_api_host_databases_list_json()
+}
+
+#[tauri::command]
+fn control_api_host_db_schemas_json(
+    instance_id: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_schemas_json(
+        &instance_id,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_tables_json(
+    instance_id: String,
+    schema: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_tables_json(
+        &instance_id,
+        &schema,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_columns_json(
+    instance_id: String,
+    schema: String,
+    table: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_columns_json(
+        &instance_id,
+        &schema,
+        &table,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_rows_json(
+    instance_id: String,
+    schema: String,
+    table: String,
+    limit: u32,
+    offset: u32,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_rows_json(
+        &instance_id,
+        &schema,
+        &table,
+        limit,
+        offset,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_relationships_json(
+    instance_id: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_relationships_json(
+        &instance_id,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_query_json(
+    instance_id: String,
+    sql: String,
+    max_rows: u32,
+    db_user: Option<String>,
+    db_password: Option<String>,
+    database: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_query_json(
+        &instance_id,
+        &sql,
+        max_rows,
+        db_user.as_deref(),
+        db_password.as_deref(),
+        database.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_redis_keys_json(
+    instance_id: String,
+    pattern: String,
+    cursor: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_redis_keys_json(
+        &instance_id,
+        &pattern,
+        &cursor,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_mongo_databases_json(
+    instance_id: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_mongo_databases_json(
+        &instance_id,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_mongo_collections_json(
+    instance_id: String,
+    db: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_mongo_collections_json(
+        &instance_id,
+        &db,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_mongo_preview_json(
+    instance_id: String,
+    db: String,
+    collection: String,
+    limit: u32,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_mongo_preview_json(
+        &instance_id,
+        &db,
+        &collection,
+        limit,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_capabilities_json() -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_capabilities_json()
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_object_tree_json(
+    instance_id: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_object_tree_json(
+        &instance_id,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_grid_json(
+    instance_id: String,
+    schema: String,
+    table: String,
+    limit: u32,
+    offset: u32,
+    sort_column: Option<String>,
+    sort_desc: bool,
+    filter_column: Option<String>,
+    filter_value: Option<serde_json::Value>,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_grid_json(
+        &instance_id,
+        &schema,
+        &table,
+        limit,
+        offset,
+        sort_column.as_deref(),
+        sort_desc,
+        filter_column.as_deref(),
+        filter_value,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_row_mutate_json(
+    instance_id: String,
+    op: String,
+    schema: String,
+    table: String,
+    pk: Option<serde_json::Map<String, serde_json::Value>>,
+    row: serde_json::Value,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_row_mutate_json(
+        &instance_id,
+        &op,
+        &schema,
+        &table,
+        pk,
+        row,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_sql_job_start_json(
+    instance_id: String,
+    sql: String,
+    max_rows: u32,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_sql_job_start_json(
+        &instance_id,
+        &sql,
+        max_rows,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_sql_job_get_json(
+    instance_id: String,
+    job_id: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_sql_job_get_json(
+        &instance_id,
+        &job_id,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_sql_job_cancel_json(
+    instance_id: String,
+    job_id: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_sql_job_cancel_json(
+        &instance_id,
+        &job_id,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_migration_status_get_json(
+    instance_id: String,
+    database: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+    tools: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_migration_status_get_json(
+        &instance_id,
+        &database,
+        db_user.as_deref(),
+        db_password.as_deref(),
+        tools.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_migration_status_post_json(
+    instance_id: String,
+    database: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+    tools: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_migration_status_post_json(
+        &instance_id,
+        &database,
+        db_user.as_deref(),
+        db_password.as_deref(),
+        tools.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_admin_create_database_json(
+    instance_id: String,
+    database: String,
+    owner: Option<String>,
+    encoding: Option<String>,
+    if_not_exists: Option<bool>,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_admin_create_database_json(
+        &instance_id,
+        &database,
+        owner.as_deref(),
+        encoding.as_deref(),
+        if_not_exists.unwrap_or(false),
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_admin_create_table_json(
+    instance_id: String,
+    body_json: String,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_admin_create_table_json(&instance_id, &body_json)
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_admin_create_user_json(
+    instance_id: String,
+    body_json: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_admin_create_user_json(
+        &instance_id,
+        &body_json,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_admin_delete_user_json(
+    instance_id: String,
+    body_json: String,
+    db_user: Option<String>,
+    db_password: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_admin_delete_user_json(
+        &instance_id,
+        &body_json,
+        db_user.as_deref(),
+        db_password.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn control_api_host_db_v2_migration_run_json(
+    instance_id: String,
+    tool: String,
+    workdir: String,
+) -> Result<String, String> {
+    pirate_desktop::control_api_host_db_v2_migration_run_json(&instance_id, &tool, &workdir)
+}
+
+/// Saved DB username / encrypted password file state for host-db viewer (per `instance_id`).
+#[tauri::command]
+fn db_credentials_get_json(instance_id: String) -> Result<String, String> {
+    pirate_desktop::db_credentials_get_json(&instance_id)
+}
+
+#[tauri::command]
+fn db_credentials_save(
+    instance_id: String,
+    username: String,
+    password: String,
+    remember: bool,
+) -> Result<(), String> {
+    pirate_desktop::db_credentials_save(&instance_id, &username, &password, remember)
+}
+
+#[tauri::command]
+fn db_credentials_forget(instance_id: String) -> Result<(), String> {
+    pirate_desktop::db_credentials_forget(&instance_id)
+}
+
+#[tauri::command]
+fn db_local_forward_start(target_host: String, target_port: u16) -> Result<u16, String> {
+    pirate_desktop::db_local_forward_start(&target_host, target_port)
+}
+
+#[tauri::command]
+fn db_local_forward_stop() -> Result<(), String> {
+    pirate_desktop::db_local_forward_stop()
+}
+
+#[tauri::command]
+fn db_local_forward_local_port() -> Option<u16> {
+    pirate_desktop::db_local_forward_local_port()
+}
+
+#[tauri::command]
+fn db_tunnel_list_json() -> Result<String, String> {
+    pirate_desktop::db_tunnel_list_json()
+}
+
+#[tauri::command]
+fn db_tunnel_tcp_start(id: String, target_host: String, target_port: u16) -> Result<u16, String> {
+    pirate_desktop::db_tunnel_tcp_start(id, &target_host, target_port)
+}
+
+#[tauri::command]
+fn db_tunnel_tcp_stop(id: String) -> Result<(), String> {
+    pirate_desktop::db_tunnel_tcp_stop(&id)
+}
+
+#[tauri::command]
+fn db_tunnel_ssh_start(
+    id: String,
+    ssh_host: String,
+    ssh_port: u16,
+    ssh_user: String,
+    remote_host: String,
+    remote_port: u16,
+    local_port: u16,
+    identity_path: Option<String>,
+) -> Result<u16, String> {
+    pirate_desktop::db_tunnel_ssh_start(
+        id,
+        &ssh_host,
+        ssh_port,
+        &ssh_user,
+        &remote_host,
+        remote_port,
+        local_port,
+        identity_path.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn db_tunnel_ssh_stop(id: String) -> Result<(), String> {
+    pirate_desktop::db_tunnel_ssh_stop(&id)
+}
+
+#[tauri::command]
+async fn db_direct_test(
+    req: pirate_desktop::DirectTestRequest,
+) -> Result<pirate_desktop::DirectTestResponse, String> {
+    pirate_desktop::direct_test(req).await
+}
+
+#[tauri::command]
+async fn db_direct_open(
+    req: pirate_desktop::DirectOpenRequest,
+) -> Result<serde_json::Value, String> {
+    pirate_desktop::direct_open(req).await
+}
+
+#[tauri::command]
+fn db_direct_close(session_id: String) -> Result<serde_json::Value, String> {
+    pirate_desktop::direct_close(session_id)
+}
+
+#[tauri::command]
+async fn db_direct_list_databases(session_id: String) -> Result<String, String> {
+    pirate_desktop::direct_list_databases(&session_id).await
+}
+
+#[tauri::command]
+async fn db_direct_list_schemas(session_id: String) -> Result<String, String> {
+    pirate_desktop::direct_list_schemas(&session_id).await
+}
+
+#[tauri::command]
+async fn db_direct_list_tables(session_id: String, schema: String) -> Result<String, String> {
+    pirate_desktop::direct_list_tables(&session_id, &schema).await
+}
+
+#[tauri::command]
+async fn db_direct_table_preview(
+    req: pirate_desktop::DirectPreviewRequest,
+) -> Result<String, String> {
+    pirate_desktop::direct_table_preview(req).await
+}
+
+#[tauri::command]
+async fn db_direct_query(req: pirate_desktop::DirectQueryRequest) -> Result<String, String> {
+    pirate_desktop::direct_query(req).await
+}
+
+#[tauri::command]
+async fn db_direct_heartbeat(session_id: String) -> Result<String, String> {
+    pirate_desktop::direct_heartbeat(&session_id).await
+}
+
+#[tauri::command]
+async fn db_direct_pg_stats(session_id: String) -> Result<String, String> {
+    pirate_desktop::direct_pg_stats_json(&session_id).await
+}
+
+#[tauri::command]
+async fn db_direct_pg_structure(
+    req: pirate_desktop::DirectStructureRequest,
+) -> Result<String, String> {
+    pirate_desktop::direct_pg_structure_json(req).await
+}
+
+#[tauri::command]
+fn db_direct_profile_list_json() -> Result<String, String> {
+    pirate_desktop::direct_profile_list_json()
+}
+
+#[tauri::command]
+fn db_direct_profile_upsert(
+    body: String,
+    password: Option<String>,
+) -> Result<String, String> {
+    let u: pirate_desktop::DirectProfileUpsert =
+        serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    pirate_desktop::direct_profile_upsert(&u, password.as_deref())
+}
+
+#[tauri::command]
+fn db_direct_profile_delete(id: String) -> Result<(), String> {
+    pirate_desktop::direct_profile_delete(&id)
+}
+
+#[tauri::command]
+fn db_direct_password_set(profile_id: String, password: String) -> Result<(), String> {
+    pirate_desktop::direct_password_set(&profile_id, &password)
+}
+
+#[tauri::command]
+fn db_direct_query_history_list(connection_id: String, limit: i64) -> Result<String, String> {
+    pirate_desktop::query_history_list_json(&connection_id, limit)
 }
 
 #[tauri::command]
@@ -684,8 +1328,123 @@ fn control_api_put_nginx_site(content: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn control_api_fetch_nginx_file_json(path: String) -> Result<String, String> {
+    pirate_desktop::control_api_fetch_nginx_file_json(&path)
+}
+
+#[tauri::command]
+fn control_api_put_nginx_file_json(path: String, content: String) -> Result<String, String> {
+    pirate_desktop::control_api_put_nginx_file_json(&path, &content)
+}
+
+#[tauri::command]
+fn control_api_storage_tree_json(path: String) -> Result<String, String> {
+    pirate_desktop::control_api_storage_tree_json(&path)
+}
+
+#[tauri::command]
+fn control_api_storage_usage_json() -> Result<String, String> {
+    pirate_desktop::control_api_storage_usage_json()
+}
+
+#[tauri::command]
+fn control_api_storage_create_folder(path: String) -> Result<(), String> {
+    pirate_desktop::control_api_storage_create_folder(&path)
+}
+
+#[tauri::command]
+fn control_api_storage_delete_file(path: String) -> Result<(), String> {
+    pirate_desktop::control_api_storage_delete_file(&path)
+}
+
+#[tauri::command]
+fn control_api_storage_delete_folder(path: String, recursive: bool) -> Result<(), String> {
+    pirate_desktop::control_api_storage_delete_folder(&path, recursive)
+}
+
+#[tauri::command]
+fn control_api_storage_rename(from: String, to: String) -> Result<(), String> {
+    pirate_desktop::control_api_storage_rename(&from, &to)
+}
+
+#[tauri::command]
+fn control_api_storage_upload_file(remote_path: String, local_file: String) -> Result<String, String> {
+    pirate_desktop::control_api_storage_upload_file(&remote_path, &local_file)
+}
+
+#[tauri::command]
+fn control_api_storage_download_file(remote_path: String, local_path: String) -> Result<(), String> {
+    pirate_desktop::control_api_storage_download_file(&remote_path, &local_path)
+}
+
+#[tauri::command]
+fn control_api_storage_extract_json(
+    archive_path: String,
+    target_dir: Option<String>,
+    conflict_mode: String,
+) -> Result<String, String> {
+    let td = target_dir.as_deref();
+    pirate_desktop::control_api_storage_extract_json(&archive_path, td, &conflict_mode)
+}
+
+#[tauri::command]
+fn control_api_storage_bind_sources_json() -> Result<String, String> {
+    pirate_desktop::control_api_storage_bind_sources_json()
+}
+
+#[tauri::command]
+fn control_api_storage_bind_json(source_path: String, volume_name: String) -> Result<String, String> {
+    pirate_desktop::control_api_storage_bind_json(&source_path, &volume_name)
+}
+
+#[tauri::command]
+fn control_api_storage_unbind_json(volume_name: String) -> Result<String, String> {
+    pirate_desktop::control_api_storage_unbind_json(&volume_name)
+}
+
+#[tauri::command]
+fn pick_file_for_storage_upload() -> Result<Option<String>, String> {
+    Ok(rfd::FileDialog::new()
+        .pick_file()
+        .map(|p| p.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn pick_files_for_storage_upload() -> Result<Option<Vec<String>>, String> {
+    Ok(rfd::FileDialog::new().pick_files().map(|paths| {
+        paths
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect()
+    }))
+}
+
+#[tauri::command]
+fn pick_save_path_for_storage_download(suggested: String) -> Result<Option<String>, String> {
+    Ok(rfd::FileDialog::new()
+        .set_file_name(&suggested)
+        .save_file()
+        .map(|p| p.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
 fn control_api_ensure_nginx(mode: String) -> Result<String, String> {
     pirate_desktop::control_api_ensure_nginx(&mode)
+}
+
+#[tauri::command]
+fn control_api_fetch_nginx_sites_json() -> Result<String, String> {
+    pirate_desktop::control_api_fetch_nginx_sites_json()
+}
+
+#[tauri::command]
+fn control_api_nginx_preflight_json(body: String) -> Result<String, String> {
+    pirate_desktop::control_api_nginx_preflight_json(&body)
+}
+
+#[tauri::command]
+fn control_api_nginx_action_json(body: String) -> Result<String, String> {
+    pirate_desktop::control_api_nginx_action_json(&body)
 }
 
 #[tauri::command]
@@ -1100,9 +1859,84 @@ fn main() {
             control_api_fetch_host_services_json, // GET /api/v1/host-services (JWT)
             control_api_host_service_install, // POST /api/v1/host-services/:id/install (JWT)
             control_api_host_service_remove, // POST /api/v1/host-services/:id/remove (JWT)
+            control_api_host_service_runtime_get_json, // GET /api/v1/host-services/:id/runtime-config (JWT)
+            control_api_host_service_runtime_put_json, // PUT /api/v1/host-services/:id/runtime-config (JWT)
+            control_api_host_service_restart, // POST /api/v1/host-services/:id/restart (JWT)
+            control_api_host_databases_list_json,
+            control_api_host_db_schemas_json,
+            control_api_host_db_tables_json,
+            control_api_host_db_columns_json,
+            control_api_host_db_rows_json,
+            control_api_host_db_relationships_json,
+            control_api_host_db_query_json,
+            control_api_host_db_redis_keys_json,
+            control_api_host_db_mongo_databases_json,
+            control_api_host_db_mongo_collections_json,
+            control_api_host_db_mongo_preview_json,
+            control_api_host_db_v2_capabilities_json,
+            control_api_host_db_v2_object_tree_json,
+            control_api_host_db_v2_grid_json,
+            control_api_host_db_v2_row_mutate_json,
+            control_api_host_db_v2_sql_job_start_json,
+            control_api_host_db_v2_sql_job_get_json,
+            control_api_host_db_v2_sql_job_cancel_json,
+            control_api_host_db_v2_migration_status_get_json,
+            control_api_host_db_v2_migration_status_post_json,
+            control_api_host_db_v2_admin_create_database_json,
+            control_api_host_db_v2_admin_create_table_json,
+            control_api_host_db_v2_admin_create_user_json,
+            control_api_host_db_v2_admin_delete_user_json,
+            control_api_host_db_v2_migration_run_json,
+            db_credentials_get_json,
+            db_credentials_save,
+            db_credentials_forget,
+            db_local_forward_start,
+            db_local_forward_stop,
+            db_local_forward_local_port,
+            db_tunnel_list_json,
+            db_tunnel_tcp_start,
+            db_tunnel_tcp_stop,
+            db_tunnel_ssh_start,
+            db_tunnel_ssh_stop,
+            db_direct_test,
+            db_direct_open,
+            db_direct_close,
+            db_direct_list_databases,
+            db_direct_list_schemas,
+            db_direct_list_tables,
+            db_direct_table_preview,
+            db_direct_query,
+            db_direct_heartbeat,
+            db_direct_pg_stats,
+            db_direct_pg_structure,
+            db_direct_profile_list_json,
+            db_direct_profile_upsert,
+            db_direct_profile_delete,
+            db_direct_password_set,
+            db_direct_query_history_list,
             control_api_fetch_nginx_site_json, // GET /api/v1/nginx/site (JWT)
             control_api_put_nginx_site, // PUT /api/v1/nginx/site (JWT)
+            control_api_fetch_nginx_file_json, // GET /api/v1/nginx/file (JWT)
+            control_api_put_nginx_file_json, // PUT /api/v1/nginx/file (JWT)
+            control_api_storage_tree_json,
+            control_api_storage_usage_json,
+            control_api_storage_create_folder,
+            control_api_storage_delete_file,
+            control_api_storage_delete_folder,
+            control_api_storage_rename,
+            control_api_storage_upload_file,
+            control_api_storage_download_file,
+            control_api_storage_extract_json,
+            control_api_storage_bind_sources_json,
+            control_api_storage_bind_json,
+            control_api_storage_unbind_json,
+            pick_file_for_storage_upload,
+            pick_files_for_storage_upload,
+            pick_save_path_for_storage_download,
             control_api_ensure_nginx, // POST /api/v1/nginx/ensure (JWT)
+            control_api_fetch_nginx_sites_json, // GET /api/v1/nginx/sites (JWT)
+            control_api_nginx_preflight_json, // POST /api/v1/nginx/preflight (JWT)
+            control_api_nginx_action_json, // POST /api/v1/nginx/action (JWT)
             control_api_restart_process_json, // POST /api/v1/process/restart (JWT)
             control_api_stop_process_json, // POST /api/v1/process/stop (JWT)
             control_api_antiddos_get_json,
@@ -1150,6 +1984,10 @@ fn main() {
             fetch_remote_host_stats, // fetch remote host stats
             fetch_remote_host_stats_detail, // fetch remote host stats detail
             fetch_remote_host_stats_series, // fetch remote host stats series
+            ssl_status_json, // gRPC SslStatus (JSON)
+            ssl_create, // gRPC SslCreate
+            ssl_update, // gRPC SslUpdate
+            ssl_check_and_renew, // gRPC SslCheckAndRenew
             pick_server_stack_tar_gz, // pick server stack tar.gz
             fetch_server_stack_info_cmd, // fetch server stack info 
             apply_server_stack_update, // apply server stack update

@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::connection::{
-    clear_control_api_jwt, load_control_api_base, load_control_api_jwt, save_control_api_jwt,
+    clear_control_api_jwt, load_control_api_base, load_control_api_direct_url, load_control_api_jwt,
+    save_control_api_jwt,
 };
 use futures_util::future::join_all;
 
@@ -812,8 +813,12 @@ pub fn control_api_fetch_host_services_json() -> Result<String, String> {
     resp.text().map_err(|e| e.to_string())
 }
 
-/// `POST /api/v1/host-services/{id}/install`
-pub fn control_api_host_service_install(id: &str) -> Result<String, String> {
+/// `POST /api/v1/host-services/{id}/install` with JSON body `{ "env": { "KEY": "value" } }`.
+/// Pass `install_env_json` as JSON object string, e.g. `{"env":{}}` or `{"env":{"PIRATE_…":"…"}}`.
+pub fn control_api_host_service_install(
+    id: &str,
+    install_env_json: Option<&str>,
+) -> Result<String, String> {
     let id = id.trim();
     if id.is_empty() {
         return Err("service id is empty".into());
@@ -823,6 +828,11 @@ pub fn control_api_host_service_install(id: &str) -> Result<String, String> {
     let base = normalize_base(&base);
     let token = bearer()?;
     let url = format!("{}/api/v1/host-services/{}/install", base, id);
+    let body: serde_json::Value = match install_env_json {
+        None => serde_json::json!({ "env": {} }),
+        Some(s) if s.trim().is_empty() => serde_json::json!({ "env": {} }),
+        Some(s) => serde_json::from_str(s).map_err(|e| format!("install env must be valid JSON: {e}"))?,
+    };
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
@@ -830,6 +840,7 @@ pub fn control_api_host_service_install(id: &str) -> Result<String, String> {
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
         .send()
         .map_err(|e| fmt_reqwest_send_err(e, &url))?;
     let status = resp.status();
@@ -879,6 +890,121 @@ pub fn control_api_host_service_remove(id: &str) -> Result<String, String> {
         let body = resp.text().unwrap_or_default();
         return Err(format!(
             "host-service remove HTTP {}: {}",
+            status,
+            body.chars().take(400).collect::<String>()
+        ));
+    }
+    let text = resp.text().map_err(|e| e.to_string())?;
+    ensure_host_service_action_ok(&text)?;
+    Ok(text)
+}
+
+/// `GET /api/v1/host-services/{id}/runtime-config` — JSON `HostServiceRuntimeConfigView` (minio, meilisearch).
+pub fn control_api_host_service_runtime_get_json(id: &str) -> Result<String, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("service id is empty".into());
+    }
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/host-services/{}/runtime-config", base, id);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-service runtime GET HTTP {}: {}",
+            status,
+            body.chars().take(400).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `PUT /api/v1/host-services/{id}/runtime-config` — body JSON `{"env":{...}}`.
+pub fn control_api_host_service_runtime_put_json(id: &str, body_json: &str) -> Result<String, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("service id is empty".into());
+    }
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/host-services/{}/runtime-config", base, id);
+    let v: serde_json::Value = serde_json::from_str(body_json)
+        .map_err(|e| format!("runtime config body must be valid JSON: {e}"))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&v)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-service runtime PUT HTTP {}: {}",
+            status,
+            body.chars().take(400).collect::<String>()
+        ));
+    }
+    let text = resp.text().map_err(|e| e.to_string())?;
+    ensure_host_service_action_ok(&text)?;
+    Ok(text)
+}
+
+/// `POST /api/v1/host-services/{id}/restart` (minio, meilisearch).
+pub fn control_api_host_service_restart(id: &str) -> Result<String, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("service id is empty".into());
+    }
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/host-services/{}/restart", base, id);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-service restart HTTP {}: {}",
             status,
             body.chars().take(400).collect::<String>()
         ));
@@ -953,7 +1079,95 @@ pub fn control_api_put_nginx_site(content: &str) -> Result<String, String> {
     resp.text().map_err(|e| e.to_string())
 }
 
+/// `GET /api/v1/nginx/file?path=...` — JSON (`NginxConfigView`).
+pub fn control_api_fetch_nginx_file_json(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("nginx file path is empty".into());
+    }
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/nginx/file?path={}",
+        base,
+        urlencoding::encode(path)
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "nginx file GET HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `PUT /api/v1/nginx/file` — `path` + `content` (privileged apply on server).
+pub fn control_api_put_nginx_file_json(path: &str, content: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("nginx file path is empty".into());
+    }
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/nginx/file", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "path": path, "content": content }))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "nginx file PUT HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+fn direct_url_likely_loopback_for_remote_client(url: &str) -> bool {
+    let t = url.to_ascii_lowercase();
+    t.contains("127.0.0.1")
+        || t.contains("localhost")
+        || t.contains("[::1]")
+        || t.contains("0.0.0.0")
+}
+
 /// `POST /api/v1/nginx/ensure` with mode (`api_only` | `with_ui`).
+///
+/// If the primary control-api base (often HTTPS via nginx) is not reachable yet, retries once
+/// with [`load_control_api_direct_url`] from the last gRPC `GetStatus` (e.g. `http://host:8080`).
 pub fn control_api_ensure_nginx(mode: &str) -> Result<String, String> {
     let base =
         load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
@@ -964,12 +1178,45 @@ pub fn control_api_ensure_nginx(mode: &str) -> Result<String, String> {
         .timeout(std::time::Duration::from_secs(180))
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
+    let resp = match client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({ "mode": mode }))
         .send()
-        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => {
+            let Some(fb) = load_control_api_direct_url() else {
+                return Err(fmt_reqwest_send_err(e, &url));
+            };
+            let fb = normalize_base(&fb);
+            if fb == base {
+                return Err(fmt_reqwest_send_err(e, &url));
+            }
+            if direct_url_likely_loopback_for_remote_client(&fb) {
+                let mut m = fmt_reqwest_send_err(e, &url);
+                m.push_str(" — GetStatus direct control-api URL is loopback; from another machine set `DEPLOY_CONTROL_API_DIRECT_URL=http://<this-server-lan-or-public-ip>:8080` on deploy-server, reconnect gRPC, then try again (or use SSH port-forward to :8080).");
+                return Err(m);
+            }
+            let url2 = format!("{}/api/v1/nginx/ensure", fb);
+            client
+                .post(&url2)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&serde_json::json!({ "mode": mode }))
+                .send()
+                .map_err(|e2| {
+                    let mut m = format!(
+                        "primary base failed ({}), retried with GetStatus direct URL {}: {}",
+                        fmt_reqwest_send_err(e, &url),
+                        fb,
+                        fmt_reqwest_send_err(e2, &url2)
+                    );
+                    m.push_str(" — if both fail, check firewall (8080) and that control-api binds to 0.0.0.0, or temporarily set the HTTP base in the app to the direct URL (http://<host>:8080).");
+                    m
+                })?
+        }
+        Err(e) => return Err(fmt_reqwest_send_err(e, &url)),
+    };
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         let _ = clear_control_api_jwt();
@@ -981,6 +1228,108 @@ pub fn control_api_ensure_nginx(mode: &str) -> Result<String, String> {
             "nginx ensure HTTP {}: {}",
             status,
             body.chars().take(400).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `GET /api/v1/nginx/sites` — full inventory JSON (`NginxSitesView`).
+pub fn control_api_fetch_nginx_sites_json() -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/nginx/sites", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "nginx sites HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v1/nginx/preflight` — JSON body `NginxPreflightProposed`, response `NginxPreflightView`.
+pub fn control_api_nginx_preflight_json(body: &str) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let body_json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| format!("preflight body JSON: {e}"))?;
+    let url = format!("{}/api/v1/nginx/preflight", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body_json)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "nginx preflight HTTP {}: {}",
+            status,
+            t.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v1/nginx/action` — JSON `NginxActionBody`, response `NginxActionResponseView`.
+pub fn control_api_nginx_action_json(body: &str) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let body_json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("nginx action body JSON: {e}"))?;
+    let url = format!("{}/api/v1/nginx/action", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body_json)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "nginx action HTTP {}: {}",
+            status,
+            t.chars().take(500).collect::<String>()
         ));
     }
     resp.text().map_err(|e| e.to_string())
@@ -1893,6 +2242,1825 @@ where
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pirate file storage (control-api `/api/v1/storage/*`, JWT)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageEntryView {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub size: u64,
+    pub mtime_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageListView {
+    pub path: String,
+    pub entries: Vec<StorageEntryView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageUsageView {
+    pub used_bytes: u64,
+    pub max_bytes: u64,
+    #[serde(default)]
+    pub free_bytes: Option<u64>,
+    #[serde(default)]
+    pub used_percent: Option<f32>,
+}
+
+/// `GET /api/v1/storage/tree?path=`
+pub fn control_api_storage_tree_json(path: &str) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let path_q = path.trim();
+    let url = format!(
+        "{}/api/v1/storage/tree?path={}",
+        base,
+        urlencoding::encode(path_q)
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage tree HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `GET /api/v1/storage/usage` — returns JSON
+pub fn control_api_storage_usage_json() -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/usage", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage usage HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v1/storage/folders` with `{"path":"a/b"}`.
+pub fn control_api_storage_create_folder(path: &str) -> Result<(), String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/folders", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "path": path.trim() }))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage create folder HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /api/v1/storage/delete-folder` (JSON) — some nginx setups block `DELETE`; same semantics as
+/// `DELETE /api/v1/storage/folders?…`.
+pub fn control_api_storage_delete_folder(path: &str, recursive: bool) -> Result<(), String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/delete-folder", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "path": path.trim(), "recursive": recursive }))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage delete folder HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /api/v1/storage/delete-file` (JSON) — `DELETE …/files` is blocked on some HTTP paths.
+pub fn control_api_storage_delete_file(path: &str) -> Result<(), String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/delete-file", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "path": path.trim() }))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage delete file HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /api/v1/storage/rename` — `{"from","to"}`; `PATCH` is blocked for some users behind nginx.
+pub fn control_api_storage_rename(from: &str, to: &str) -> Result<(), String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{base}/api/v1/storage/rename");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "from": from.trim(), "to": to.trim() }))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage rename HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+/// Files larger than this use `POST /api/v1/storage/upload-sessions` (resumable, same as deploy).
+const STORAGE_RESUMABLE_MIN_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct StorageUploadSessionCreateBody {
+    path: String,
+    file_bytes: u64,
+    file_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct StorageUploadSessionCreateOut {
+    upload_id: String,
+    chunk_bytes: usize,
+    #[serde(default)]
+    received_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct StorageUploadSessionChunkOut {
+    received_bytes: u64,
+}
+
+/// Resumable storage upload: session create → PUT chunks → complete (retries on transient errors).
+fn control_api_storage_upload_resumable(
+    local_path: &Path,
+    remote_rel: &str,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let session_base_url = format!("{}/api/v1/storage/upload-sessions", base);
+    let session_create_url = session_base_url.clone();
+
+    let path = local_path.to_path_buf();
+    let rel_owned = remote_rel.trim().to_string();
+
+    let mut file = std::fs::File::open(&path)
+        .map_err(|e| format!("open local file {}: {e}", path.display()))?;
+    let artifact_bytes = file
+        .metadata()
+        .map_err(|e| format!("metadata {}: {e}", path.display()))?
+        .len();
+    let mut hasher = Sha256::new();
+    let mut hash_buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file
+            .read(&mut hash_buf)
+            .map_err(|e| format!("read file for sha256 {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&hash_buf[..n]);
+    }
+    let file_sha256 = format!("{:x}", hasher.finalize());
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek {}: {e}", path.display()))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(86400))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let create_body = StorageUploadSessionCreateBody {
+        path: rel_owned,
+        file_bytes: artifact_bytes,
+        file_sha256,
+    };
+
+    let create_out: StorageUploadSessionCreateOut = (|| {
+        let mut create_last_err: Option<String> = None;
+        for attempt in 1u32..=5u32 {
+            match client
+                .post(&session_create_url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&create_body)
+                .send()
+            {
+                Ok(create_resp) => {
+                    let st = create_resp.status();
+                    let create_body_text = create_resp.text().unwrap_or_default();
+                    if st == reqwest::StatusCode::UNAUTHORIZED {
+                        let _ = clear_control_api_jwt();
+                        return Err("control-api returned 401; sign in again".into());
+                    }
+                    if st == reqwest::StatusCode::NOT_FOUND {
+                        return Err("storage resumable upload API (POST /api/v1/storage/upload-sessions) is not available; upgrade control-api, or set a lower max upload / split the file".into());
+                    }
+                    if !st.is_success() {
+                        let err = format!(
+                            "storage upload-sessions create HTTP {}: {}",
+                            st,
+                            create_body_text.chars().take(500).collect::<String>()
+                        );
+                        let retry = matches!(st.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
+                        if attempt < 5 && (retry || is_retryable_upload_error(&err)) {
+                            create_last_err = Some(err);
+                            std::thread::sleep(Duration::from_millis(300 * attempt as u64));
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    return serde_json::from_str(&create_body_text).map_err(|e| {
+                        format!(
+                            "storage session create JSON: {e}: {}",
+                            create_body_text.chars().take(240).collect::<String>()
+                        )
+                    });
+                }
+                Err(e) => {
+                    let err = fmt_reqwest_send_err(e, &session_create_url);
+                    if attempt < 5 && is_retryable_upload_error(&err) {
+                        create_last_err = Some(err);
+                        std::thread::sleep(Duration::from_millis(300 * attempt as u64));
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(create_last_err.unwrap_or_else(|| "storage session create failed after retries".into()))
+    })()?;
+
+    let upload_id = create_out.upload_id.trim().to_string();
+    if upload_id.is_empty() {
+        return Err("storage session create returned empty upload_id".into());
+    }
+    let chunk_bytes = if create_out.chunk_bytes == 0 {
+        1024 * 1024
+    } else {
+        create_out.chunk_bytes
+    };
+    let mut offset = create_out.received_bytes;
+    if offset > artifact_bytes {
+        return Err(format!(
+            "storage session create: received_bytes={} > file size {}",
+            offset, artifact_bytes
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seek to offset {offset}: {e}"))?;
+
+    let mut chunk_buf = vec![0u8; chunk_bytes];
+    while offset < artifact_bytes {
+        let n = file
+            .read(&mut chunk_buf)
+            .map_err(|e| format!("read chunk at offset {offset}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &chunk_buf[..n];
+        let chunk_sha = format!("{:x}", Sha256::digest(chunk));
+        let chunk_path = format!(
+            "{}/{}",
+            session_base_url,
+            urlencoding::encode(&upload_id)
+        );
+        let chunk_url = format!("{}/chunk?offset={}", chunk_path, offset);
+        let mut last_err: Option<String> = None;
+        let mut done = false;
+        for attempt in 1..=5u32 {
+            match client
+                .put(&chunk_url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("x-chunk-sha256", &chunk_sha)
+                .body(chunk.to_vec())
+                .send()
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().unwrap_or_default();
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        let _ = clear_control_api_jwt();
+                        return Err("control-api returned 401; sign in again".into());
+                    }
+                    if !status.is_success() {
+                        let err = format!(
+                            "storage session chunk HTTP {} at offset {}: {}",
+                            status,
+                            offset,
+                            body.chars().take(240).collect::<String>()
+                        );
+                        let retry = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
+                        if attempt < 5 && (retry || is_retryable_upload_error(&err)) {
+                            std::thread::sleep(Duration::from_millis(400 * attempt as u64));
+                            last_err = Some(err);
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    let out: StorageUploadSessionChunkOut = serde_json::from_str(&body).map_err(
+                        |e| {
+                            format!(
+                                "storage session chunk JSON: {e}: {}",
+                                body.chars().take(240).collect::<String>()
+                            )
+                        },
+                    )?;
+                    if out.received_bytes < offset {
+                        return Err(format!(
+                            "storage session chunk regressed received_bytes={} < offset={}",
+                            out.received_bytes, offset
+                        ));
+                    }
+                    offset = out.received_bytes;
+                    done = true;
+                    break;
+                }
+                Err(e) => {
+                    let err = fmt_reqwest_send_err(e, &chunk_url);
+                    if attempt < 5 && is_retryable_upload_error(&err) {
+                        std::thread::sleep(Duration::from_millis(400 * attempt as u64));
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        if !done {
+            return Err(
+                last_err.unwrap_or_else(|| "storage session chunk failed after retries".into()),
+            );
+        }
+    }
+
+    let complete_path = format!(
+        "{}/{}",
+        session_base_url,
+        urlencoding::encode(&upload_id)
+    );
+    let complete_url = format!("{}/complete", complete_path);
+    let mut complete_last: Option<String> = None;
+    for attempt in 1u32..=5u32 {
+        match client
+            .post(&complete_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+        {
+            Ok(complete_resp) => {
+                let st = complete_resp.status();
+                let text = complete_resp.text().unwrap_or_default();
+                if st == reqwest::StatusCode::UNAUTHORIZED {
+                    let _ = clear_control_api_jwt();
+                    return Err("control-api returned 401; sign in again".into());
+                }
+                if !st.is_success() {
+                    let err = format!(
+                        "storage session complete HTTP {}: {}",
+                        st,
+                        text.chars().take(500).collect::<String>()
+                    );
+                    let retry = matches!(st.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
+                    if attempt < 5 && (retry || is_retryable_upload_error(&err)) {
+                        complete_last = Some(err);
+                        std::thread::sleep(Duration::from_millis(400 * attempt as u64));
+                        continue;
+                    }
+                    return Err(err);
+                }
+                return Ok(text);
+            }
+            Err(e) => {
+                let err = fmt_reqwest_send_err(e, &complete_url);
+                if attempt < 5 && is_retryable_upload_error(&err) {
+                    complete_last = Some(err);
+                    std::thread::sleep(Duration::from_millis(400 * attempt as u64));
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Err(complete_last.unwrap_or_else(|| "storage session complete failed after retries".into()))
+}
+
+/// Multipart: `path` = relative in storage, `file` = local path to read (streamed, no full-file RAM).
+pub fn control_api_storage_upload_file(remote_rel: &str, local_file: &str) -> Result<String, String> {
+    let p = Path::new(local_file);
+    let file_bytes = std::fs::metadata(p)
+        .map_err(|e| format!("stat local file {local_file}: {e}"))?
+        .len();
+    if file_bytes > STORAGE_RESUMABLE_MIN_BYTES {
+        return control_api_storage_upload_resumable(p, remote_rel);
+    }
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/files", base);
+    let f = std::fs::File::open(p).map_err(|e| format!("open {local_file}: {e}"))?;
+    let len = f
+        .metadata()
+        .map_err(|e| format!("metadata {local_file}: {e}"))?
+        .len();
+    let fname: String = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("upload.bin")
+        .to_string();
+    let part = reqwest::blocking::multipart::Part::reader_with_length(f, len).file_name(fname);
+    let form = reqwest::blocking::multipart::Form::new()
+        .text("path", remote_rel.trim().to_string())
+        .part("file", part);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(86400))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage upload HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `GET /api/v1/storage/files/download?path=…` — write to `local_path`.
+pub fn control_api_storage_download_file(remote_rel: &str, local_path: &str) -> Result<(), String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/storage/files/download?path={}",
+        base,
+        urlencoding::encode(remote_rel.trim())
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage download HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    let bytes = resp.bytes().map_err(|e| e.to_string())?;
+    if let Some(parent) = std::path::Path::new(local_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+    }
+    std::fs::write(local_path, &bytes)
+        .map_err(|e| format!("write {}: {e}", local_path))?;
+    Ok(())
+}
+
+/// `POST /api/v1/storage/extract` — `conflict_mode`: `abort` | `overwrite` | `delete_and_overwrite`.
+/// Returns response JSON (success or error body).
+pub fn control_api_storage_extract_json(
+    archive_path: &str,
+    target_dir: Option<&str>,
+    conflict_mode: &str,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/extract", base);
+    let body = if let Some(td) = target_dir.filter(|s| !s.trim().is_empty()) {
+        serde_json::json!({
+            "archive_path": archive_path.trim(),
+            "target_dir": td.trim(),
+            "conflict_mode": conflict_mode,
+        })
+    } else {
+        serde_json::json!({
+            "archive_path": archive_path.trim(),
+            "conflict_mode": conflict_mode,
+        })
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    let text = resp.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "storage extract HTTP {}: {}",
+            status,
+            text.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(text)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageBindMountCandidate {
+    pub mount_point: String,
+    pub fstype: String,
+    pub source: String,
+    #[serde(default)]
+    pub avail_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageBindActive {
+    pub volume: String,
+    pub source: String,
+    pub mount_point: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageBindSourcesView {
+    pub candidates: Vec<StorageBindMountCandidate>,
+    pub active_binds: Vec<StorageBindActive>,
+}
+
+/// `GET /api/v1/storage/bind-sources`
+pub fn control_api_storage_bind_sources_json() -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/bind-sources", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "storage bind-sources HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v1/storage/bind` — JSON body; returns JSON `{ ok, message }`.
+pub fn control_api_storage_bind_json(source_path: &str, volume_name: &str) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/bind", base);
+    let body = serde_json::json!({
+        "source_path": source_path.trim(),
+        "volume_name": volume_name.trim(),
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    let text = resp.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "storage bind HTTP {}: {}",
+            status,
+            text.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(text)
+}
+
+/// `POST /api/v1/storage/unbind`
+pub fn control_api_storage_unbind_json(volume_name: &str) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/storage/unbind", base);
+    let body = serde_json::json!({ "volume_name": volume_name.trim() });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    let text = resp.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "storage unbind HTTP {}: {}",
+            status,
+            text.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(text)
+}
+
+// --- Host databases (control-api `/api/v1/host-databases/*`) ---
+
+const PIRATE_DB_USER_HEADER: &str = "x-pirate-db-user";
+const PIRATE_DB_PASS_HEADER: &str = "x-pirate-db-password";
+
+fn add_pirate_db_headers(
+    req: reqwest::blocking::RequestBuilder,
+    user: &str,
+    pass: &str,
+) -> reqwest::blocking::RequestBuilder {
+    req.header(PIRATE_DB_USER_HEADER, user)
+        .header(PIRATE_DB_PASS_HEADER, pass)
+}
+
+/// `None` — no per-request cred headers (server uses host env for DSN).
+/// `Pair` — per-request DSN user/pass for this browse session or from the local `host_db_credentials.json` (encrypted).
+enum HostDbCreds {
+    None,
+    Pair(String, String),
+}
+
+/// Resolves per-request database credentials. Empty user and password → no headers.
+/// With username, password is taken from the `db_password` argument or, if empty, from the local credential store.
+fn resolve_host_db_creds(
+    instance_id: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<HostDbCreds, String> {
+    let uopt = db_user.map(str::trim).filter(|s| !s.is_empty());
+    let popt = db_password.map(str::trim).filter(|s| !s.is_empty());
+    if uopt.is_none() && popt.is_none() {
+        return Ok(HostDbCreds::None);
+    }
+    let Some(u) = uopt else {
+        return Err(
+            "set a database username when using a password or saved database credentials".into(),
+        );
+    };
+    let u = u.to_string();
+    if let Some(p) = popt {
+        return Ok(HostDbCreds::Pair(u, p.to_string()));
+    }
+    if let Some(p) = crate::db_credentials::saved_password_plain(instance_id)? {
+        if !p.is_empty() {
+            return Ok(HostDbCreds::Pair(u, p));
+        }
+    }
+    Err(
+        "database password is required: enter it, or use Remember to save it in the local credential file"
+            .into(),
+    )
+}
+
+/// `GET /api/v1/host-databases`
+pub fn control_api_host_databases_list_json() -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/host-databases", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-databases HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+fn enc_path(s: &str) -> String {
+    urlencoding::encode(s).into_owned()
+}
+
+/// `GET /api/v1/host-databases/:id/schemas`
+pub fn control_api_host_db_schemas_json(
+    instance_id: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/schemas",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+/// `GET /api/v1/host-databases/:id/tables?schema=`
+pub fn control_api_host_db_tables_json(
+    instance_id: &str,
+    schema: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/tables?schema={}",
+        base,
+        enc_path(instance_id),
+        urlencoding::encode(schema)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+/// `GET .../columns/:schema/:table`
+pub fn control_api_host_db_columns_json(
+    instance_id: &str,
+    schema: &str,
+    table: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/columns/{}/{}",
+        base,
+        enc_path(instance_id),
+        enc_path(schema),
+        enc_path(table)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+#[derive(serde::Serialize)]
+struct HostDbQueryBodySer<'a> {
+    sql: &'a str,
+    max_rows: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database: Option<&'a str>,
+}
+
+/// `POST /api/v1/host-databases/:id/query`
+pub fn control_api_host_db_query_json(
+    instance_id: &str,
+    sql: &str,
+    max_rows: u32,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+    database: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/query",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body = HostDbQueryBodySer {
+        sql,
+        max_rows,
+        database: database.map(str::trim).filter(|s| !s.is_empty()),
+    };
+    let mut post = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    if let HostDbCreds::Pair(ref u, ref p) = creds {
+        post = add_pirate_db_headers(post, u, p);
+    }
+    let resp = post
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db query HTTP {}: {}",
+            status,
+            body.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `GET .../rows?schema=&table=&limit=&offset=`
+pub fn control_api_host_db_rows_json(
+    instance_id: &str,
+    schema: &str,
+    table: &str,
+    limit: u32,
+    offset: u32,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/rows?schema={}&table={}&limit={}&offset={}",
+        base,
+        enc_path(instance_id),
+        urlencoding::encode(schema),
+        urlencoding::encode(table),
+        limit,
+        offset
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+/// `GET .../relationships`
+pub fn control_api_host_db_relationships_json(
+    instance_id: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/relationships",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+fn get_json_authenticated_with_creds(
+    url: &str,
+    token: &str,
+    creds: &HostDbCreds,
+) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut get = client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", token));
+    if let HostDbCreds::Pair(ref u, ref p) = *creds {
+        get = add_pirate_db_headers(get, u, p);
+    }
+    let resp = get
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `GET .../redis/keys?pattern=&cursor=`
+pub fn control_api_host_db_redis_keys_json(
+    instance_id: &str,
+    pattern: &str,
+    cursor: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/redis/keys?pattern={}&cursor={}",
+        base,
+        enc_path(instance_id),
+        urlencoding::encode(pattern),
+        urlencoding::encode(cursor)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+/// `GET .../mongo/databases`
+pub fn control_api_host_db_mongo_databases_json(
+    instance_id: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/mongo/databases",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+/// `GET .../mongo/collections?db=`
+pub fn control_api_host_db_mongo_collections_json(
+    instance_id: &str,
+    db: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/mongo/collections?db={}",
+        base,
+        enc_path(instance_id),
+        urlencoding::encode(db)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+/// `GET .../mongo/preview?db=&collection=&limit=`
+pub fn control_api_host_db_mongo_preview_json(
+    instance_id: &str,
+    db: &str,
+    collection: &str,
+    limit: u32,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v1/host-databases/{}/mongo/preview?db={}&collection={}&limit={}",
+        base,
+        enc_path(instance_id),
+        urlencoding::encode(db),
+        urlencoding::encode(collection),
+        limit
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+// --- Host databases v2 (`/api/v2/host-databases/*`) ---
+
+/// `GET /api/v2/host-databases/capabilities`
+pub fn control_api_host_db_v2_capabilities_json() -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v2/host-databases/capabilities", base);
+    get_json_authenticated_with_creds(&url, &token, &HostDbCreds::None)
+}
+
+/// `GET /api/v2/host-databases/:id/object-tree`
+pub fn control_api_host_db_v2_object_tree_json(
+    instance_id: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/object-tree",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+#[derive(serde::Serialize)]
+struct HostDbV2GridBodySer {
+    schema: String,
+    table: String,
+    limit: u32,
+    offset: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sort_column: Option<String>,
+    #[serde(default)]
+    sort_desc: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter_column: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter_value: Option<serde_json::Value>,
+}
+
+/// `POST /api/v2/host-databases/:id/grid`
+pub fn control_api_host_db_v2_grid_json(
+    instance_id: &str,
+    schema: &str,
+    table: &str,
+    limit: u32,
+    offset: u32,
+    sort_column: Option<&str>,
+    sort_desc: bool,
+    filter_column: Option<&str>,
+    filter_value: Option<serde_json::Value>,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/grid",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    let body = HostDbV2GridBodySer {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        limit,
+        offset,
+        sort_column: sort_column.map(|s| s.to_string()),
+        sort_desc,
+        filter_column: filter_column.map(|s| s.to_string()),
+        filter_value,
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut post = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    if let HostDbCreds::Pair(ref u, ref p) = creds {
+        post = add_pirate_db_headers(post, u, p);
+    }
+    let resp = post
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db v2 grid HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct HostDbV2RowMutateBodySer {
+    op: String,
+    schema: String,
+    table: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pk: Option<serde_json::Map<String, serde_json::Value>>,
+    row: serde_json::Value,
+}
+
+/// `POST /api/v2/host-databases/:id/row-mutate`
+pub fn control_api_host_db_v2_row_mutate_json(
+    instance_id: &str,
+    op: &str,
+    schema: &str,
+    table: &str,
+    pk: Option<serde_json::Map<String, serde_json::Value>>,
+    row: serde_json::Value,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/row-mutate",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    let body = HostDbV2RowMutateBodySer {
+        op: op.to_string(),
+        schema: schema.to_string(),
+        table: table.to_string(),
+        pk,
+        row,
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut post = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    if let HostDbCreds::Pair(ref u, ref p) = creds {
+        post = add_pirate_db_headers(post, u, p);
+    }
+    let resp = post
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db v2 row-mutate HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct HostDbV2SqlJobStartSer<'a> {
+    sql: &'a str,
+    max_rows: u32,
+}
+
+/// `POST /api/v2/host-databases/:id/sql-jobs`
+pub fn control_api_host_db_v2_sql_job_start_json(
+    instance_id: &str,
+    sql: &str,
+    max_rows: u32,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/sql-jobs",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    let body = HostDbV2SqlJobStartSer { sql, max_rows };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut post = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    if let HostDbCreds::Pair(ref u, ref p) = creds {
+        post = add_pirate_db_headers(post, u, p);
+    }
+    let resp = post
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db v2 sql-job HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `GET /api/v2/host-databases/:id/sql-jobs/:job_id`
+pub fn control_api_host_db_v2_sql_job_get_json(
+    instance_id: &str,
+    job_id: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/sql-jobs/{}",
+        base,
+        enc_path(instance_id),
+        enc_path(job_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+/// `DELETE /api/v2/host-databases/:id/sql-jobs/:job_id`
+pub fn control_api_host_db_v2_sql_job_cancel_json(
+    instance_id: &str,
+    job_id: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/sql-jobs/{}",
+        base,
+        enc_path(instance_id),
+        enc_path(job_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut del = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    if let HostDbCreds::Pair(ref u, ref p) = creds {
+        del = add_pirate_db_headers(del, u, p);
+    }
+    let resp = del.send().map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db v2 sql-job cancel HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `GET /api/v2/host-databases/:id/migration-status?database=...` (read-only tool detection).
+pub fn control_api_host_db_v2_migration_status_get_json(
+    instance_id: &str,
+    database: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+    tools: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let mut url = format!(
+        "{}/api/v2/host-databases/{}/migration-status?database={}",
+        base,
+        enc_path(instance_id),
+        urlencoding::encode(database)
+    );
+    if let Some(t) = tools {
+        let t = t.trim();
+        if !t.is_empty() {
+            url.push_str("&tools=");
+            url.push_str(&urlencoding::encode(t));
+        }
+    }
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    get_json_authenticated_with_creds(&url, &token, &creds)
+}
+
+#[derive(serde::Serialize)]
+struct HostDbV2MigrationStatusBodySer {
+    database: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<String>,
+}
+
+/// `POST /api/v2/host-databases/:id/migration-status` (same as GET; useful when proxies mangle query strings).
+pub fn control_api_host_db_v2_migration_status_post_json(
+    instance_id: &str,
+    database: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+    tools: Option<&str>,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/migration-status",
+        base,
+        enc_path(instance_id)
+    );
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    let body = HostDbV2MigrationStatusBodySer {
+        database: database.to_string(),
+        tools: tools
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(std::string::ToString::to_string),
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut post = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    if let HostDbCreds::Pair(ref u, ref p) = creds {
+        post = add_pirate_db_headers(post, u, p);
+    }
+    let resp = post
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db migration-status HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v2/host-databases/:id/admin/create-database`.
+/// **PostgreSQL:** requires `X-Pirate-Db-User` / `X-Pirate-Db-Password` (same as host browse; no `PIRATE_POSTGRES_ADMIN_URL`).
+/// **MySQL:** still uses host `PIRATE_MYSQL_ADMIN_URL`; db cred headers optional.
+pub fn control_api_host_db_v2_admin_create_database_json(
+    instance_id: &str,
+    database: &str,
+    owner: Option<&str>,
+    encoding: Option<&str>,
+    if_not_exists: bool,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let is_pg = instance_id.split('|').next() == Some("postgresql");
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    if is_pg {
+        if matches!(creds, HostDbCreds::None) {
+            return Err(
+                "database username and password are required for admin create-database (PostgreSQL); set them in the Databases panel"
+                    .into(),
+            );
+        }
+    }
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/admin/create-database",
+        base,
+        enc_path(instance_id)
+    );
+    let body = serde_json::json!({
+        "database": database,
+        "owner": owner,
+        "encoding": encoding,
+        "if_not_exists": if_not_exists,
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut post = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    if let HostDbCreds::Pair(ref u, ref p) = creds {
+        post = add_pirate_db_headers(post, u, p);
+    }
+    let resp = post
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db admin create-database HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v2/host-databases/:id/admin/create-table` — `body_json` is the full request body.
+pub fn control_api_host_db_v2_admin_create_table_json(
+    instance_id: &str,
+    body_json: &str,
+) -> Result<String, String> {
+    let body_val: serde_json::Value = serde_json::from_str(body_json)
+        .map_err(|e| format!("admin create-table: invalid JSON ({e})"))?;
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/admin/create-table",
+        base,
+        enc_path(instance_id)
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body_val)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db admin create-table HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v2/host-databases/:id/admin/create-user` — `body_json` is the full request body; response may include a generated password once.
+/// Per-request DB credentials (same as host-db browse) are required; the server no longer uses `PIRATE_POSTGRES_ADMIN_URL` for this operation.
+pub fn control_api_host_db_v2_admin_create_user_json(
+    instance_id: &str,
+    body_json: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let body_val: serde_json::Value = serde_json::from_str(body_json)
+        .map_err(|e| format!("admin create-user: invalid JSON ({e})"))?;
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    let (u, p) = match creds {
+        HostDbCreds::Pair(ref u, ref p) => (u.as_str(), p.as_str()),
+        HostDbCreds::None => {
+            return Err(
+                "database username and password are required for admin create-user (set in the Databases panel, or use Remember to save the password locally)"
+                    .into(),
+            );
+        }
+    };
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/admin/create-user",
+        base,
+        enc_path(instance_id)
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let post = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    let post = add_pirate_db_headers(post, u, p);
+    let resp = post
+        .json(&body_val)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db admin create-user HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v2/host-databases/:id/admin/delete-user` — drop a PostgreSQL login role.
+pub fn control_api_host_db_v2_admin_delete_user_json(
+    instance_id: &str,
+    body_json: &str,
+    db_user: Option<&str>,
+    db_password: Option<&str>,
+) -> Result<String, String> {
+    let body_val: serde_json::Value = serde_json::from_str(body_json)
+        .map_err(|e| format!("admin delete-user: invalid JSON ({e})"))?;
+    let creds = resolve_host_db_creds(instance_id, db_user, db_password)?;
+    let (u, p) = match creds {
+        HostDbCreds::Pair(ref u, ref p) => (u.as_str(), p.as_str()),
+        HostDbCreds::None => {
+            return Err(
+                "database username and password are required for admin delete-user (set in the Databases panel, or use Remember to save the password locally)"
+                    .into(),
+            );
+        }
+    };
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/admin/delete-user",
+        base,
+        enc_path(instance_id)
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let post = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token));
+    let post = add_pirate_db_headers(post, u, p);
+    let resp = post
+        .json(&body_val)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db admin delete-user HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v2/host-databases/:id/migration-run` (whitelisted CLI; JWT only).
+pub fn control_api_host_db_v2_migration_run_json(
+    instance_id: &str,
+    tool: &str,
+    workdir: &str,
+) -> Result<String, String> {
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!(
+        "{}/api/v2/host-databases/{}/migration-run",
+        base,
+        enc_path(instance_id)
+    );
+    let body = serde_json::json!({ "tool": tool, "workdir": workdir });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .map_err(|e| fmt_reqwest_send_err(e, &url))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    if !status.is_success() {
+        let t = resp.text().unwrap_or_default();
+        return Err(format!(
+            "host-db migration-run HTTP {}: {}",
+            status,
+            t.chars().take(800).collect::<String>()
+        ));
+    }
+    resp.text().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

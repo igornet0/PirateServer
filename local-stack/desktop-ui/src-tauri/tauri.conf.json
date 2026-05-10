@@ -36,6 +36,23 @@
     "resources": [
       "bundled/cli/pirate"
     ],
+    "macOS": {
+      "dmg": {
+        "background": "../../../packaging/macos/dmg.png",
+        "windowSize": {
+          "width": 700,
+          "height": 550
+        },
+        "appPosition": {
+          "x": 185,
+          "y": 390
+        },
+        "applicationFolderPosition": {
+          "x": 485,
+          "y": 390
+        }
+      }
+    },
     "linux": {
       "deb": {
         "files": {

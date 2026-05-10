@@ -23,7 +23,7 @@ use deploy_auth::{
 };
 use deploy_client::{
     default_version, deploy_directory, fetch_server_stack_info, inspect_bundle_path,
-    read_or_pack_bundle, upload_server_stack_artifact_with_progress, validate_version_label,
+    read_or_pack_bundle, ssl, upload_server_stack_artifact_with_progress, validate_version_label,
 };
 use deploy_core::display_stream::DisplayStreamConfig;
 use deploy_proto::deploy::{
@@ -357,6 +357,11 @@ enum Commands {
         #[command(subcommand)]
         sub: ProjectsCmd,
     },
+    /// ACME / Certbot on the deploy host (metadata DB + signed gRPC). Requires `openssl` and `certbot` on the server.
+    Ssl {
+        #[command(subcommand)]
+        cmd: SslCmd,
+    },
 }
 
 /// Subcommands for `pirate project <NAME> …`
@@ -376,6 +381,49 @@ enum ProjectCmd {
         release: Option<String>,
         #[arg(long, default_value_t = 64 * 1024)]
         chunk_size: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SslCmd {
+    /// Obtain a new certificate (`certbot certonly`) and register paths in the metadata DB.
+    Create {
+        #[arg(short = 'd', long = "domain", action = clap::ArgAction::Append, required = true)]
+        domains: Vec<String>,
+        /// nginx | standalone | webroot | dns (omit: use server env `SSL_MODE`).
+        #[arg(long)]
+        mode: Option<String>,
+        /// Webroot path when `SSL_MODE=webroot` or `--mode webroot`.
+        #[arg(long)]
+        webroot: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        staging: bool,
+    },
+    /// List tracked certificates and expiry (use `--verbose` for paths).
+    Status {
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+    /// Renew certificates matching a domain, glob (`--ur '*.example.com'`), or `--regex`.
+    Update {
+        #[arg(short = 'u', long)]
+        domain: Option<String>,
+        #[arg(long = "ur")]
+        pattern: Option<String>,
+        #[arg(long)]
+        regex: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        staging: bool,
+    },
+    /// Run one check/renew pass (same logic as the server scheduler).
+    #[command(name = "check-and-renew")]
+    CheckAndRenew {
+        #[arg(long)]
+        force_all: bool,
     },
 }
 
@@ -1308,6 +1356,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Pair { bundle } => {
             run_pair(bundle.clone()).await?;
+            return Ok(());
+        }
+        Commands::Ssl { cmd } => {
+            let ep = resolve_endpoint_normalized(&cli);
+            match cmd {
+                SslCmd::Create {
+                    domains,
+                    mode,
+                    webroot,
+                    dry_run,
+                    staging,
+                } => {
+                    ssl::run_ssl_create(
+                        &ep,
+                        &cli.project,
+                        domains,
+                        mode.as_deref(),
+                        webroot.as_deref(),
+                        *dry_run,
+                        *staging,
+                    )
+                    .await?;
+                }
+                SslCmd::Status { verbose } => {
+                    ssl::run_ssl_status(&ep, &cli.project, *verbose).await?;
+                }
+                SslCmd::Update {
+                    domain,
+                    pattern,
+                    regex,
+                    dry_run,
+                    staging,
+                } => {
+                    ssl::run_ssl_update(
+                        &ep,
+                        &cli.project,
+                        domain.as_deref(),
+                        pattern.as_deref(),
+                        regex.as_deref(),
+                        *dry_run,
+                        *staging,
+                    )
+                    .await?;
+                }
+                SslCmd::CheckAndRenew { force_all } => {
+                    ssl::run_ssl_check_and_renew(&ep, &cli.project, *force_all).await?;
+                }
+            }
             return Ok(());
         }
         Commands::Sessions {

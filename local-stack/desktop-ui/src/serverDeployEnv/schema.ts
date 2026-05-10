@@ -11,6 +11,8 @@ export type ServerEnvVarDef = {
   label: string;
   /** Подсказка одной строкой */
   hint?: string;
+  /** Значение по умолчанию (из env.example / install defaults) */
+  defaultValue?: string;
   type: EnvFieldType;
 };
 
@@ -29,6 +31,7 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
         key: "DEPLOY_SQLITE_URL",
         label: "SQLite (метаданные)",
         hint: "sqlite:///… для нативной установки",
+        defaultValue: "sqlite:///var/lib/pirate/deploy/deploy.db",
         type: "string",
       },
       {
@@ -43,14 +46,15 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
         hint: "Отдельная БД для встроенного explorer",
         type: "string",
       },
-      { key: "DEPLOY_ROOT", label: "Корень деплоя", type: "string" },
+      { key: "DEPLOY_ROOT", label: "Корень деплоя", defaultValue: "/var/lib/pirate/deploy", type: "string" },
       {
         key: "GRPC_ENDPOINT",
         label: "GRPC_ENDPOINT (локальный ремот на хосте)",
         hint: "Обычно loopback для вызовов с сервера",
+        defaultValue: "http://[::1]:50051",
         type: "string",
       },
-      { key: "RUST_LOG", label: "RUST_LOG", hint: "Например info, debug", type: "string" },
+      { key: "RUST_LOG", label: "RUST_LOG", hint: "Например info, debug", defaultValue: "info", type: "string" },
     ],
   },
   {
@@ -84,6 +88,7 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
       {
         key: "DEPLOY_MAX_SERVER_STACK_BYTES",
         label: "Макс. размер OTA tarball (байты)",
+        defaultValue: "536870912",
         type: "string",
       },
       {
@@ -115,17 +120,25 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
         hint: "Список через запятую или *",
         type: "textarea",
       },
+      {
+        key: "DEPLOY_QUIC_DATAPLANE",
+        label: "QUIC data-plane (UDP)",
+        hint: "Вкл/выкл QUIC transport для proxy",
+        defaultValue: "1",
+        type: "boolean",
+      },
     ],
   },
   {
     id: "control_api",
     title: "control-api (HTTP)",
     vars: [
-      { key: "CONTROL_API_PORT", label: "Порт control-api", type: "string" },
+      { key: "CONTROL_API_PORT", label: "Порт control-api", defaultValue: "8080", type: "string" },
       {
         key: "CONTROL_API_BIND",
         label: "BIND адрес",
         hint: "127.0.0.1 или 0.0.0.0 при отсутствии nginx",
+        defaultValue: "127.0.0.1",
         type: "string",
       },
       {
@@ -141,6 +154,25 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
       {
         key: "CONTROL_API_JWT_TTL_SECS",
         label: "TTL JWT (секунды)",
+        defaultValue: "28800",
+        type: "string",
+      },
+      {
+        key: "CONTROL_API_DEPLOY_CHUNK_BYTES",
+        label: "Размер HTTP deploy chunk (байты)",
+        defaultValue: "262144",
+        type: "string",
+      },
+      {
+        key: "CONTROL_API_DEPLOY_SESSION_CHUNK_BYTES",
+        label: "Размер chunk upload-session (байты)",
+        defaultValue: "1048576",
+        type: "string",
+      },
+      {
+        key: "CONTROL_API_DEPLOY_SESSION_TTL_SECS",
+        label: "TTL upload-session (секунды)",
+        defaultValue: "3600",
         type: "string",
       },
       {
@@ -188,6 +220,41 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
       {
         key: "PIRATE_DATA_MOUNTS_ROOT",
         label: "Корень для кредов БД / SMB",
+        defaultValue: "/var/lib/pirate/db-mounts",
+        type: "string",
+      },
+      {
+        key: "PIRATE_STORAGE_ROOT",
+        label: "Корень файлового хранилища",
+        defaultValue: "/var/lib/pirate/file-storage",
+        type: "string",
+      },
+      {
+        key: "PIRATE_STORAGE_MAX_BYTES",
+        label: "Лимит хранилища (байты, 0 = без лимита)",
+        defaultValue: "0",
+        type: "string",
+      },
+      {
+        key: "PIRATE_STORAGE_MAX_UPLOAD_BYTES",
+        label: "Лимит одного файла (байты)",
+        hint: "0 = взять DEPLOY_MAX_UPLOAD_BYTES",
+        defaultValue: "0",
+        type: "string",
+      },
+      {
+        key: "CONTROL_API_HOST_TERMINAL",
+        label: "Host terminal через WebSocket",
+        type: "boolean",
+      },
+      {
+        key: "CONTROL_API_HOST_TERMINAL_SHELL",
+        label: "Shell для host terminal",
+        type: "string",
+      },
+      {
+        key: "CONTROL_API_HOST_TERMINAL_SESSION_SECS",
+        label: "TTL host terminal сессии (секунды)",
         type: "string",
       },
     ],
@@ -237,17 +304,48 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
       {
         key: "CONTROL_API_NGINX_SITE_PATH",
         label: "Путь к nginx site (pirate)",
+        defaultValue: "/etc/nginx/sites-available/pirate",
         type: "string",
       },
       {
         key: "CONTROL_API_NGINX_ENSURE_SCRIPT",
         label: "Скрипт ensure nginx (sudo)",
+        defaultValue: "/usr/local/lib/pirate/pirate-ensure-nginx.sh",
         type: "string",
       },
       {
         key: "CONTROL_API_NGINX_APPLY_SITE_SCRIPT",
         label: "Скрипт apply site nginx (sudo)",
+        defaultValue: "/usr/local/lib/pirate/pirate-nginx-apply-site.sh",
         type: "string",
+      },
+      {
+        key: "CONTROL_API_NGINX_OPS_SCRIPT",
+        label: "Скрипт ops nginx (test/reload)",
+        defaultValue: "/usr/local/lib/pirate/pirate-nginx-ops.sh",
+        type: "string",
+      },
+    ],
+  },
+  {
+    id: "wan_security",
+    title: "WAN security",
+    vars: [
+      {
+        key: "PIRATE_WAN_DOMAIN",
+        label: "WAN домен",
+        type: "string",
+      },
+      {
+        key: "PIRATE_WAN_ACME_EMAIL",
+        label: "ACME email для WAN",
+        type: "string",
+      },
+      {
+        key: "PIRATE_WAN_FIREWALL_MANAGED",
+        label: "Управление firewall для WAN",
+        defaultValue: "1",
+        type: "boolean",
       },
     ],
   },
@@ -279,6 +377,203 @@ export const SERVER_DEPLOY_ENV_SCHEMA: ServerEnvCategory[] = [
         key: "DEPLOY_DASHBOARD_PASSWORD",
         label: "Пароль для dashboard-add-user (CLI)",
         type: "password",
+      },
+    ],
+  },
+  {
+    id: "minio_meilisearch",
+    title: "MinIO / Meilisearch (эндпоинты для приложений)",
+    vars: [
+      {
+        key: "MINIO_HOST",
+        label: "MinIO: хост API S3",
+        hint: "Loopback по умолчанию; real credentials: /etc/pirate-minio.env",
+        defaultValue: "127.0.0.1",
+        type: "string",
+      },
+      {
+        key: "MINIO_PORT",
+        label: "MinIO: порт API (S3)",
+        hint: "Совпадает с install-minio.sh (pirate-minio) — 9000",
+        defaultValue: "9000",
+        type: "string",
+      },
+      {
+        key: "MINIO_CONSOLE_PORT",
+        label: "MinIO: порт веб-консоли",
+        defaultValue: "9001",
+        type: "string",
+      },
+      {
+        key: "MINIO_USE_SSL",
+        label: "MinIO: HTTPS для S3 client",
+        hint: "0 = http (loopback), 1 = https",
+        defaultValue: "0",
+        type: "string",
+      },
+      {
+        key: "MINIO_ROOT_USER",
+        label: "MinIO: root user (если копируете в env приложения)",
+        type: "string",
+      },
+      {
+        key: "MINIO_ROOT_PASSWORD",
+        label: "MinIO: root password",
+        type: "password",
+      },
+      {
+        key: "MINIO_DATA_DIR",
+        label: "MinIO: каталог данных (справка)",
+        hint: "install-minio: /var/lib/pirate/minio",
+        defaultValue: "/var/lib/pirate/minio",
+        type: "string",
+      },
+      {
+        key: "MEILI_HOST",
+        label: "Meilisearch: HTTP host",
+        defaultValue: "127.0.0.1",
+        type: "string",
+      },
+      {
+        key: "MEILI_PORT",
+        label: "Meilisearch: HTTP порт",
+        defaultValue: "7700",
+        type: "string",
+      },
+      {
+        key: "MEILI_MASTER_KEY",
+        label: "Meilisearch: master key (если в env приложения)",
+        hint: "Первичный серверный файл: /etc/pirate-meilisearch.env",
+        type: "password",
+      },
+      {
+        key: "MEILI_DB_PATH",
+        label: "Meilisearch: путь к данным (справка)",
+        hint: "install-meilisearch: /var/lib/pirate/meili/data",
+        defaultValue: "/var/lib/pirate/meili/data",
+        type: "string",
+      },
+    ],
+  },
+  {
+    id: "ssl",
+    title: "SSL / Certbot",
+    vars: [
+      {
+        key: "SSL_PROVIDER",
+        label: "SSL provider",
+        hint: "Обычно certbot",
+        defaultValue: "certbot",
+        type: "string",
+      },
+      {
+        key: "SSL_EMAIL",
+        label: "Email для Let's Encrypt",
+        type: "string",
+      },
+      {
+        key: "SSL_MODE",
+        label: "Режим certbot",
+        hint: "nginx | webroot | standalone | dns",
+        type: "string",
+      },
+      {
+        key: "SSL_WEBROOT",
+        label: "Webroot путь",
+        type: "string",
+      },
+      {
+        key: "SSL_CERTBOT_DNS_PLUGIN",
+        label: "DNS plugin certbot",
+        type: "string",
+      },
+      {
+        key: "SSL_CERTBOT_DNS_CREDENTIALS",
+        label: "Путь к DNS credentials",
+        type: "string",
+      },
+      {
+        key: "SSL_CHECK_INTERVAL",
+        label: "Интервал проверки SSL (секунды)",
+        defaultValue: "86400",
+        type: "string",
+      },
+      {
+        key: "SSL_EXPIRY_THRESHOLD_DAYS",
+        label: "Порог обновления до истечения (дни)",
+        defaultValue: "7",
+        type: "string",
+      },
+      {
+        key: "SSL_ENABLE_SCHEDULER",
+        label: "Автопланировщик renew",
+        defaultValue: "1",
+        type: "boolean",
+      },
+      {
+        key: "SSL_CERTBOT_BIN",
+        label: "Путь/имя certbot",
+        defaultValue: "certbot",
+        type: "string",
+      },
+      {
+        key: "SSL_CERTBOT_EXTRA_ARGS",
+        label: "Доп. аргументы certbot",
+        type: "textarea",
+      },
+      {
+        key: "SSL_USE_SUDO",
+        label: "Запуск certbot через sudo",
+        type: "boolean",
+      },
+      {
+        key: "SSL_RELOAD_CMD",
+        label: "Команда reload (без sudo)",
+        type: "string",
+      },
+      {
+        key: "PIRATE_NGINX_OPS_SCRIPT",
+        label: "Скрипт nginx ops для SSL",
+        type: "string",
+      },
+      {
+        key: "SSL_ALERT_WEBHOOK_URL",
+        label: "Webhook alert при ошибке renew",
+        type: "string",
+      },
+      {
+        key: "SSL_POST_CHECK_ENABLED",
+        label: "Пост-проверка после issue/renew",
+        defaultValue: "1",
+        type: "boolean",
+      },
+      {
+        key: "SSL_POST_CHECK_PATH",
+        label: "Путь smoke-check",
+        defaultValue: "/",
+        type: "string",
+      },
+      {
+        key: "SSL_POST_CHECK_PORT",
+        label: "Порт smoke-check",
+        defaultValue: "443",
+        type: "string",
+      },
+      {
+        key: "SSL_POST_CHECK_LOOPBACK",
+        label: "Loopback для smoke-check",
+        defaultValue: "127.0.0.1",
+        type: "string",
+      },
+      {
+        key: "SSL_POST_CHECK_HOST",
+        label: "SNI host для smoke-check",
+        type: "string",
+      },
+      {
+        key: "SSL_STRICT_NGINX_RELOAD",
+        label: "Strict nginx reload",
+        type: "boolean",
       },
     ],
   },
