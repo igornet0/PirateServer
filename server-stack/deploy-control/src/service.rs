@@ -1,9 +1,20 @@
+use crate::db_admin::{
+    migration_run_approved, mysql_create_database, mysql_create_table, postgres_create_connection_user,
+    postgres_create_database_for_caller, postgres_create_table, postgres_delete_connection_user,
+};
+use crate::db_migration::host_migration_status;
+use crate::HostDbMigrationStatusView;
 use crate::types::{
     DataSourceItemView, DataSourcesListView, DatabaseColumnsView, DatabaseInfoView,
     DatabaseRelationshipsView, DatabaseSchemasView, DatabaseTablePreviewView, DatabaseTablesView,
-    HistoryView, HostDeployEnvPutView, HostDeployEnvView, LocalClientConnect,
-    ProjectNginxSnippetView, ProjectTelemetryLogLine, ProjectTelemetryView, ProjectView,
-    ProjectsView, ReleasesView, StatusView,
+    HistoryView, HostDatabaseQueryResultView, HostDatabasesListView, HostDbAdminCreateTableBody,
+    HostDbAdminCreateUserBody, HostDbAdminCreateUserView, HostDbAdminDeleteUserBody, HostDbAdminDeleteUserView,
+    HostDbCreateDatabaseBody, HostDbMigrationRunBody,
+    HostDbMigrationRunView, HostDbRequestCredentials,
+    HostDeployEnvPutView, HostDeployEnvView, HostDbV2GridBody, HostDbV2GridView, HostDbV2MutationResultView,
+    HostDbV2ObjectTreeView, HostDbV2RowMutationBody, HostDbV2SchemaNode, LocalClientConnect,
+    ProjectNginxSnippetView, ProjectTelemetryLogLine, ProjectTelemetryView, ProjectView, ProjectsView,
+    HostDatabaseQueryBody, HostDatabaseRedisKeysView, ReleasesView, StatusView,
 };
 use deploy_auth::attach_auth_metadata;
 use deploy_core::{
@@ -12,6 +23,16 @@ use deploy_core::{
     validate_project_id,
 };
 use deploy_core::pirate_project::PirateManifest;
+use crate::db_host::{
+    clickhouse_base_url_with_creds, clickhouse_query, clickhouse_query_http, connect_ephemeral_postgres,
+    list_instances, mongo_collections, mongo_collections_for_url, mongo_databases, mongo_databases_for_url,
+    mongo_preview, mongo_preview_for_url, mongodb_url_with_creds, mysql_columns, mysql_columns_for_url, mysql_query,
+    mysql_explorer_url_from_env, mysql_query_for_url, mysql_preview, mysql_preview_for_url, mysql_row_mutate,
+    mysql_schemas, mysql_schemas_for_url, mysql_tables, mysql_tables_for_url, mysql_url_with_creds, mysql_v2_grid,
+    parse_instance_id, pg_columns_view,
+    pg_preview, pg_query, pg_rel_view, pg_row_mutate, pg_schemas_view, pg_tables_view, pg_v2_grid, postgres_url_with_creds,
+    redis_keys, redis_keys_for_url, redis_url_with_creds, DbHostError,
+};
 use deploy_db::{
     explorer_columns, explorer_foreign_keys, explorer_schemas, explorer_table_preview,
     explorer_tables, fetch_postgres_server_info, DataSourceRow, DbStore, PgPool,
@@ -146,6 +167,8 @@ pub enum ControlError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Db(#[from] deploy_db::DbError),
+    #[error("host_db: {0}")]
+    HostDb(String),
 }
 
 /// Aggregates deploy-server gRPC, optional DB snapshot, and filesystem layout.
@@ -158,6 +181,10 @@ pub struct ControlPlane {
     pub pg_explorer: Option<Arc<PgPool>>,
     /// If set, `GetStatus` gRPC calls include deploy-auth metadata (when deploy-server requires auth).
     pub grpc_signing_key: Option<Arc<SigningKey>>,
+    /// `CONTROL_API_HOST_DEPLOY_ENV_PATH` — host services env for DB port discovery and explorer URLs.
+    pub host_env_path: std::path::PathBuf,
+    /// Host + port of `POSTGRES_EXPLORER_URL` to match a discovered `postgresql` instance.
+    pub pg_explorer_target: Option<(String, u16)>,
 }
 
 impl ControlPlane {
@@ -167,6 +194,8 @@ impl ControlPlane {
         db: Option<Arc<DbStore>>,
         pg_explorer: Option<Arc<PgPool>>,
         grpc_signing_key: Option<Arc<SigningKey>>,
+        host_env_path: std::path::PathBuf,
+        pg_explorer_target: Option<(String, u16)>,
     ) -> Self {
         Self {
             deploy_root,
@@ -174,6 +203,8 @@ impl ControlPlane {
             db,
             pg_explorer,
             grpc_signing_key,
+            host_env_path,
+            pg_explorer_target,
         }
     }
 
@@ -755,6 +786,910 @@ impl ControlPlane {
         })
     }
 
+    fn map_host_db(e: DbHostError) -> ControlError {
+        ControlError::HostDb(e.to_string())
+    }
+
+    /// Pool when the instance is PostgreSQL and matches `POSTGRES_EXPLORER_URL` host:port.
+    fn pg_pool_for_host_instance(&self, instance_id: &str) -> Option<Arc<PgPool>> {
+        let (engine, h, p) = parse_instance_id(instance_id)?;
+        if engine != "postgresql" {
+            return None;
+        }
+        let t = self.pg_explorer_target.as_ref()?;
+        if t.0 == h && t.1 == p {
+            return self.pg_explorer.clone();
+        }
+        None
+    }
+
+    pub async fn host_databases_list(&self) -> Result<HostDatabasesListView, ControlError> {
+        Ok(
+            list_instances(&self.host_env_path, self.pg_explorer_target.as_ref())
+                .await,
+        )
+    }
+
+    pub async fn host_db_schemas_json(
+        &self,
+        instance_id: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<serde_json::Value, ControlError> {
+        if let Some(c) = creds {
+            let (engine, _, _) = parse_instance_id(instance_id)
+                .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+            if engine == "postgresql" {
+                let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, "postgres")
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let pool = connect_ephemeral_postgres(&url)
+                    .await
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let v = pg_schemas_view(&pool)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+            }
+            if engine == "mysql" {
+                let url = mysql_url_with_creds(instance_id, &c.user, &c.pass)
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let r = mysql_schemas_for_url(&url)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return Ok(serde_json::json!({
+                    "engine": "mysql",
+                    "configured": true,
+                    "schemas": r
+                }));
+            }
+        }
+        if let Some(ref pool) = self.pg_pool_for_host_instance(instance_id) {
+            let v = pg_schemas_view(pool)
+                .await
+                .map_err(Self::map_host_db)?;
+            return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+        }
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        if engine == "mysql" {
+            let r = mysql_schemas(&self.host_env_path)
+                .await
+                .map_err(Self::map_host_db)?;
+            return Ok(serde_json::json!({
+                "engine": "mysql",
+                "configured": true,
+                "schemas": r
+            }));
+        }
+        Err(ControlError::HostDb(
+            "schemas not available for this instance (set explorer URL / check POSTGRES_EXPLORER_URL host:port match)".into(),
+        ))
+    }
+
+    pub async fn host_db_tables_json(
+        &self,
+        instance_id: &str,
+        schema: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<serde_json::Value, ControlError> {
+        if let Some(c) = creds {
+            let (engine, _, _) = parse_instance_id(instance_id)
+                .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+            if engine == "postgresql" {
+                let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, "postgres")
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let pool = connect_ephemeral_postgres(&url)
+                    .await
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let v = pg_tables_view(&pool, schema)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+            }
+            if engine == "mysql" {
+                let url = mysql_url_with_creds(instance_id, &c.user, &c.pass)
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let r = mysql_tables_for_url(&url, schema)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return Ok(serde_json::json!({ "engine": "mysql", "tables": r }));
+            }
+        }
+        if let Some(ref pool) = self.pg_pool_for_host_instance(instance_id) {
+            let v = pg_tables_view(pool, schema)
+                .await
+                .map_err(Self::map_host_db)?;
+            return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+        }
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        if engine == "mysql" {
+            let r = mysql_tables(&self.host_env_path, schema)
+                .await
+                .map_err(Self::map_host_db)?;
+            return Ok(serde_json::json!({ "engine": "mysql", "tables": r }));
+        }
+        Err(ControlError::HostDb("tables not available".into()))
+    }
+
+    pub async fn host_db_columns_json(
+        &self,
+        instance_id: &str,
+        schema: &str,
+        table: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<serde_json::Value, ControlError> {
+        if let Some(c) = creds {
+            let (engine, _, _) = parse_instance_id(instance_id)
+                .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+            if engine == "postgresql" {
+                let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, "postgres")
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let pool = connect_ephemeral_postgres(&url)
+                    .await
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let v = pg_columns_view(&pool, schema, table)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+            }
+            if engine == "mysql" {
+                let url = mysql_url_with_creds(instance_id, &c.user, &c.pass)
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let r = mysql_columns_for_url(&url, schema, table)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return Ok(serde_json::json!({ "engine": "mysql", "columns": r }));
+            }
+        }
+        if let Some(ref pool) = self.pg_pool_for_host_instance(instance_id) {
+            let v = pg_columns_view(pool, schema, table)
+                .await
+                .map_err(Self::map_host_db)?;
+            return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+        }
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        if engine == "mysql" {
+            let r = mysql_columns(&self.host_env_path, schema, table)
+                .await
+                .map_err(Self::map_host_db)?;
+            return Ok(serde_json::json!({ "engine": "mysql", "columns": r }));
+        }
+        Err(ControlError::HostDb("columns not available".into()))
+    }
+
+    pub async fn host_db_rows_json(
+        &self,
+        instance_id: &str,
+        schema: &str,
+        table: &str,
+        limit: u32,
+        offset: u32,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<serde_json::Value, ControlError> {
+        if let Some(c) = creds {
+            let (engine, _, _) = parse_instance_id(instance_id)
+                .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+            if engine == "postgresql" {
+                let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, "postgres")
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let pool = connect_ephemeral_postgres(&url)
+                    .await
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let v = pg_preview(&pool, schema, table, i64::from(limit), i64::from(offset))
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+            }
+            if engine == "mysql" {
+                let url = mysql_url_with_creds(instance_id, &c.user, &c.pass)
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let v = mysql_preview_for_url(&url, schema, table, limit, offset)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return Ok(serde_json::json!({ "engine": "mysql", "preview": v }));
+            }
+        }
+        if let Some(ref pool) = self.pg_pool_for_host_instance(instance_id) {
+            let v = pg_preview(pool, schema, table, i64::from(limit), i64::from(offset))
+                .await
+                .map_err(Self::map_host_db)?;
+            return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+        }
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        if engine == "mysql" {
+            let v = mysql_preview(
+                &self.host_env_path,
+                schema,
+                table,
+                limit,
+                offset,
+            )
+            .await
+            .map_err(Self::map_host_db)?;
+            return Ok(serde_json::json!({ "engine": "mysql", "preview": v }));
+        }
+        Err(ControlError::HostDb("row preview not available for this engine".into()))
+    }
+
+    pub async fn host_db_relationships_json(
+        &self,
+        instance_id: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<serde_json::Value, ControlError> {
+        if let Some(c) = creds {
+            let (engine, _, _) = parse_instance_id(instance_id)
+                .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+            if engine == "postgresql" {
+                let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, "postgres")
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let pool = connect_ephemeral_postgres(&url)
+                    .await
+                    .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                let v = pg_rel_view(&pool)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                return serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()));
+            }
+        }
+        let pool = self
+            .pg_pool_for_host_instance(instance_id)
+            .ok_or_else(|| {
+                ControlError::HostDb(
+                    "foreign keys are only for PostgreSQL (set POSTGRES_EXPLORER_URL or pass X-Pirate-Db-* headers)"
+                        .into(),
+                )
+            })?;
+        let v = pg_rel_view(&pool)
+            .await
+            .map_err(Self::map_host_db)?;
+        serde_json::to_value(v).map_err(|e| ControlError::HostDb(e.to_string()))
+    }
+
+    pub async fn host_db_query(
+        &self,
+        instance_id: &str,
+        body: &HostDatabaseQueryBody,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<HostDatabaseQueryResultView, ControlError> {
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        match engine.as_str() {
+            "postgresql" => {
+                if let Some(c) = creds {
+                    let db = body
+                        .database
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("postgres");
+                    deploy_db::validate_pg_ident(db).map_err(|e: deploy_db::DbError| {
+                        ControlError::HostDb(e.to_string())
+                    })?;
+                    let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, db)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    let pool = connect_ephemeral_postgres(&url)
+                        .await
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    return pg_query(&pool, &body.sql, body.max_rows)
+                        .await
+                        .map_err(Self::map_host_db);
+                }
+                let pool = self
+                    .pg_pool_for_host_instance(instance_id)
+                    .ok_or_else(|| {
+                        ControlError::HostDb(
+                            "POSTGRES_EXPLORER_URL host:port does not match this instance"
+                                .into(),
+                        )
+                    })?;
+                pg_query(&pool, &body.sql, body.max_rows)
+                    .await
+                    .map_err(Self::map_host_db)
+            }
+            "mysql" => {
+                if let Some(c) = creds {
+                    let mut url_str = mysql_url_with_creds(instance_id, &c.user, &c.pass)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    if let Some(ref d) = body.database {
+                        let d = d.trim();
+                        if !d.is_empty() {
+                            if d.len() > 64
+                                || !d.chars().all(|ch| {
+                                    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '$'
+                                })
+                            {
+                                return Err(ControlError::HostDb(
+                                    "invalid MySQL database name".into(),
+                                ));
+                            }
+                            let mut u = url::Url::parse(&url_str).map_err(|e| {
+                                ControlError::HostDb(format!("mysql URL: {e}"))
+                            })?;
+                            u.set_path(&format!("/{d}"));
+                            url_str = u.to_string();
+                        }
+                    }
+                    return mysql_query_for_url(&url_str, &body.sql, body.max_rows)
+                        .await
+                        .map_err(Self::map_host_db);
+                }
+                mysql_query(&self.host_env_path, instance_id, &body.sql, body.max_rows)
+                    .await
+                    .map_err(Self::map_host_db)
+            }
+            "clickhouse" => {
+                if let Some(c) = creds {
+                    let u = clickhouse_base_url_with_creds(instance_id, &c.user, &c.pass)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    return clickhouse_query_http(&u, &body.sql, body.max_rows)
+                        .await
+                        .map_err(Self::map_host_db);
+                }
+                clickhouse_query(&self.host_env_path, instance_id, &body.sql, body.max_rows)
+                    .await
+                    .map_err(Self::map_host_db)
+            }
+            _ => Err(ControlError::HostDb("SQL query not supported for this engine".into())),
+        }
+    }
+
+    pub async fn host_db_redis_keys(
+        &self,
+        instance_id: &str,
+        pattern: &str,
+        cursor: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<HostDatabaseRedisKeysView, ControlError> {
+        if let Some(c) = creds {
+            let url = redis_url_with_creds(instance_id, &c.user, &c.pass)
+                .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+            return redis_keys_for_url(&url, pattern, cursor)
+                .await
+                .map_err(Self::map_host_db);
+        }
+        redis_keys(&self.host_env_path, instance_id, pattern, cursor)
+            .await
+            .map_err(Self::map_host_db)
+    }
+
+    pub async fn host_db_mongo_dbs(
+        &self,
+        instance_id: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<Vec<String>, ControlError> {
+        let (e, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid id".into()))?;
+        if e != "mongodb" {
+            return Err(ControlError::HostDb("not a MongoDB instance id".into()));
+        }
+        if let Some(c) = creds {
+            let url = mongodb_url_with_creds(instance_id, &c.user, &c.pass)
+                .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+            return mongo_databases_for_url(&url)
+                .await
+                .map_err(Self::map_host_db);
+        }
+        mongo_databases(&self.host_env_path)
+            .await
+            .map_err(Self::map_host_db)
+    }
+
+    pub async fn host_db_mongo_collections(
+        &self,
+        instance_id: &str,
+        db_name: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<Vec<String>, ControlError> {
+        let (e, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid id".into()))?;
+        if e != "mongodb" {
+            return Err(ControlError::HostDb("not a MongoDB instance id".into()));
+        }
+        if let Some(c) = creds {
+            let url = mongodb_url_with_creds(instance_id, &c.user, &c.pass)
+                .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+            return mongo_collections_for_url(&url, db_name)
+                .await
+                .map_err(Self::map_host_db);
+        }
+        mongo_collections(&self.host_env_path, db_name)
+            .await
+            .map_err(Self::map_host_db)
+    }
+
+    pub async fn host_db_mongo_preview(
+        &self,
+        instance_id: &str,
+        db_name: &str,
+        collection: &str,
+        limit: u32,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<Vec<serde_json::Value>, ControlError> {
+        let (e, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid id".into()))?;
+        if e != "mongodb" {
+            return Err(ControlError::HostDb("not a MongoDB instance id".into()));
+        }
+        if let Some(c) = creds {
+            let url = mongodb_url_with_creds(instance_id, &c.user, &c.pass)
+                .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+            return mongo_preview_for_url(&url, db_name, collection, limit)
+                .await
+                .map_err(Self::map_host_db);
+        }
+        mongo_preview(
+            &self.host_env_path,
+            db_name,
+            collection,
+            limit,
+        )
+        .await
+        .map_err(Self::map_host_db)
+    }
+
+    /// DBeaver-like object tree (schemas → tables) for supported engines.
+    pub async fn host_db_v2_object_tree(
+        &self,
+        instance_id: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<HostDbV2ObjectTreeView, ControlError> {
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        match engine.as_str() {
+            "postgresql" => {
+                let pool: Arc<PgPool> = if let Some(c) = creds {
+                    let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, "postgres")
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    Arc::new(
+                        connect_ephemeral_postgres(&url)
+                            .await
+                            .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?,
+                    )
+                } else {
+                    self.pg_pool_for_host_instance(instance_id)
+                        .ok_or_else(|| {
+                            ControlError::HostDb(
+                                "PostgreSQL tree: set POSTGRES_EXPLORER_URL match or pass X-Pirate-Db-*"
+                                    .into(),
+                            )
+                        })?
+                };
+                let sv = pg_schemas_view(&*pool)
+                    .await
+                    .map_err(Self::map_host_db)?;
+                let mut schemas: Vec<HostDbV2SchemaNode> = Vec::new();
+                for s in sv.schemas.into_iter().take(200) {
+                    let tv = pg_tables_view(&*pool, &s.name)
+                        .await
+                        .map_err(Self::map_host_db)?;
+                    let tables: Vec<String> = tv.tables.into_iter().map(|t| t.name).take(500).collect();
+                    schemas.push(HostDbV2SchemaNode {
+                        name: s.name,
+                        tables,
+                    });
+                }
+                Ok(HostDbV2ObjectTreeView {
+                    version: 2,
+                    engine,
+                    schemas,
+                })
+            }
+            "mysql" => {
+                let mut schemas: Vec<HostDbV2SchemaNode> = Vec::new();
+                if let Some(c) = creds {
+                    let url = mysql_url_with_creds(instance_id, &c.user, &c.pass)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    let sch_rows = mysql_schemas_for_url(&url)
+                        .await
+                        .map_err(Self::map_host_db)?;
+                    let names: Vec<String> = sch_rows
+                        .into_iter()
+                        .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                        .take(200)
+                        .collect();
+                    for name in names {
+                        let tr = mysql_tables_for_url(&url, &name)
+                            .await
+                            .map_err(Self::map_host_db)?;
+                        let tables: Vec<String> = tr
+                            .iter()
+                            .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .take(500)
+                            .collect();
+                        schemas.push(HostDbV2SchemaNode { name, tables });
+                    }
+                } else {
+                    let sch_rows = mysql_schemas(&self.host_env_path)
+                        .await
+                        .map_err(Self::map_host_db)?;
+                    let names: Vec<String> = sch_rows
+                        .into_iter()
+                        .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                        .take(200)
+                        .collect();
+                    for name in names {
+                        let tr = mysql_tables(&self.host_env_path, &name)
+                            .await
+                            .map_err(Self::map_host_db)?;
+                        let tables: Vec<String> = tr
+                            .iter()
+                            .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .take(500)
+                            .collect();
+                        schemas.push(HostDbV2SchemaNode { name, tables });
+                    }
+                }
+                Ok(HostDbV2ObjectTreeView {
+                    version: 2,
+                    engine,
+                    schemas,
+                })
+            }
+            "clickhouse" => {
+                let sql = "SELECT name FROM system.tables WHERE database = currentDatabase() ORDER BY name";
+                let res = if let Some(c) = creds {
+                    let u = clickhouse_base_url_with_creds(instance_id, &c.user, &c.pass)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    clickhouse_query_http(&u, sql, 2000)
+                        .await
+                        .map_err(Self::map_host_db)?
+                } else {
+                    clickhouse_query(&self.host_env_path, instance_id, sql, 2000)
+                        .await
+                        .map_err(Self::map_host_db)?
+                };
+                let tables: Vec<String> = res
+                    .rows
+                    .iter()
+                    .filter_map(|r| {
+                        r.as_object()
+                            .and_then(|o| o.get("name").or_else(|| o.get("NAME")))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect();
+                Ok(HostDbV2ObjectTreeView {
+                    version: 2,
+                    engine,
+                    schemas: vec![HostDbV2SchemaNode {
+                        name: "default".into(),
+                        tables,
+                    }],
+                })
+            }
+            "redis" => Ok(HostDbV2ObjectTreeView {
+                version: 2,
+                engine,
+                schemas: vec![HostDbV2SchemaNode {
+                    name: "keyspace".into(),
+                    tables: vec!["(keys)".into()],
+                }],
+            }),
+            "mongodb" => {
+                if let Some(c) = creds {
+                    let url = mongodb_url_with_creds(instance_id, &c.user, &c.pass)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    let dbs = mongo_databases_for_url(&url)
+                        .await
+                        .map_err(Self::map_host_db)?;
+                    let mut schemas: Vec<HostDbV2SchemaNode> = Vec::new();
+                    for dbn in dbs.into_iter().take(100) {
+                        let colls = mongo_collections_for_url(&url, &dbn)
+                            .await
+                            .map_err(Self::map_host_db)?;
+                        schemas.push(HostDbV2SchemaNode {
+                            name: dbn,
+                            tables: colls.into_iter().take(500).collect(),
+                        });
+                    }
+                    Ok(HostDbV2ObjectTreeView {
+                        version: 2,
+                        engine,
+                        schemas,
+                    })
+                } else {
+                    let dbs = mongo_databases(&self.host_env_path)
+                        .await
+                        .map_err(Self::map_host_db)?;
+                    let mut schemas: Vec<HostDbV2SchemaNode> = Vec::new();
+                    for dbn in dbs.into_iter().take(100) {
+                        let colls = mongo_collections(&self.host_env_path, &dbn)
+                            .await
+                            .map_err(Self::map_host_db)?;
+                        schemas.push(HostDbV2SchemaNode {
+                            name: dbn,
+                            tables: colls.into_iter().take(500).collect(),
+                        });
+                    }
+                    Ok(HostDbV2ObjectTreeView {
+                        version: 2,
+                        engine,
+                        schemas,
+                    })
+                }
+            }
+            _ => Err(ControlError::HostDb(
+                "object tree not available for this engine".into(),
+            )),
+        }
+    }
+
+    /// Filtered / sorted data grid (PostgreSQL and MySQL).
+    pub async fn host_db_v2_grid(
+        &self,
+        instance_id: &str,
+        body: &HostDbV2GridBody,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<HostDbV2GridView, ControlError> {
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        let limit = body.limit;
+        let offset = body.offset;
+        match engine.as_str() {
+            "postgresql" => {
+                let pool: Arc<PgPool> = if let Some(c) = creds {
+                    let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, "postgres")
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    Arc::new(
+                        connect_ephemeral_postgres(&url)
+                            .await
+                            .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?,
+                    )
+                } else {
+                    self.pg_pool_for_host_instance(instance_id)
+                        .ok_or_else(|| {
+                            ControlError::HostDb("PostgreSQL grid: need explorer pool or credentials".into())
+                        })?
+                };
+                let (res, total) = pg_v2_grid(
+                    &*pool,
+                    &body.schema,
+                    &body.table,
+                    limit,
+                    offset,
+                    body.sort_column.as_deref(),
+                    body.sort_desc,
+                    body.filter_column.as_deref(),
+                    body.filter_value.as_ref(),
+                )
+                .await
+                .map_err(Self::map_host_db)?;
+                Ok(HostDbV2GridView {
+                    result: res,
+                    total_count: total,
+                })
+            }
+            "mysql" => {
+                let url = if let Some(c) = creds {
+                    mysql_url_with_creds(instance_id, &c.user, &c.pass)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?
+                } else {
+                    mysql_explorer_url_from_env(&self.host_env_path)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?
+                };
+                let (res, total) = mysql_v2_grid(
+                    &url,
+                    &body.schema,
+                    &body.table,
+                    limit,
+                    offset,
+                    body.sort_column.as_deref(),
+                    body.sort_desc,
+                    body.filter_column.as_deref(),
+                    body.filter_value.as_ref(),
+                )
+                .await
+                .map_err(Self::map_host_db)?;
+                Ok(HostDbV2GridView {
+                    result: res,
+                    total_count: total,
+                })
+            }
+            _ => Err(ControlError::HostDb(
+                "v2 data grid not supported for this engine (use v1 row preview / SQL query)".into(),
+            )),
+        }
+    }
+
+    /// Structured single-row / small batch mutation (engine-specific).
+    pub async fn host_db_v2_row_mutate(
+        &self,
+        instance_id: &str,
+        body: &HostDbV2RowMutationBody,
+        creds: Option<&HostDbRequestCredentials>,
+        write_enabled: bool,
+    ) -> Result<HostDbV2MutationResultView, ControlError> {
+        if !write_enabled {
+            return Err(ControlError::HostDb(
+                "host DB writes are disabled (set CONTROL_API_HOST_DB_WRITE=1 on control-api)"
+                    .into(),
+            ));
+        }
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        match engine.as_str() {
+            "postgresql" => {
+                let pool: Arc<PgPool> = if let Some(c) = creds {
+                    let url = postgres_url_with_creds(instance_id, &c.user, &c.pass, "postgres")
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?;
+                    Arc::new(
+                        connect_ephemeral_postgres(&url)
+                            .await
+                            .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?,
+                    )
+                } else {
+                    return Err(ControlError::HostDb(
+                        "PostgreSQL mutations require per-request X-Pirate-Db-* credentials"
+                            .into(),
+                    ));
+                };
+                let n = pg_row_mutate(
+                    &*pool,
+                    &body.op,
+                    &body.schema,
+                    &body.table,
+                    body.pk.as_ref(),
+                    &body.row,
+                )
+                .await
+                .map_err(Self::map_host_db)?;
+                Ok(HostDbV2MutationResultView {
+                    affected: n,
+                    message: None,
+                })
+            }
+            "mysql" => {
+                let url = if let Some(c) = creds {
+                    mysql_url_with_creds(instance_id, &c.user, &c.pass)
+                        .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))?
+                } else {
+                    return Err(ControlError::HostDb(
+                        "MySQL mutations require per-request X-Pirate-Db-* credentials"
+                            .into(),
+                    ));
+                };
+                let n = mysql_row_mutate(
+                    &url,
+                    &body.op,
+                    &body.schema,
+                    &body.table,
+                    body.pk.as_ref(),
+                    &body.row,
+                )
+                .await
+                .map_err(Self::map_host_db)?;
+                Ok(HostDbV2MutationResultView {
+                    affected: n,
+                    message: None,
+                })
+            }
+            _ => Err(ControlError::HostDb(
+                "mutations are only supported for postgresql|mysql in this release".into(),
+            )),
+        }
+    }
+
+    /// Read-only: detect Alembic / Flyway / Prisma / Django metadata in the selected database.
+    pub async fn host_db_migration_status(
+        &self,
+        instance_id: &str,
+        database: &str,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<HostDbMigrationStatusView, ControlError> {
+        let c = creds.ok_or_else(|| {
+            ControlError::HostDb(
+                "X-Pirate-Db-User and X-Pirate-Db-Password are required for migration status"
+                    .into(),
+            )
+        })?;
+        host_migration_status(instance_id, &c.user, &c.pass, database)
+            .await
+            .map_err(|e: DbHostError| ControlError::HostDb(e.to_string()))
+    }
+
+    /// Create a new database. **PostgreSQL:** per-request `X-Pirate-Db-*` (same as create-user; no `PIRATE_POSTGRES_ADMIN_URL`). **MySQL:** host `PIRATE_MYSQL_ADMIN_URL`.
+    pub async fn host_db_admin_create_database(
+        &self,
+        instance_id: &str,
+        body: &HostDbCreateDatabaseBody,
+        creds: Option<&HostDbRequestCredentials>,
+    ) -> Result<(), ControlError> {
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        match engine.as_str() {
+            "postgresql" => {
+                let c = creds.ok_or_else(|| {
+                    ControlError::HostDb(
+                        "database credentials are required: set X-Pirate-Db-User and X-Pirate-Db-Password (same as host database browse)"
+                            .into(),
+                    )
+                })?;
+                postgres_create_database_for_caller(instance_id, c, body)
+                    .await
+                    .map_err(|e| ControlError::HostDb(e.to_string()))
+            }
+            "mysql" => mysql_create_database(&self.host_env_path, body)
+                .await
+                .map_err(|e| ControlError::HostDb(e.to_string())),
+            e => Err(ControlError::HostDb(format!(
+                "admin create-database is not supported for {e} instances"
+            ))),
+        }
+    }
+
+    /// `CREATE TABLE` via superuser (allowlisted column types; identifiers validated per engine).
+    pub async fn host_db_admin_create_table(
+        &self,
+        instance_id: &str,
+        body: &HostDbAdminCreateTableBody,
+    ) -> Result<(), ControlError> {
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        match engine.as_str() {
+            "postgresql" => postgres_create_table(&self.host_env_path, body)
+                .await
+                .map_err(|e| ControlError::HostDb(e.to_string())),
+            "mysql" => mysql_create_table(&self.host_env_path, body)
+                .await
+                .map_err(|e| ControlError::HostDb(e.to_string())),
+            e => Err(ControlError::HostDb(format!(
+                "admin create-table is not supported for {e} instances"
+            ))),
+        }
+    }
+
+    /// Login role + `GRANT` for application access (password returned once if generated).
+    /// Requires per-request DB credentials (same as host-db browse); does not use host env superuser URL.
+    pub async fn host_db_admin_create_user(
+        &self,
+        instance_id: &str,
+        body: &HostDbAdminCreateUserBody,
+        creds: &HostDbRequestCredentials,
+    ) -> Result<HostDbAdminCreateUserView, ControlError> {
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        if engine != "postgresql" {
+            return Err(ControlError::HostDb(
+                "admin create-user is only for postgresql instances".into(),
+            ));
+        }
+        postgres_create_connection_user(instance_id, creds, body)
+            .await
+            .map_err(|e| ControlError::HostDb(e.to_string()))
+    }
+
+    /// `DROP ROLE` for a login role; optional `DROP OWNED` across all non-template DBs.
+    pub async fn host_db_admin_delete_user(
+        &self,
+        instance_id: &str,
+        body: &HostDbAdminDeleteUserBody,
+        creds: &HostDbRequestCredentials,
+    ) -> Result<HostDbAdminDeleteUserView, ControlError> {
+        let (engine, _, _) = parse_instance_id(instance_id)
+            .ok_or_else(|| ControlError::HostDb("invalid instance id".into()))?;
+        if engine != "postgresql" {
+            return Err(ControlError::HostDb(
+                "admin delete-user is only for postgresql instances".into(),
+            ));
+        }
+        postgres_delete_connection_user(instance_id, creds, body)
+            .await
+            .map_err(|e| ControlError::HostDb(e.to_string()))
+    }
+
+    /// Whitelisted migration CLI (`alembic` / `npx prisma` / `flyway`) in an allowlisted cwd.
+    pub async fn host_db_migration_run(
+        &self,
+        _instance_id: &str,
+        body: &HostDbMigrationRunBody,
+    ) -> Result<HostDbMigrationRunView, ControlError> {
+        migration_run_approved(&self.host_env_path, body)
+            .await
+            .map_err(|e| ControlError::HostDb(e.to_string()))
+    }
+
     pub async fn data_sources_list(&self) -> Result<DataSourcesListView, ControlError> {
         let mut sources = Vec::new();
         if self.pg_explorer.is_some() {
@@ -1087,7 +2022,15 @@ mod tests {
     #[test]
     fn list_releases_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let p = ControlPlane::new(tmp.path().to_path_buf(), "http://[::1]:9".into(), None, None, None);
+        let p = ControlPlane::new(
+            tmp.path().to_path_buf(),
+            "http://[::1]:9".into(),
+            None,
+            None,
+            None,
+            std::path::PathBuf::from("/dev/null"),
+            None,
+        );
         let r = p.list_releases("default").unwrap();
         assert!(r.releases.is_empty());
     }
@@ -1098,7 +2041,15 @@ mod tests {
         let rel = tmp.path().join("releases");
         fs::create_dir_all(rel.join("v2")).unwrap();
         fs::create_dir_all(rel.join("v1")).unwrap();
-        let p = ControlPlane::new(tmp.path().to_path_buf(), "http://[::1]:9".into(), None, None, None);
+        let p = ControlPlane::new(
+            tmp.path().to_path_buf(),
+            "http://[::1]:9".into(),
+            None,
+            None,
+            None,
+            std::path::PathBuf::from("/dev/null"),
+            None,
+        );
         let r = p.list_releases("default").unwrap();
         assert_eq!(r.releases, vec!["v1", "v2"]);
     }

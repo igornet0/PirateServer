@@ -21,6 +21,12 @@ pub fn required_host_service_ids(manifest: &PirateManifest) -> Vec<String> {
     if manifest.services.mongodb {
         set.insert("mongodb".into());
     }
+    if manifest.services.minio {
+        set.insert("minio".into());
+    }
+    if manifest.services.meilisearch {
+        set.insert("meilisearch".into());
+    }
 
     if let Some(ref srv) = manifest.services.server {
         if !srv.node.trim().is_empty() {
@@ -77,6 +83,17 @@ mod tests {
         assert_eq!(
             required_host_service_ids(&m),
             vec!["postgresql".to_string(), "redis".to_string()]
+        );
+    }
+
+    #[test]
+    fn minio_and_meilisearch_flags_map() {
+        let mut m = minimal_docker();
+        m.services.minio = true;
+        m.services.meilisearch = true;
+        assert_eq!(
+            required_host_service_ids(&m),
+            vec!["meilisearch".to_string(), "minio".to_string()]
         );
     }
 

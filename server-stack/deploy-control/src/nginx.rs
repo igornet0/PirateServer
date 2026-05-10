@@ -5,7 +5,7 @@ use crate::ControlError;
 use deploy_core::pirate_project::PirateManifest;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 fn output_text(out: &Output) -> String {
@@ -77,77 +77,182 @@ pub async fn read_nginx_config(path: &Path) -> Result<NginxConfigView, std::io::
     })
 }
 
+const MAX_NGINX_INVENTORY_READ_BYTES: u64 = 256 * 1024;
+
+/// Inventory editor path: absolute, under `/etc/nginx/`, no `..`.
+pub fn parse_nginx_inventory_path(raw: &str) -> Result<PathBuf, ControlError> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err(ControlError::NginxOp("empty path".into()));
+    }
+    const PREFIX: &str = "/etc/nginx/";
+    if !t.starts_with(PREFIX) || t.len() <= PREFIX.len() {
+        return Err(ControlError::NginxOp(
+            "path must be a file under /etc/nginx/".into(),
+        ));
+    }
+    let p = Path::new(t);
+    if !p.is_absolute() {
+        return Err(ControlError::NginxOp("path must be absolute".into()));
+    }
+    for c in p.components() {
+        if c == std::path::Component::ParentDir {
+            return Err(ControlError::NginxOp("path must not contain '..'".into()));
+        }
+    }
+    Ok(p.to_path_buf())
+}
+
+fn assert_not_sites_enabled_for_put(path: &Path) -> Result<(), ControlError> {
+    if path.to_string_lossy().contains("/sites-enabled/") {
+        return Err(ControlError::NginxOp(
+            "refusing to write under sites-enabled; edit sites-available and enable the site instead"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read a single inventory file (size-capped) for `GET /api/v1/nginx/file`.
+pub async fn read_nginx_inventory_file(path: &Path) -> Result<NginxConfigView, std::io::Error> {
+    let meta = tokio::fs::metadata(path).await?;
+    if meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is a directory",
+        ));
+    }
+    if meta.len() > MAX_NGINX_INVENTORY_READ_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {} bytes", MAX_NGINX_INVENTORY_READ_BYTES),
+        ));
+    }
+    read_nginx_config(path).await
+}
+
+/// Write inventory file: `sites-available/*` via apply-site script; others via `apply-config`.
+pub async fn apply_nginx_inventory_file_put(
+    path: &Path,
+    content: &str,
+    test_full_config: bool,
+    ops_script: &Path,
+    apply_site_script: &Path,
+) -> Result<NginxPutOutcome, std::io::Error> {
+    assert_not_sites_enabled_for_put(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    let lossy = path.to_string_lossy();
+    if lossy.contains("/sites-available/") {
+        let r = apply_nginx_site_via_sudo(path, content, apply_site_script).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+        return Ok(NginxPutOutcome { response: r });
+    }
+    apply_nginx_put(path, content, test_full_config, ops_script).await
+}
+
 pub struct NginxPutOutcome {
     pub response: NginxPutResponseView,
 }
 
 /// Write config, `nginx -t`, optionally `nginx -s reload`. On test failure, returns `revert_to` content.
+const MAX_NGINX_PUT_BYTES: usize = 256 * 1024;
+
+/// Write main (or other) nginx config via `pirate-nginx-ops.sh apply-config` (root `nginx -t` + reload).
 pub async fn apply_nginx_put(
     path: &Path,
     content: &str,
     test_full_config: bool,
+    ops_script: &Path,
 ) -> Result<NginxPutOutcome, std::io::Error> {
-    let previous = tokio::fs::read_to_string(path).await.unwrap_or_default();
-    tokio::fs::write(path, content).await?;
-
-    let path_owned = path.to_path_buf();
-    let test_full = test_full_config;
-    let nginx_test_output_result = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("nginx");
-        cmd.arg("-t");
-        if test_full {
-            cmd.arg("-c").arg(&path_owned);
-        }
-        cmd.output()
-    })
-    .await??;
-
-    let test_out = output_text(&nginx_test_output_result);
-
-    if !nginx_test_output_result.status.success() {
-        let _ = tokio::fs::write(path, &previous).await;
+    if content.len() > MAX_NGINX_PUT_BYTES {
         return Ok(NginxPutOutcome {
             response: NginxPutResponseView {
                 ok: false,
-                message: "nginx -t failed; file reverted".into(),
-                test_output: Some(test_out),
+                message: format!("content exceeds {MAX_NGINX_PUT_BYTES} bytes"),
+                test_output: None,
+                reload_output: None,
+            },
+        });
+    }
+    if content.as_bytes().contains(&0) {
+        return Ok(NginxPutOutcome {
+            response: NginxPutResponseView {
+                ok: false,
+                message: "content must not contain NUL bytes".into(),
+                test_output: None,
+                reload_output: None,
+            },
+        });
+    }
+    if !ops_script.is_file() {
+        return Ok(NginxPutOutcome {
+            response: NginxPutResponseView {
+                ok: false,
+                message: format!(
+                    "nginx ops script not found: {} (install pirate-nginx-ops.sh)",
+                    ops_script.display()
+                ),
+                test_output: None,
                 reload_output: None,
             },
         });
     }
 
-    let reload_path = path.to_path_buf();
-    let reload_full = test_full_config;
-    let reload_res = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("nginx");
-        if reload_full {
-            cmd.arg("-c").arg(&reload_path);
+    let path_buf = path.to_path_buf();
+    let ops_buf = ops_script.to_path_buf();
+    let content_owned = content.to_string();
+    let test_full = test_full_config;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let p = path_buf
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+        let ops = ops_buf
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid ops path"))?;
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.args(["-n", ops, "apply-config", p]);
+        if test_full {
+            cmd.arg("full_main");
         }
-        cmd.arg("-s").arg("reload").output()
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let mut child = cmd.spawn()?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin"))?;
+            use std::io::Write;
+            stdin.write_all(content_owned.as_bytes())?;
+        }
+        child.wait_with_output()
     })
     .await??;
 
-    let reload_out = output_text(&reload_res);
+    let merged = output_text(&result);
 
-    if !reload_res.status.success() {
-        tracing::warn!(%reload_out, "nginx reload failed");
+    if !result.status.success() {
         return Ok(NginxPutOutcome {
             response: NginxPutResponseView {
                 ok: false,
-                message: "nginx -t ok but nginx -s reload failed (config left on disk)".into(),
-                test_output: Some(test_out),
-                reload_output: Some(reload_out),
+                message: "nginx apply-config failed (see test_output; file reverted by helper if it existed)"
+                    .into(),
+                test_output: Some(merged),
+                reload_output: None,
             },
         });
     }
 
-    tracing::info!(path = %path.display(), "nginx config updated and reloaded");
+    tracing::info!(path = %path.display(), "nginx config updated via ops helper");
     Ok(NginxPutOutcome {
         response: NginxPutResponseView {
             ok: true,
-            message: "nginx config written, nginx -t passed, reload sent".into(),
-            test_output: Some(test_out),
-            reload_output: Some(reload_out),
+            message: "nginx config applied via privileged helper (test + reload)".into(),
+            test_output: Some(merged),
+            reload_output: None,
         },
     })
 }
@@ -157,6 +262,7 @@ pub fn collect_nginx_status(
     site_path: &Path,
     ensure_script: &Path,
     apply_script: &Path,
+    ops_script: &Path,
 ) -> NginxStatusView {
     let installed = Command::new("sh")
         .args(["-c", "command -v nginx"])
@@ -219,6 +325,7 @@ pub fn collect_nginx_status(
         site_enabled,
         ensure_script_present: ensure_script.is_file(),
         apply_site_script_present: apply_script.is_file(),
+        ops_script_present: ops_script.is_file(),
     }
 }
 

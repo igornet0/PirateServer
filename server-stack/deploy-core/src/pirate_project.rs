@@ -126,6 +126,12 @@ pub struct ServicesSection {
     pub mysql: bool,
     #[serde(default)]
     pub mongodb: bool,
+    /// When true, preflight expects MinIO (S3) on the host; install via Services tab or `install-minio.sh`.
+    #[serde(default)]
+    pub minio: bool,
+    /// When true, preflight expects Meilisearch on the host; install via Services tab or `install-meilisearch.sh`.
+    #[serde(default)]
+    pub meilisearch: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServicesServerSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

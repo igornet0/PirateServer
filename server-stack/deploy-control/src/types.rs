@@ -1,6 +1,7 @@
 use deploy_db::DeployEventRow;
 use deploy_db::{ForeignKeyRow, SchemaRow, TableColumnRow, TablePreview, TableSummaryRow};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Deploy status exposed to the HTTP API (and dashboard).
 /// One deployable unit on the host. Today only a single implicit `default` project (see ROADMAP multi-project).
@@ -265,6 +266,7 @@ pub struct NginxStatusView {
     pub site_enabled: bool,
     pub ensure_script_present: bool,
     pub apply_site_script_present: bool,
+    pub ops_script_present: bool,
 }
 
 /// One inventory row for `GET /api/v1/host-services`.
@@ -285,6 +287,8 @@ pub struct HostServiceRow {
     pub actions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    #[serde(default)]
+    pub runtime_configurable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -412,6 +416,137 @@ pub struct NginxPutResponseView {
     pub test_output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reload_output: Option<String>,
+}
+
+// --- Nginx inventory / universal API (pirate-nginx-ops) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NginxSiteEntryView {
+    pub site_id: String,
+    pub file_name: String,
+    pub path: String,
+    pub entry_kind: String,
+    pub active: bool,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_path: Option<String>,
+    pub domains: Vec<String>,
+    pub ssl_enabled: bool,
+    pub listen_ports: Vec<u16>,
+    pub managed_by: String,
+    pub is_ui_stack: bool,
+    #[serde(default)]
+    pub parse_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NginxProblemView {
+    pub level: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NginxSitesView {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nginx_test_output: Option<String>,
+    #[serde(default)]
+    pub global_warnings: Vec<String>,
+    #[serde(default)]
+    pub global_conflicts: Vec<NginxProblemView>,
+    pub sites: Vec<NginxSiteEntryView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NginxPreflightProposed {
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NginxPreflightView {
+    pub ok: bool,
+    pub inventory: NginxSitesView,
+    pub blockers: Vec<NginxProblemView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NginxActionPostCheckView {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub curl_exit: Option<i32>,
+    pub summary: String,
+    pub rollback_performed: bool,
+    pub classified: String,
+    #[serde(default)]
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NginxActionResponseView {
+    pub ok: bool,
+    pub action: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_check: Option<NginxActionPostCheckView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NginxActionBody {
+    pub action: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub available_path: Option<String>,
+    #[serde(default)]
+    pub enabled_path: Option<String>,
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub ssl_enabled: Option<bool>,
+    #[serde(default)]
+    pub ssl_cert_path: Option<String>,
+    #[serde(default)]
+    pub ssl_key_path: Option<String>,
+    #[serde(default)]
+    pub issue_certificate_if_missing: Option<bool>,
+    #[serde(default)]
+    pub post_check_host: Option<String>,
+    #[serde(default)]
+    pub post_check_enabled: Option<bool>,
+    #[serde(default)]
+    pub post_check_path: Option<String>,
+    #[serde(default)]
+    pub post_check_port: Option<u16>,
+    #[serde(default)]
+    pub post_check_loopback: Option<String>,
+    #[serde(default)]
+    pub acme_email: Option<String>,
+    #[serde(default)]
+    pub acme_staging: Option<bool>,
+    #[serde(default)]
+    pub acme_dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NginxFilePut {
+    pub path: String,
+    pub content: String,
+}
+
+/// Runtime env for MinIO / Meilisearch (from show-runtime on host).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostServiceRuntimeConfigView {
+    pub env: BTreeMap<String, String>,
 }
 
 // --- Host stats detail (on-demand) ---
@@ -673,4 +808,321 @@ pub struct AntiddosStatsView {
     pub fail2ban_banned: Option<u32>,
     pub limit_log_tail: Vec<String>,
     pub nft_table_present: bool,
+}
+
+/// Capabilities for a discovered host database instance (DBeaver-like gating).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDatabaseCapabilities {
+    pub metadata: bool,
+    pub list_schemas: bool,
+    pub list_tables: bool,
+    pub list_columns: bool,
+    pub preview_rows: bool,
+    pub foreign_keys: bool,
+    pub run_readonly_sql: bool,
+    pub list_redis_keys: bool,
+    pub list_mongo_databases: bool,
+    pub list_mongo_collections: bool,
+    pub preview_mongo_documents: bool,
+    pub clickhouse_system: bool,
+}
+
+/// One discovered DB service (env + TCP probe).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDatabaseInstanceView {
+    pub id: String,
+    pub engine: String,
+    pub label: String,
+    pub host: String,
+    pub port: u16,
+    pub reachable: bool,
+    pub dsn_template: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_note: Option<String>,
+    pub capabilities: HostDatabaseCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDatabasesListView {
+    pub instances: Vec<HostDatabaseInstanceView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostDatabaseQueryBody {
+    pub sql: String,
+    #[serde(default = "default_query_max_rows")]
+    pub max_rows: u32,
+    /// When set (PostgreSQL / MySQL with `X-Pirate-Db-*`), connect to this database for the query.
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+fn default_query_max_rows() -> u32 {
+    500
+}
+
+/// Optional DB credentials from control-api (HTTP headers); used only for the duration of a request, never stored.
+#[derive(Debug, Clone)]
+pub struct HostDbRequestCredentials {
+    pub user: String,
+    pub pass: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostDatabaseQueryResultView {
+    pub columns: Vec<String>,
+    pub rows: Vec<serde_json::Value>,
+    pub row_count: usize,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warn: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDatabaseRedisKeyView {
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_sec: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDatabaseRedisKeysView {
+    pub keys: Vec<HostDatabaseRedisKeyView>,
+    pub cursor: String,
+    pub done: bool,
+}
+
+// --- host-databases workspace v2 (DBeaver-like) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostDbV2ObjectTreeView {
+    pub version: u32,
+    pub engine: String,
+    pub schemas: Vec<HostDbV2SchemaNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostDbV2SchemaNode {
+    pub name: String,
+    pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostDbV2GridBody {
+    pub schema: String,
+    pub table: String,
+    #[serde(default = "default_v2_grid_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub offset: u32,
+    #[serde(default)]
+    pub sort_column: Option<String>,
+    #[serde(default)]
+    pub sort_desc: bool,
+    #[serde(default)]
+    pub filter_column: Option<String>,
+    #[serde(default)]
+    pub filter_value: Option<serde_json::Value>,
+}
+
+fn default_v2_grid_limit() -> u32 {
+    100
+}
+
+/// Data grid result (browse + optional total for pagination UI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostDbV2GridView {
+    #[serde(flatten)]
+    pub result: HostDatabaseQueryResultView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_count: Option<usize>,
+}
+
+/// Body to start an async read-only SQL job (DBeaver-like).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostDbV2SqlJobStartBody {
+    pub sql: String,
+    #[serde(default = "default_query_max_rows")]
+    pub max_rows: u32,
+}
+
+/// Structured row change (avoids raw SQL in the first line of defense; identifiers validated on server).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostDbV2RowMutationBody {
+    pub op: String,
+    pub schema: String,
+    pub table: String,
+    #[serde(default)]
+    pub pk: Option<serde_json::Map<String, serde_json::Value>>,
+    pub row: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDbV2MutationResultView {
+    pub affected: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDbV2SqlJobView {
+    pub job_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<HostDatabaseQueryResultView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDbV2CapabilitiesView {
+    pub workspace_v2: bool,
+    pub write: bool,
+    pub sql_jobs: bool,
+    /// Read-only migration tool / revision detection (`alembic_version`, flyway, prisma, django tables).
+    pub migration_status: bool,
+    /// `POST .../admin/create-database` (PostgreSQL: per-request `X-Pirate-Db-*`, superuser or `CREATEDB`).
+    pub admin_create_database: bool,
+    /// `POST .../admin/create-table` (same flag as create-database).
+    pub admin_create_table: bool,
+    /// `POST .../admin/create-user` (login role + GRANTs; same flag).
+    pub admin_create_user: bool,
+    /// Whitelisted `alembic` / `prisma` / `flyway` runs in an allowlisted working directory.
+    pub migration_run: bool,
+}
+
+/// Body for `POST /api/v2/host-databases/:instance_id/migration-status`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostDbV2MigrationStatusBody {
+    /// Logical database to connect to (not the `postgres` maintenance DB for trees).
+    pub database: String,
+    /// Optional comma-separated filter: `alembic,prisma,flyway` (case-insensitive).
+    #[serde(default)]
+    pub tools: Option<String>,
+}
+
+/// Body for `POST /api/v2/host-databases/:instance_id/admin/create-database` (PostgreSQL only).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostDbCreateDatabaseBody {
+    pub database: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// e.g. `UTF8` — optional, validated against a small allowlist in deploy-control.
+    #[serde(default)]
+    pub encoding: Option<String>,
+    /// When true, succeed if the database already exists (PostgreSQL only).
+    #[serde(default)]
+    pub if_not_exists: bool,
+}
+
+/// One column for `POST .../admin/create-table` (PostgreSQL, allowlisted types only).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostDbAdminCreateTableColumn {
+    pub name: String,
+    /// `integer` | `bigint` | `text` | `varchar` | `boolean` | `timestamptz` | `date` | `jsonb` | `uuid` | `double` | `real` | `serial` | `bigserial` | `smallserial`
+    pub data_type: String,
+    #[serde(default)]
+    pub not_null: bool,
+    #[serde(default)]
+    pub primary_key: bool,
+    /// Required when `data_type` is `varchar` (1–10_000).
+    #[serde(default)]
+    pub varchar_length: Option<u32>,
+}
+
+/// Body for `POST .../admin/create-table`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostDbAdminCreateTableBody {
+    pub database: String,
+    /// Usually `public`.
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<HostDbAdminCreateTableColumn>,
+    #[serde(default)]
+    pub if_not_exists: bool,
+}
+
+/// Body for `POST .../admin/create-user` — login role for application connections.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostDbAdminCreateUserBody {
+    pub database: String,
+    /// New role name (login).
+    pub username: String,
+    /// If set with `generate_password: false`, use this password (not logged by Pirate).
+    #[serde(default)]
+    pub password: Option<String>,
+    /// If true, `password` is ignored and a new password is returned once in the response.
+    #[serde(default)]
+    pub generate_password: bool,
+    /// Target schema for GRANTs (default `public`).
+    #[serde(default = "default_public")]
+    pub schema: String,
+    /// `read_write` | `read_only` — DML on existing/future objects in schema (default privileges for creator).
+    #[serde(default = "default_read_write")]
+    pub privileges: String,
+    /// Also `GRANT CREATE ON SCHEMA` (so the user can run DDL in that schema).
+    #[serde(default)]
+    pub allow_schema_ddl: bool,
+}
+
+fn default_public() -> String {
+    "public".to_string()
+}
+fn default_read_write() -> String {
+    "read_write".to_string()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDbAdminCreateUserView {
+    pub ok: bool,
+    pub username: String,
+    /// Returned only when `generate_password` was true; store safely — not logged server-side in audit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn default_drop_owned_all_databases() -> bool {
+    true
+}
+
+/// Body for `POST .../admin/delete-user` — drop a login role (PostgreSQL).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostDbAdminDeleteUserBody {
+    /// Role to remove (must not be the same as the connecting `X-Pirate-Db-User`).
+    pub username: String,
+    /// Run `DROP OWNED BY ... CASCADE` in every non-template database before `DROP ROLE` (recommended).
+    #[serde(default = "default_drop_owned_all_databases")]
+    pub drop_owned_all_databases: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDbAdminDeleteUserView {
+    pub ok: bool,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Body for `POST /api/v2/host-databases/:instance_id/migration-run`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostDbMigrationRunBody {
+    /// `alembic` | `prisma` | `flyway` — only these literals are accepted.
+    pub tool: String,
+    /// Must match a path prefix from host env `PIRATE_MIGRATION_CWD_ALLOWLIST` (see deploy docs).
+    pub workdir: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDbMigrationRunView {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Truncated combined stdout+stderr.
+    pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
