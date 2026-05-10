@@ -3,7 +3,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use deploy_control::ControlError;
+use deploy_control::{ControlError, PirateStorageError, StorageBindError};
 use deploy_db::DbError;
 use serde::Serialize;
 
@@ -25,6 +25,9 @@ pub struct ApiErrorPayload {
     /// `min(configured_limit, grpc_limit)` (or configured only when gRPC unknown).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_limit: Option<u64>,
+    /// Storage-relative path in conflict (archive extract `abort` mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_path: Option<String>,
 }
 
 pub struct ApiError {
@@ -34,6 +37,7 @@ pub struct ApiError {
     configured_limit: Option<u64>,
     grpc_limit: Option<u64>,
     effective_limit: Option<u64>,
+    conflict_path: Option<String>,
 }
 
 impl ApiError {
@@ -45,6 +49,7 @@ impl ApiError {
             configured_limit: None,
             grpc_limit: None,
             effective_limit: None,
+            conflict_path: None,
         }
     }
 
@@ -56,6 +61,7 @@ impl ApiError {
             configured_limit: None,
             grpc_limit: None,
             effective_limit: None,
+            conflict_path: None,
         }
     }
 
@@ -67,6 +73,7 @@ impl ApiError {
             configured_limit: None,
             grpc_limit: None,
             effective_limit: None,
+            conflict_path: None,
         }
     }
 
@@ -78,6 +85,7 @@ impl ApiError {
             configured_limit: None,
             grpc_limit: None,
             effective_limit: None,
+            conflict_path: None,
         }
     }
 
@@ -89,6 +97,7 @@ impl ApiError {
             configured_limit: None,
             grpc_limit: None,
             effective_limit: None,
+            conflict_path: None,
         }
     }
 
@@ -106,6 +115,7 @@ impl ApiError {
             configured_limit: Some(configured_limit),
             grpc_limit,
             effective_limit: Some(effective_limit),
+            conflict_path: None,
         }
     }
 
@@ -117,6 +127,117 @@ impl ApiError {
             configured_limit: None,
             grpc_limit: None,
             effective_limit: None,
+            conflict_path: None,
+        }
+    }
+
+    /// Feature disabled (e.g. `CONTROL_API_HOST_DATABASES=0`) or not allowed.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            message: message.into(),
+            configured_limit: None,
+            grpc_limit: None,
+            effective_limit: None,
+            conflict_path: None,
+        }
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: message.into(),
+            configured_limit: None,
+            grpc_limit: None,
+            effective_limit: None,
+            conflict_path: None,
+        }
+    }
+
+    pub fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: "not_implemented",
+            message: message.into(),
+            configured_limit: None,
+            grpc_limit: None,
+            effective_limit: None,
+            conflict_path: None,
+        }
+    }
+
+    /// HTTP 507 — storage quota (Pirate file manager).
+    pub fn storage_quota_exceeded(message: impl Into<String>, max_bytes: u64, would_be_used: u64) -> Self {
+        Self {
+            status: StatusCode::INSUFFICIENT_STORAGE,
+            code: "storage_quota",
+            message: message.into(),
+            configured_limit: Some(max_bytes),
+            grpc_limit: None,
+            effective_limit: Some(would_be_used),
+            conflict_path: None,
+        }
+    }
+
+    /// Extract would overwrite; retry with `overwrite` or `delete_and_overwrite`.
+    pub fn extract_conflict(path: String, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "extract_conflict",
+            message: message.into(),
+            configured_limit: None,
+            grpc_limit: None,
+            effective_limit: None,
+            conflict_path: Some(path),
+        }
+    }
+}
+
+impl From<PirateStorageError> for ApiError {
+    fn from(e: PirateStorageError) -> Self {
+        match e {
+            PirateStorageError::NotFound(msg) => ApiError::not_found(msg),
+            PirateStorageError::AlreadyExists(msg) => ApiError::conflict(msg),
+            PirateStorageError::ExtractConflict { path } => {
+                ApiError::extract_conflict(
+                    path,
+                    "extraction path conflict: choose overwrite or delete_and_overwrite",
+                )
+            }
+            PirateStorageError::UnsupportedArchive(msg) => {
+                ApiError::bad_request(format!("unsupported archive: {msg}"))
+            }
+            PirateStorageError::CorruptArchive(msg) => ApiError::bad_request(format!("corrupt archive: {msg}")),
+            PirateStorageError::Quota { used, max, .. } => {
+                ApiError::storage_quota_exceeded(
+                    format!("storage quota: would be {used} bytes; max {max}"),
+                    max,
+                    used,
+                )
+            }
+            PirateStorageError::InvalidPath(msg) | PirateStorageError::NameTooLong(msg) => {
+                ApiError::bad_request(msg)
+            }
+            PirateStorageError::NotConfigured => ApiError::service_unavailable(
+                "Pirate storage is not configured (PIRATE_STORAGE_ROOT)",
+            ),
+            PirateStorageError::Io(e) => ApiError::internal(e.to_string()),
+            PirateStorageError::Db(m) => ApiError::internal(m),
+        }
+    }
+}
+
+impl From<StorageBindError> for ApiError {
+    fn from(e: StorageBindError) -> Self {
+        match e {
+            StorageBindError::InvalidScript => {
+                ApiError::service_unavailable("storage bind helper script is missing on this host")
+            }
+            StorageBindError::SudoFailed(m) => ApiError::bad_gateway(m),
+            StorageBindError::Io(e) => ApiError::internal(e.to_string()),
+            StorageBindError::Json(e) => ApiError::internal(e.to_string()),
         }
     }
 }
@@ -157,6 +278,7 @@ impl From<ControlError> for ApiError {
                     ApiError::bad_gateway(msg)
                 }
             }
+            ControlError::HostDb(msg) => ApiError::bad_request(msg),
             ControlError::Io(err) => ApiError::internal(err.to_string()),
             ControlError::Db(err) => match err {
                 DbError::InvalidIdentifier(msg) => ApiError::bad_request(msg),
@@ -175,6 +297,7 @@ impl IntoResponse for ApiError {
                 configured_limit: self.configured_limit,
                 grpc_limit: self.grpc_limit,
                 effective_limit: self.effective_limit,
+                conflict_path: self.conflict_path,
             },
         };
         (self.status, Json(body)).into_response()
