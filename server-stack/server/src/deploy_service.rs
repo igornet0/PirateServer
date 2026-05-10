@@ -52,8 +52,10 @@ use deploy_proto::deploy::{
     StackApplyOptions, ServerStackChunk, ServerStackInfo, ServerStackInfoRequest, ServerStackResponse,
     StatusRequest, StatusResponse,
     StopProcessRequest,
-    ListSessionsRequest, ListSessionsResponse, QuerySessionLogsRequest, QuerySessionLogsResponse,
+    ListSessionsRequest, ListSessionsResponse,     QuerySessionLogsRequest, QuerySessionLogsResponse,
     SessionLogEvent, SessionPeerRow,
+    SslCheckAndRenewRequest, SslCheckAndRenewResponse, SslCreateRequest, SslCreateResponse, SslStatusRequest,
+    SslStatusResponse, SslUpdateRequest, SslUpdateResponse,
     UpdateConnectionProfileRequest, UpdateConnectionProfileResponse,
     UpdateProxySettingsRequest, UpdateProxySettingsResponse,
 };
@@ -72,6 +74,7 @@ use std::time::Instant;
 use std::time::Duration;
 
 use crate::auth::{sign_pair_response, verify_pair_signature};
+use crate::ssl::SslService;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
@@ -3795,6 +3798,146 @@ impl DeployService for DeployServiceImpl {
             })
             .collect();
         Ok(Response::new(QuerySessionLogsResponse { events, has_more }))
+    }
+
+    async fn ssl_create(
+        &self,
+        request: Request<SslCreateRequest>,
+    ) -> Result<Response<SslCreateResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let spec = request
+            .get_ref()
+            .spec
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("spec"))?;
+        let project_id = &spec.project_id;
+        validate_project_id(project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("SslCreate", project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "SslCreate",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let inner = request.into_inner();
+        let svc = SslService::new(Arc::clone(db));
+        match svc.create(inner).await {
+            Ok(r) => Ok(Response::new(r)),
+            Err(e) => Err(Status::internal(e)),
+        }
+    }
+
+    async fn ssl_status(
+        &self,
+        request: Request<SslStatusRequest>,
+    ) -> Result<Response<SslStatusResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner = request.get_ref();
+        let project_id = &inner.project_id;
+        validate_project_id(project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("SslStatus", project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "SslStatus",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let inner = request.into_inner();
+        let svc = SslService::new(Arc::clone(db));
+        match svc.status(inner).await {
+            Ok(r) => Ok(Response::new(r)),
+            Err(e) => Err(Status::internal(e)),
+        }
+    }
+
+    async fn ssl_update(
+        &self,
+        request: Request<SslUpdateRequest>,
+    ) -> Result<Response<SslUpdateResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner = request.get_ref();
+        let project_id = &inner.project_id;
+        validate_project_id(project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("SslUpdate", project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "SslUpdate",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let inner = request.into_inner();
+        let svc = SslService::new(Arc::clone(db));
+        match svc.update(inner).await {
+            Ok(r) => Ok(Response::new(r)),
+            Err(e) => Err(Status::internal(e)),
+        }
+    }
+
+    async fn ssl_check_and_renew(
+        &self,
+        request: Request<SslCheckAndRenewRequest>,
+    ) -> Result<Response<SslCheckAndRenewResponse>, Status> {
+        const NO_METADATA_DB: &str = "metadata database is not configured; set DEPLOY_SQLITE_URL or DATABASE_URL on deploy-server";
+        let Some(db) = self.db.as_ref() else {
+            return Err(Status::failed_precondition(NO_METADATA_DB));
+        };
+        let meta = request.metadata().clone();
+        let inner = request.get_ref();
+        let project_id = &inner.project_id;
+        validate_project_id(project_id).map_err(Status::invalid_argument)?;
+        let sign_payload = signing_payload("SslCheckAndRenew", project_id, "");
+        if let Some(ref auth) = self.auth {
+            let peers = auth.peers.read();
+            verify_rpc_metadata(
+                &meta,
+                &peers,
+                "SslCheckAndRenew",
+                &sign_payload,
+                &auth.config,
+                &auth.nonce_tracker,
+            )
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            register_authenticated_client(&request, &meta);
+        }
+        let inner = request.into_inner();
+        let svc = SslService::new(Arc::clone(db));
+        match svc.check_and_renew(inner).await {
+            Ok(r) => Ok(Response::new(r)),
+            Err(e) => Err(Status::internal(e)),
+        }
     }
 }
 

@@ -13,6 +13,7 @@ mod metrics_http;
 mod proxy_session;
 mod quic;
 mod session_audit;
+mod ssl;
 
 use clap::{Parser, Subcommand};
 use deploy_auth::format_install_bundle;
@@ -493,6 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(bind = %s, "DEPLOY_METRICS_BIND: invalid address, metrics disabled");
         }
     }
+    crate::ssl::spawn_ssl_scheduler(db.clone());
     let control_api_direct = control_api_direct_url(&public_url);
     let control_api_public = control_api_public_url(&public_url, &control_api_direct);
 
