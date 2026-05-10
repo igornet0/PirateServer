@@ -323,7 +323,8 @@ pub fn signing_payload(method: &str, project_id: &str, secondary: &str) -> Strin
         | "GetHostStatsDetail" | "GetServerStackInfo" | "ListSessions" | "QuerySessionLogs"
         | "UpdateConnectionProfile" | "ReportResourceUsage" | "ReportDisplayTopology"
         | "ConnectionProbe"
-        | "CreateConnection" | "CloseConnection" | "GetStats" | "UpdateSettings" => {
+        | "CreateConnection" | "CloseConnection" | "GetStats" | "UpdateSettings"
+        | "SslCreate" | "SslStatus" | "SslUpdate" | "SslCheckAndRenew" => {
             if is_default {
                 String::new()
             } else {

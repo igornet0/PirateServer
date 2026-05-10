@@ -12,7 +12,7 @@
 | `bin/client`, `bin/pirate` | один бинарник CLI (`pirate` — копия/симлинк на `client`) |
 | `systemd/*.service` | unit-файлы для `deploy-server` и `control-api` |
 | `nginx/*.conf`, `nginx/*.conf.in` | шаблоны nginx (сайт + API-only, с доменом и без) |
-| `lib/pirate/*.sh`, `lib/pirate/99-pirate-smb.sudoers.fragment` | OTA стека, SMB, установщики (`install-*.sh`) и **скрипты удаления (`remove-*.sh`)** для диспетчера `pirate-host-service.sh`, WAN helpers (`pirate-ensure-https.sh`, …); фрагмент — NOPASSWD как при `install.sh` |
+| `lib/pirate/*.sh`, `lib/pirate/99-pirate-smb.sudoers.fragment` | OTA стека, SMB, установщики (`install-*.sh`) и **скрипты удаления (`remove-*.sh`)** для диспетчера `pirate-host-service.sh`, WAN helpers (`pirate-ensure-https.sh`, …); фрагмент — NOPASSWD как при `install.sh` (для `pirate-host-service.sh` — `NOPASSWD:SETENV`) |
 | `share/ui/dist/` | статика дашборда (если сборка не `UI_BUILD=0`) |
 | `env.example` | комментированный шаблон переменных окружения |
 | `install.sh`, `uninstall.sh`, `purge-pirate-data.sh` | установка и очистка |
@@ -127,7 +127,13 @@ sudo ./purge-pirate-data.sh --remove-os-user   # при необходимост
 
 ## Опциональные пакеты через десктоп (вкладка «Сервисы»)
 
-После установки или OTA стека на хосте в `/usr/local/lib/pirate/` лежит **`pirate-host-service.sh`** — whitelist-диспетчер (`install` / `remove` для фиксированных id: `node`, `redis`, `postgresql`, …). В `install.sh` пользователю `pirate` выдаётся `NOPASSWD` только на этот скрипт (в дополнение к SMB/nginx/env). Если в ответе API или в логах видно `sudo: a password is required`, обновите хост (повторный `./install.sh` из актуального бандла или правка `/etc/sudoers.d/…`) и проверьте от имени `pirate`: `sudo -n /usr/local/lib/pirate/pirate-host-service.sh install node`.
+После установки или OTA стека на хосте в `/usr/local/lib/pirate/` лежит **`pirate-host-service.sh`** — whitelist-диспетчер (`install` / `remove` для фиксированных id: `node`, `redis`, `postgresql`, …). В `install.sh` пользователю `pirate` выдаётся `NOPASSWD` на этот скрипт (в дополнение к SMB/nginx/env). Установка **MinIO / Meilisearch / Redis / PostgreSQL (и др.)** с параметрами передаёт переменные окружения через `sudo` (`VAR=value` перед путём к скрипту), поэтому в `/etc/sudoers.d/99-pirate-smb` нужна строка **`NOPASSWD:SETENV`** именно для `pirate-host-service.sh` (см. `99-pirate-smb.sudoers.fragment` в бандле). Если в ответе API или в логах видно `sudo: a password is required`, обновите хост (повторный `./install.sh` из актуального бандла или OTA) и проверьте от имени `pirate`: `sudo -n /usr/local/lib/pirate/pirate-host-service.sh install node` (без env) и smoke с env: `sudo -n PIRATE_SUDO_NOPASSWD_CHECK=1 /usr/local/lib/pirate/pirate-host-service.sh show-runtime minio`.
+
+**Переменные `install` для Redis** (`install-redis.sh`, пробрасываются из десктопа в `env`): `PIRATE_REDIS_BIND` (по умолчанию `127.0.0.1`), `PIRATE_REDIS_PORT` (`6379`), `PIRATE_REDIS_AUTH_MODE` (`requirepass` или `acl`), `PIRATE_REDIS_PASSWORD` (пусто → генерируется; в выводе будет `PIRATE_REDIS_GENERATED_PASSWORD=…`), для `acl` ещё `PIRATE_REDIS_ACL_USERNAME`. В режиме `acl` пароль должен быть одной строкой из символов `[a-zA-Z0-9_-]+` (иначе используйте `requirepass`). Конфиг пишется в `/etc/redis/pirate-stack-generated.conf` (подключается `include` из `redis.conf`).
+
+**Переменные `install` для PostgreSQL** (`install-postgresql.sh`): `PIRATE_POSTGRESQL_LISTEN_ADDRESSES` (например `127.0.0.1` или `*`), `PIRATE_POSTGRESQL_PORT` (`5432`), `PIRATE_EXPLORER_DB_USER` / `PIRATE_EXPLORER_DB_NAME` (по умолчанию `pirate_explorer`), `PIRATE_EXPLORER_DB_PASSWORD` (пусто → hex), `PIRATE_EXPLORER_DB_HOST` / `PIRATE_EXPLORER_DB_PORT` для строки `POSTGRES_EXPLORER_URL` и правила `pg_hba` (хост должен быть IPv4/IPv6 литералом или `localhost`). Скрипт дописывает блоки с маркерами `# BEGIN/END pirate-stack postgresql` в `postgresql.conf` и `pg_hba.conf` (повторный install перезаписывает только эти блоки).
+
+Отдельно (вручную в `/etc/pirate-deploy.env`, не генерируется `install-postgresql.sh`): **`PIRATE_POSTGRES_ADMIN_URL`** — URL суперпользователя к БД `postgres` для API **create-database** (`CONTROL_API_HOST_DB_ADMIN_CREATE`); не смешивать с ограниченным explorer. Для **migration-run**: **`PIRATE_MIGRATION_CWD_ALLOWLIST`** — см. `docs/HOST_DB_MIGRATIONS_AND_ADMIN.md`.
 
 **Preflight OTA:** перед `pirate update` убедитесь, что в архиве есть фрагмент sudoers (иначе OTA снова сузит NOPASSWD):
 
@@ -137,6 +143,6 @@ tar tzf pirate-linux-aarch64-no-ui-*.tar.gz | grep lib/pirate/99-pirate-smb.sudo
 
 Или: `./scripts/verify-server-stack-bundle-tar.sh dist/pirate-linux-*-no-ui-*.tar.gz`.
 
-**Проверка на хосте после OTA:** `grep host-service /etc/sudoers.d/99-pirate-smb` и `sudo -u pirate sudo -n /usr/local/lib/pirate/pirate-host-service.sh --help` (без запроса пароля).
+**Проверка на хосте после OTA:** `grep pirate-host-service /etc/sudoers.d/99-pirate-smb` (должно быть `NOPASSWD:SETENV:`) и `sudo -u pirate sudo -n PIRATE_SUDO_NOPASSWD_CHECK=1 /usr/local/lib/pirate/pirate-host-service.sh show-runtime minio` (без запроса пароля).
 
 **Важно:** удаление СУБД через API вызывает сценарии `remove-*.sh` (`apt-get remove --purge`). Это может **безвозвратно удалить данные** на хосте. Используйте на тестовых машинах или после резервного копирования.

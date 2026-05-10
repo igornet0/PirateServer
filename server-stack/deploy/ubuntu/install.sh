@@ -428,6 +428,14 @@ if [[ "${pirate_INSTALL_CLICKHOUSE:-0}" == "1" ]] && [[ -x "$PIRATE_LIB_DIR/inst
   echo "==> опционально: ClickHouse"
   bash "$PIRATE_LIB_DIR/install-clickhouse.sh"
 fi
+if [[ "${pirate_INSTALL_MINIO:-0}" == "1" ]] && [[ -x "$PIRATE_LIB_DIR/install-minio.sh" ]]; then
+  echo "==> опционально: MinIO (S3 на loopback)"
+  bash "$PIRATE_LIB_DIR/install-minio.sh"
+fi
+if [[ "${pirate_INSTALL_MEILISEARCH:-0}" == "1" ]] && [[ -x "$PIRATE_LIB_DIR/install-meilisearch.sh" ]]; then
+  echo "==> опционально: Meilisearch"
+  bash "$PIRATE_LIB_DIR/install-meilisearch.sh"
+fi
 if [[ "${pirate_INSTALL_ORACLE_NOTES:-0}" == "1" ]] && [[ -x "$PIRATE_LIB_DIR/install-oracle-notes.sh" ]]; then
   echo "==> опционально: Oracle (заметки / скрипт)"
   bash "$PIRATE_LIB_DIR/install-oracle-notes.sh"
@@ -462,6 +470,11 @@ for _pf in "$PIRATE_LIB_DIR"/*.sh; do
   install -m 0755 "$_pf" "/usr/local/lib/pirate/$_bn"
 done
 shopt -u nullglob
+
+if [[ -x /usr/local/lib/pirate/pirate-ensure-file-storage.sh ]]; then
+  echo "==> file storage (PIRATE_STORAGE_ROOT / pirate-ensure-file-storage.sh)"
+  /usr/local/lib/pirate/pirate-ensure-file-storage.sh
+fi
 
 echo "==> uninstall scripts -> /usr/local/share/pirate-uninstall"
 install -d -m 0755 /usr/local/share/pirate-uninstall

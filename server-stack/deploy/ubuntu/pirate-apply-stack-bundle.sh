@@ -154,6 +154,12 @@ if [[ -d "$LIB_SRC" ]]; then
   fi
 fi
 
+# Desktop file storage: PIRATE_STORAGE_ROOT + .pirate-tmp, optional line in /etc/pirate-deploy.env
+if [[ -x /usr/local/lib/pirate/pirate-ensure-file-storage.sh ]]; then
+  echo "==> file storage (PIRATE_STORAGE_ROOT / pirate-ensure-file-storage.sh)"
+  /usr/local/lib/pirate/pirate-ensure-file-storage.sh
+fi
+
 # Sudoers must match install.sh: canonical file is 99-pirate-smb.sudoers.fragment (bundled under lib/pirate).
 SUDOERS_PIRATE=/etc/sudoers.d/99-pirate-smb
 FRAG_BUNDLE="$LIB_SRC/$SUDOERS_FRAG_NAME"
@@ -166,7 +172,8 @@ else
   cat >"$SUDOERS_PIRATE" <<'SUDOERS'
 # Pirate: non-interactive sudo for SMB helpers, stack OTA, and dashboard host env writer (control-api).
 # Legacy bundle without 99-pirate-smb.sudoers.fragment — NOPASSWD list must match install.sh.
-pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh, /usr/local/lib/pirate/pirate-write-deploy-env.sh, /usr/local/lib/pirate/pirate-ensure-nginx.sh, /usr/local/lib/pirate/pirate-nginx-apply-site.sh, /usr/local/lib/pirate/pirate-host-service.sh, /usr/local/lib/pirate/pirate-antiddos-apply.sh, /usr/local/lib/pirate/pirate-host-agent-reboot.sh
+pirate ALL=(root) NOPASSWD: /usr/local/lib/pirate/pirate-smb-mount.sh, /usr/local/lib/pirate/pirate-smb-umount.sh, /usr/local/lib/pirate/pirate-storage-bind.sh, /usr/local/lib/pirate/pirate-apply-stack-bundle.sh, /usr/local/lib/pirate/pirate-write-deploy-env.sh, /usr/local/lib/pirate/pirate-ensure-nginx.sh, /usr/local/lib/pirate/pirate-nginx-apply-site.sh, /usr/local/lib/pirate/pirate-nginx-ops.sh, /usr/local/lib/pirate/pirate-antiddos-apply.sh, /usr/local/lib/pirate/pirate-host-agent-reboot.sh, /usr/bin/certbot, /usr/bin/test, /usr/bin/openssl
+pirate ALL=(root) NOPASSWD:SETENV: /usr/local/lib/pirate/pirate-host-service.sh
 SUDOERS
   chmod 0440 "$SUDOERS_PIRATE"
 fi
