@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Verify a Linux server-stack .tar.gz unpacks to a layout deploy-server expects for OTA
 # (bin/deploy-server + bin/control-api under pirate-linux-* or flat top-level).
-# Also requires lib/pirate/99-pirate-smb.sudoers.fragment with pirate-host-service.sh NOPASSWD
-# so control-api host-services install does not fail with "sudo: a password is required".
+# Also requires lib/pirate/99-pirate-smb.sudoers.fragment with NOPASSWD:SETENV for pirate-host-service.sh
+# so control-api host-services install (MinIO/Meilisearch env) does not fail with "sudo: a password is required".
 #
 # Usage: ./scripts/verify-server-stack-bundle-tar.sh <path/to/pirate-linux-*.tar.gz>
 # Exit 0 if OK, 1 otherwise.
@@ -51,12 +51,12 @@ if [[ ! -f "$FRAG" ]]; then
   echo "error: missing $FRAG (include 99-pirate-smb.sudoers.fragment in lib/pirate for OTA sudoers)" >&2
   exit 1
 fi
-if ! grep -q 'pirate-host-service\.sh' "$FRAG"; then
-  echo "error: $FRAG must NOPASSWD-list pirate-host-service.sh (host-services install from control-api)" >&2
+if ! grep -qE 'NOPASSWD:SETENV:.*pirate-host-service\.sh' "$FRAG"; then
+  echo "error: $FRAG must include NOPASSWD:SETENV for pirate-host-service.sh (host-services install with env from control-api)" >&2
   exit 1
 fi
 
-echo "OK: sudoers fragment lists pirate-host-service.sh"
+echo "OK: sudoers fragment has NOPASSWD:SETENV for pirate-host-service.sh"
 
 RM_NODE="$BUNDLE_ROOT/lib/pirate/remove-nodejs-runtime.sh"
 if [[ ! -f "$RM_NODE" ]]; then

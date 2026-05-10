@@ -54,6 +54,31 @@ if [[ "$HOST_OS" != "Darwin" || "$LINUX_BUNDLE_HOST_BUILD" == "1" ]]; then
   rustup target add "$TARGET_TRIPLE" >/dev/null 2>&1 || true
 fi
 
+# On Apple Silicon, linux/amd64 in Docker (QEMU) often cannot run rustc.
+# Preflight stays "soft" by default: if it fails we continue and let
+# linux-bundle-build-rust-in-docker.sh pick a runnable platform + cross toolchain.
+# Set PIRATE_REQUIRE_DOCKER_PREFLIGHT=1 to enforce hard-fail behavior.
+if [[ "$HOST_OS" == "Darwin" && "$LINUX_BUNDLE_HOST_BUILD" != "1" && "$TARGET_TRIPLE" == "x86_64-unknown-linux-gnu" && "$(uname -m)" == "arm64" ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: on macOS, Docker is required to build this bundle (deploy-client links libxcb via xcap)." >&2
+    exit 1
+  fi
+  REQUIRE_PREFLIGHT="${PIRATE_REQUIRE_DOCKER_PREFLIGHT:-0}"
+  case "${REQUIRE_PREFLIGHT,,}" in
+    1|true|yes|on) REQUIRE_PREFLIGHT=1 ;;
+    *) REQUIRE_PREFLIGHT=0 ;;
+  esac
+  chmod +x "$REPO_ROOT/scripts/preflight-linux-rust-docker.sh" 2>/dev/null || true
+  if DOCKER_RUST_IMAGE="${DOCKER_RUST_IMAGE:-rust:bookworm}" \
+      "$REPO_ROOT/scripts/preflight-linux-rust-docker.sh" "$TARGET_TRIPLE"; then
+    export PIRATE_RUST_IN_DOCKER_PREFLIGHT_OK=1
+  elif [[ "$REQUIRE_PREFLIGHT" == "1" ]]; then
+    exit 1
+  else
+    echo "warning: docker preflight failed for $TARGET_TRIPLE; continuing with automatic docker fallback." >&2
+  fi
+fi
+
 if [[ "$UI_BUILD" == "1" ]]; then
   echo "==> frontend (npm run build)"
   (
@@ -76,7 +101,8 @@ if [[ "$HOST_OS" == "Darwin" && "$LINUX_BUNDLE_HOST_BUILD" != "1" ]]; then
     echo "      Install Docker Desktop, or set LINUX_BUNDLE_HOST_BUILD=1 to use cargo-zigbuild/cargo on the host (link may fail on -lxcb)." >&2
     exit 1
   fi
-  chmod +x "$REPO_ROOT/scripts/linux-bundle-build-rust-in-docker.sh" "$REPO_ROOT/scripts/linux-bundle-rust-docker-entry.sh" 2>/dev/null || true
+  chmod +x "$REPO_ROOT/scripts/preflight-linux-rust-docker.sh" "$REPO_ROOT/scripts/linux-bundle-build-rust-in-docker.sh" "$REPO_ROOT/scripts/linux-bundle-rust-docker-entry.sh" 2>/dev/null || true
+  # preflight: scripts/preflight-linux-rust-docker.sh (Colima x86_64 on Apple when ARCH=amd64)
   REPO_ROOT="$REPO_ROOT" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     "$REPO_ROOT/scripts/linux-bundle-build-rust-in-docker.sh" "$TARGET_TRIPLE"
 elif command -v cargo-zigbuild >/dev/null 2>&1; then

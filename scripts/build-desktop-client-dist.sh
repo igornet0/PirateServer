@@ -2,7 +2,7 @@
 # Release artifacts for Tauri desktop bundles (default: local-stack/desktop-ui → pirate-client).
 # Invoked from Makefile: dist-client-* | dist-desktop-*
 #
-# Usage: ./scripts/build-desktop-client-dist.sh linux-tgz|macos-tgz|macos-dmg|windows-zip|windows-msi
+# Usage: ./scripts/build-desktop-client-dist.sh linux-tgz|macos-tgz|macos-dmg|macos-dmg-fast|windows-zip|windows-msi
 # Env:
 #   ARCH=amd64|arm64 (default amd64)
 #   UI_BUILD=0|1 (ignored for Tauri; embedded UI is always built)
@@ -23,7 +23,7 @@
 #
 set -euo pipefail
 
-MODE="${1:?usage: $0 linux-tgz|macos-tgz|macos-dmg|windows-zip|windows-msi}"
+MODE="${1:?usage: $0 linux-tgz|macos-tgz|macos-dmg|macos-dmg-fast|windows-zip|windows-msi}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -235,7 +235,7 @@ dmg_inject_readme() {
   local src_dmg="$1"
   local out_dmg="$2"
   local readme_template="${DMG_README_TEMPLATE:-$REPO_ROOT/scripts/dmg-bundle-README.in.txt}"
-  local tmp_readme tmp_rw mntpnt
+  local tmp_readme tmp_rw mntpnt app_bundle_name
 
   if [[ ! -f "$readme_template" ]]; then
     echo "warning: DMG README template missing ($readme_template); copying .dmg unchanged." >&2
@@ -258,12 +258,52 @@ dmg_inject_readme() {
   hdiutil convert "$src_dmg" -format UDRW -o "$tmp_rw"
   hdiutil attach "$tmp_rw" -readwrite -nobrowse -mountpoint "$mntpnt"
   cp -f "$tmp_readme" "$mntpnt/README.txt"
+  app_bundle_name="$(basename "$(find "$mntpnt" -maxdepth 1 -name '*.app' -print | head -n 1 || true)")"
+  # Keep README visible at the very top of the DMG window layout.
+  osascript <<EOF >/dev/null 2>&1 || echo "warning: failed to set README icon position in DMG Finder layout; continuing." >&2
+tell application "Finder"
+  set readmeItem to (POSIX file "$mntpnt/README.txt") as alias
+  set position of readmeItem to {520, 90}
+  if "$app_bundle_name" is not "" then
+    try
+      set appItem to (POSIX file "$mntpnt/$app_bundle_name") as alias
+      set position of appItem to {${DMG_APP_POS_X:-170}, ${DMG_APP_POS_Y:-350}}
+    end try
+  end if
+  try
+    set appsItem to (POSIX file "$mntpnt/Applications") as alias
+    set position of appsItem to {${DMG_APPS_POS_X:-430}, ${DMG_APPS_POS_Y:-350}}
+  end try
+end tell
+EOF
   sync
   hdiutil detach "$mntpnt"
   rm -f "$out_dmg"
   hdiutil convert "$tmp_rw" -format UDZO -imagekey zlib-level=9 -ov -o "$out_dmg"
   rm -f "$tmp_readme" "$tmp_rw"
   rmdir "$mntpnt" 2>/dev/null || true
+}
+
+load_dmg_layout_from_tauri_conf() {
+  local conf="$DESKTOP_UI/src-tauri/tauri.conf.json"
+  if [[ ! -f "$conf" ]]; then
+    return 0
+  fi
+  local layout
+  layout="$(python3 - "$conf" <<'PY'
+import json,sys
+cfg=json.load(open(sys.argv[1], encoding="utf-8"))
+dmg=((cfg.get("bundle") or {}).get("macOS") or {}).get("dmg") or {}
+app=dmg.get("appPosition") or {}
+apps=dmg.get("applicationFolderPosition") or {}
+print(f'{app.get("x","")} {app.get("y","")} {apps.get("x","")} {apps.get("y","")}')
+PY
+)"
+  read -r app_x app_y apps_x apps_y <<<"$layout"
+  [[ "$app_x" =~ ^[0-9]+$ ]] && export DMG_APP_POS_X="$app_x"
+  [[ "$app_y" =~ ^[0-9]+$ ]] && export DMG_APP_POS_Y="$app_y"
+  [[ "$apps_x" =~ ^[0-9]+$ ]] && export DMG_APPS_POS_X="$apps_x"
+  [[ "$apps_y" =~ ^[0-9]+$ ]] && export DMG_APPS_POS_Y="$apps_y"
 }
 
 bundle_win_nsis_dir() {
@@ -463,25 +503,35 @@ case "$MODE" in
     echo "note: add bin/ to PATH (or symlink bin/pirate) to run pirate in the terminal."
     ;;
 
-  macos-dmg)
+  macos-dmg|macos-dmg-fast)
     is_darwin || {
       echo "error: macOS DMG — run on Darwin (macOS)." >&2
       exit 1
     }
     TARGET="$(rust_triple_mac)"
-    rustup_target_add "$TARGET"
-    ensure_npm_deps
-    build_pirate_cli_release "$TARGET"
-    echo "==> tauri build (dmg) target=$TARGET version=$REL"
-    run_tauri_build "$TARGET" --bundles dmg
+    if [[ "$MODE" == "macos-dmg" ]]; then
+      rustup_target_add "$TARGET"
+      ensure_npm_deps
+      build_pirate_cli_release "$TARGET"
+      echo "==> tauri build (dmg) target=$TARGET version=$REL"
+      run_tauri_build "$TARGET" --bundles dmg
+    else
+      echo "==> fast DMG repack mode (no Rust/UI rebuild)"
+    fi
     DMG_DIR="$(bundle_macos_dmg_dir "$TARGET")"
     DMG_SRC="$(find "$DMG_DIR" -maxdepth 1 -name '*.dmg' -print | head -n 1 || true)"
     if [[ -z "$DMG_SRC" || ! -f "$DMG_SRC" ]]; then
-      echo "error: no .dmg under $DMG_DIR" >&2
+      if [[ "$MODE" == "macos-dmg-fast" ]]; then
+        echo "error: fast mode requires an existing DMG under $DMG_DIR" >&2
+        echo "       run once: ARCH=$ARCH_N ./scripts/build-desktop-client-dist.sh macos-dmg" >&2
+      else
+        echo "error: no .dmg under $DMG_DIR" >&2
+      fi
       exit 1
     fi
     OUT_DMG="$DIST_DIR/${DIST_ARTIFACT_PREFIX}-macos-${ARCH_N}-${REL}-${DATE_TAG}.dmg"
     rm -f "$OUT_DMG"
+    load_dmg_layout_from_tauri_conf
     dmg_inject_readme "$DMG_SRC" "$OUT_DMG"
     echo "Done: $OUT_DMG (README.txt added inside the disk image)"
     ;;
@@ -559,7 +609,7 @@ case "$MODE" in
     ;;
 
   *)
-    echo "usage: $0 linux-tgz|macos-tgz|macos-dmg|windows-zip|windows-msi" >&2
+    echo "usage: $0 linux-tgz|macos-tgz|macos-dmg|macos-dmg-fast|windows-zip|windows-msi" >&2
     exit 1
     ;;
 esac

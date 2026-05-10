@@ -5,6 +5,9 @@ mod auth;
 mod cors;
 mod data_sources_api;
 mod error;
+mod host_databases_api;
+mod host_databases_v2_api;
+mod storage_api;
 mod proxy_sessions_api;
 mod proxy_tunnel_redis;
 mod host_terminal;
@@ -27,14 +30,21 @@ use deploy_auth::{
     load_authorized_peers, load_identity, save_authorized_peers, IdentityFile,
 };
 use deploy_control::{
-    apply_nginx_put, apply_nginx_site_via_sudo, collect_host_services, collect_nginx_status,
-    ensure_nginx_via_sudo, host_service_action_via_sudo, read_nginx_config, read_nginx_site_file,
-    AllocateProjectResponse, AppEnvView, ControlPlane, CpuDetail, DatabaseColumnsView,
-    DatabaseInfoView, DatabaseRelationshipsView, DatabaseSchemasView, DatabaseTablePreviewView,
-    DatabaseTablesView, DiskDetail, HostDeployEnvPutView, HostDeployEnvView, HostServiceActionView,
-    HostServicesView, HostStatsHistory, MemoryDetail, NginxConfigPut, NginxConfigView, NginxEnsureView,
-    NginxEnvUpdateView, NginxEnvVarUpdateView, NginxPutResponseView, NginxStatusView, NetworkDetail,
-    ProcessControlView, ProcessesDetail, ProjectsView, RollbackBody, RollbackView, SeriesResponse,
+    apply_nginx_inventory_file_put, apply_nginx_put, apply_nginx_site_via_sudo,
+    apply_nginx_universal_action, collect_host_service_runtime_config, collect_host_services,
+    collect_nginx_sites, collect_nginx_status, ensure_nginx_via_sudo, host_service_action_via_sudo,
+    host_service_apply_runtime_via_sudo, host_service_restart_runtime_via_sudo,
+    parse_nginx_inventory_path, preflight_nginx,
+    read_nginx_config, read_nginx_inventory_file, read_nginx_site_file, AllocateProjectResponse,
+    AppEnvView, ControlPlane, CpuDetail, DatabaseColumnsView, DatabaseInfoView,
+    DatabaseRelationshipsView, DatabaseSchemasView, DatabaseTablePreviewView, DatabaseTablesView,
+    DiskDetail, HostDeployEnvPutView, HostDeployEnvView, HostServiceActionView,
+    HostServiceRuntimeConfigView, HostServicesView,
+    HostStatsHistory, MemoryDetail, NginxActionBody, NginxActionResponseView, NginxConfigPut,
+    NginxConfigView, NginxEnsureView, NginxEnvUpdateView, NginxEnvVarUpdateView, NginxFilePut,
+    NginxPreflightProposed, NginxPreflightView, NginxPutResponseView, NginxSitesView, NginxStatusView,
+    NetworkDetail, ProcessControlView, ProcessesDetail, ProjectsView, RollbackBody, RollbackView,
+    SeriesResponse,
 };
 use deploy_core::{validate_project_id, validate_version};
 use deploy_db::{DbStore, PgPool};
@@ -102,6 +112,8 @@ pub(crate) struct ApiState {
     nginx_ensure_script: PathBuf,
     /// Helper run via `sudo -n` to write site config, test and reload nginx.
     nginx_apply_site_script: PathBuf,
+    /// Privileged helper: `nginx -t`, `reload`, `apply-config` (non-vhost paths).
+    nginx_ops_script: PathBuf,
     /// Whitelist dispatcher for optional host packages (`install` / `remove`).
     host_service_dispatch_script: PathBuf,
     antiddos_state_dir: PathBuf,
@@ -114,6 +126,53 @@ pub(crate) struct ApiState {
     deploy_upload_session_chunk_bytes: usize,
     deploy_upload_session_ttl_secs: u64,
     deploy_upload_sessions: Arc<AsyncMutex<HashMap<String, DeployUploadSessionState>>>,
+    /// Serialize nginx preflight + privileged actions.
+    nginx_action_lock: Arc<Mutex<()>>,
+    /// Absolute directory for the Pirate file manager; env `PIRATE_STORAGE_ROOT` (optional).
+    storage_root: Option<PathBuf>,
+    /// 0 = unlimited. Env `PIRATE_STORAGE_MAX_BYTES`.
+    storage_max_bytes: u64,
+    /// Per-file cap for `POST /api/v1/storage/files`. Env `PIRATE_STORAGE_MAX_UPLOAD_BYTES`.
+    storage_max_upload_bytes: u64,
+    /// Chunk size for resumable storage upload sessions (bytes).
+    storage_upload_session_chunk_bytes: usize,
+    /// TTL for resumable storage upload sessions (seconds).
+    storage_upload_session_ttl_secs: u64,
+    storage_upload_sessions: Arc<
+        AsyncMutex<HashMap<String, storage_api::StorageUploadSessionState>>,
+    >,
+    /// `pirate-storage-bind.sh` (sudo NOPASSWD); bind-mount sources into `PIRATE_STORAGE_ROOT/volumes/`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    storage_bind_script: PathBuf,
+    /// JSON registry of active binds (written by the helper script).
+    storage_bind_state_path: PathBuf,
+    /// Optional `:`-separated allowlist roots for bind sources (env `PIRATE_STORAGE_BIND_SOURCE_PREFIXES`).
+    storage_bind_source_prefixes: Option<String>,
+    /// `CONTROL_API_HOST_DATABASES=0` disables `/api/v1/host-databases/*` (403). Default: enabled.
+    pub(crate) host_databases_enabled: bool,
+    /// Cap for `POST .../query` `max_rows` (and default when 0). Env: `CONTROL_API_HOST_DB_MAX_QUERY_ROWS`.
+    pub(crate) host_db_max_query_rows: u32,
+    /// Cap for `GET .../rows` and Mongo preview `limit`. Env: `CONTROL_API_HOST_DB_MAX_PREVIEW_LIMIT`.
+    pub(crate) host_db_max_preview_limit: u32,
+    /// Max `GET .../rows` offset (defence in depth). Env: `CONTROL_API_HOST_DB_MAX_OFFSET`.
+    pub(crate) host_db_max_offset: u32,
+    /// Reject SQL larger than this (bytes). Env: `CONTROL_API_HOST_DB_MAX_SQL_BYTES`.
+    pub(crate) host_db_max_sql_bytes: usize,
+    /// Max length of Redis key `pattern` query param. Env: `CONTROL_API_HOST_DB_MAX_REDIS_PATTERN_BYTES`.
+    pub(crate) host_db_max_redis_pattern_bytes: usize,
+    /// `CONTROL_API_HOST_DB_WORKSPACE_V2=1`: enable `/api/v2/host-databases/*` (tree, grid, optional jobs/mutations).
+    pub(crate) host_db_workspace_v2: bool,
+    /// `CONTROL_API_HOST_DB_WRITE=1`: allow `POST .../row-mutate` (PostgreSQL/MySQL).
+    pub(crate) host_db_write_enabled: bool,
+    /// `CONTROL_API_HOST_DB_SQL_JOBS=1`: allow async SQL job endpoints.
+    pub(crate) host_db_sql_jobs_enabled: bool,
+    pub(crate) host_db_sql_jobs: Arc<Mutex<HashMap<String, host_databases_v2_api::HostDbSqlJobRec>>>,
+    /// `CONTROL_API_HOST_DB_MIGRATIONS=1`: migration tool / revision detection (read-only).
+    pub(crate) host_db_migrations_enabled: bool,
+    /// `CONTROL_API_HOST_DB_ADMIN_CREATE=1`: `POST .../admin/*` (create database, create table, create user; PostgreSQL `PIRATE_POSTGRES_ADMIN_URL` on host).
+    pub(crate) host_db_admin_create_enabled: bool,
+    /// `CONTROL_API_HOST_DB_MIGRATION_RUN=1`: whitelisted `alembic` / `prisma` / `flyway` in allowlisted cwd.
+    pub(crate) host_db_migration_run_enabled: bool,
 }
 
 /// Parse database URL and strip password for safe display (PostgreSQL; SQLite returned as-is).
@@ -1860,12 +1919,65 @@ async fn put_nginx_config(
         )),
         Some(path) => {
             check_nginx_write_auth(&s, &headers)?;
-            let outcome = apply_nginx_put(path, &body.content, s.nginx_test_full_config)
+            let outcome = apply_nginx_put(
+                path,
+                &body.content,
+                s.nginx_test_full_config,
+                &s.nginx_ops_script,
+            )
                 .await
                 .map_err(|e| ApiError::internal(e.to_string()))?;
             Ok(Json(outcome.response))
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct NginxFilePathQuery {
+    path: String,
+}
+
+async fn get_nginx_file(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<NginxFilePathQuery>,
+) -> Result<Json<NginxConfigView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let path = parse_nginx_inventory_path(&q.path).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    read_nginx_inventory_file(&path)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::not_found(e.to_string())
+            } else {
+                ApiError::bad_request(e.to_string())
+            }
+        })
+}
+
+async fn put_nginx_file(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<NginxFilePut>,
+) -> Result<Json<NginxPutResponseView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let path = parse_nginx_inventory_path(&body.path).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let test_full = s
+        .nginx_config_path
+        .as_ref()
+        .is_some_and(|cfg| cfg == &path)
+        && s.nginx_test_full_config;
+    let outcome = apply_nginx_inventory_file_put(
+        &path,
+        &body.content,
+        test_full,
+        &s.nginx_ops_script,
+        &s.nginx_apply_site_script,
+    )
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(outcome.response))
 }
 
 async fn api_nginx_status(
@@ -1877,6 +1989,7 @@ async fn api_nginx_status(
         &s.nginx_site_path,
         &s.nginx_ensure_script,
         &s.nginx_apply_site_script,
+        &s.nginx_ops_script,
     )))
 }
 
@@ -1916,20 +2029,34 @@ async fn api_host_services(
         &s.nginx_site_path,
         &s.nginx_ensure_script,
         &s.nginx_apply_site_script,
+        &s.nginx_ops_script,
         &s.host_service_dispatch_script,
     )))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct HostServiceInstallBody {
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 
 async fn api_host_service_install(
     State(s): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: axum::Json<HostServiceInstallBody>,
 ) -> Result<Json<HostServiceActionView>, ApiError> {
     check_api_bearer(&s, &headers)?;
+    let install_env = if body.env.is_empty() {
+        None
+    } else {
+        Some(body.env.clone())
+    };
     Ok(Json(host_service_action_via_sudo(
         "install",
         &id,
         &s.host_service_dispatch_script,
+        install_env,
     )?))
 }
 
@@ -1943,7 +2070,87 @@ async fn api_host_service_remove(
         "remove",
         &id,
         &s.host_service_dispatch_script,
+        None,
     )?))
+}
+
+async fn api_host_service_runtime_get(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<HostServiceRuntimeConfigView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(collect_host_service_runtime_config(
+        &id,
+        &s.host_service_dispatch_script,
+    )?))
+}
+
+async fn api_host_service_runtime_put(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::Json<HostServiceRuntimeConfigView>,
+) -> Result<Json<HostServiceActionView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(host_service_apply_runtime_via_sudo(
+        &id,
+        &s.host_service_dispatch_script,
+        body.env.clone(),
+    )?))
+}
+
+async fn api_host_service_restart(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<HostServiceActionView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    Ok(Json(host_service_restart_runtime_via_sudo(
+        &id,
+        &s.host_service_dispatch_script,
+    )?))
+}
+
+async fn api_nginx_sites(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<NginxSitesView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let v = collect_nginx_sites(&s.nginx_site_path, &s.nginx_ops_script)?;
+    Ok(Json(v))
+}
+
+async fn api_nginx_preflight(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<NginxPreflightProposed>,
+) -> Result<Json<NginxPreflightView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let _g = s
+        .nginx_action_lock
+        .lock()
+        .map_err(|_| ApiError::internal("nginx action lock poisoned"))?;
+    let v = preflight_nginx(&s.nginx_site_path, &body, &s.nginx_ops_script)?;
+    Ok(Json(v))
+}
+
+async fn api_nginx_action(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<NginxActionBody>,
+) -> Result<Json<NginxActionResponseView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let _g = s
+        .nginx_action_lock
+        .lock()
+        .map_err(|_| ApiError::internal("nginx action lock poisoned"))?;
+    let v = apply_nginx_universal_action(
+        &s.nginx_apply_site_script,
+        &s.nginx_ops_script,
+        &body,
+    )?;
+    Ok(Json(v))
 }
 
 async fn api_nginx_ensure(
@@ -2069,6 +2276,14 @@ struct Args {
     )]
     nginx_apply_site_script: PathBuf,
 
+    /// Privileged nginx ops (`validate`, `reload`, `apply-config` for PUT main config).
+    #[arg(
+        long,
+        env = "CONTROL_API_NGINX_OPS_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-nginx-ops.sh"
+    )]
+    nginx_ops_script: PathBuf,
+
     /// `pirate-host-service.sh` whitelist (install/remove optional host packages).
     #[arg(
         long,
@@ -2100,6 +2315,18 @@ struct Args {
         default_value = "/var/log/nginx/pirate-antiddos-error.log"
     )]
     antiddos_limit_log_path: PathBuf,
+
+    /// When set, `GET/POST/… /api/v1/storage/*` serve the desktop file manager (Pirate data dir).
+    #[arg(long, env = "PIRATE_STORAGE_ROOT")]
+    pirate_storage_root: Option<PathBuf>,
+
+    /// Max total file bytes under `PIRATE_STORAGE_ROOT`. `0` = unlimited. Env: `PIRATE_STORAGE_MAX_BYTES`.
+    #[arg(long, env = "PIRATE_STORAGE_MAX_BYTES", default_value_t = 0)]
+    pirate_storage_max_bytes: u64,
+
+    /// Max single file upload to storage. `0` = same as `DEPLOY_MAX_UPLOAD_BYTES` at runtime.
+    #[arg(long, env = "PIRATE_STORAGE_MAX_UPLOAD_BYTES", default_value_t = 0)]
+    pirate_storage_max_upload_bytes: u64,
 
     /// If set, `Authorization: Bearer` may match this token (in addition to JWT when `CONTROL_API_JWT_SECRET` is set).
     #[arg(long, env = "CONTROL_API_BEARER_TOKEN")]
@@ -2188,6 +2415,42 @@ struct Args {
         default_value = "/usr/local/lib/pirate/pirate-smb-umount.sh"
     )]
     smb_umount_script: PathBuf,
+
+    /// Privileged helper: `pirate-storage-bind.sh` (bind / unbind under `PIRATE_STORAGE_ROOT/volumes/`).
+    #[arg(
+        long,
+        env = "CONTROL_API_STORAGE_BIND_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-storage-bind.sh"
+    )]
+    storage_bind_script: PathBuf,
+
+    /// Bind registry JSON (must match `pirate-storage-bind.sh`).
+    #[arg(
+        long,
+        env = "CONTROL_API_STORAGE_BIND_STATE_PATH",
+        default_value = "/var/lib/pirate/storage-binds.json"
+    )]
+    storage_bind_state_path: PathBuf,
+
+    /// `:`-separated directory prefixes for bind sources (default `/mnt:/media:/srv` when unset).
+    #[arg(long, env = "PIRATE_STORAGE_BIND_SOURCE_PREFIXES")]
+    pirate_storage_bind_source_prefixes: Option<String>,
+
+    /// Chunk size for resumable Pirate storage upload sessions (bytes).
+    #[arg(
+        long,
+        env = "CONTROL_API_STORAGE_SESSION_CHUNK_BYTES",
+        default_value_t = 1024 * 1024
+    )]
+    storage_upload_session_chunk_bytes: usize,
+
+    /// TTL for resumable Pirate storage upload sessions (seconds).
+    #[arg(
+        long,
+        env = "CONTROL_API_STORAGE_SESSION_TTL_SECS",
+        default_value_t = 3600
+    )]
+    storage_upload_session_ttl_secs: u64,
 }
 
 fn spawn_reconcile(plane: Arc<ControlPlane>) {
@@ -2342,12 +2605,31 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    let host_deploy_env_path = std::env::var("CONTROL_API_HOST_DEPLOY_ENV_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/pirate-deploy.env"));
+
+    let pg_explorer_target: Option<(String, u16)> = args
+        .postgres_explorer_url
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|raw| {
+            let u = url::Url::parse(raw).ok()?;
+            let h = u.host_str()?.to_string();
+            let port = u.port().unwrap_or(5432);
+            Some((h, port))
+        });
+
     let plane = Arc::new(ControlPlane::new(
         args.deploy_root.clone(),
         args.grpc_endpoint.clone(),
         db.clone(),
         pg_explorer,
         grpc_signing_key,
+        host_deploy_env_path.clone(),
+        pg_explorer_target,
     ));
 
     if db.is_some() {
@@ -2412,11 +2694,68 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty());
 
-    let host_deploy_env_path = std::env::var("CONTROL_API_HOST_DEPLOY_ENV_PATH")
+    let host_databases_enabled = std::env::var("CONTROL_API_HOST_DATABASES")
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/etc/pirate-deploy.env"));
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| !matches!(s.as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true);
+    let host_db_max_query_rows = std::env::var("CONTROL_API_HOST_DB_MAX_QUERY_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u32| (1..=100_000).contains(&n))
+        .unwrap_or(5_000u32);
+    let host_db_max_preview_limit = std::env::var("CONTROL_API_HOST_DB_MAX_PREVIEW_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u32| (1..=10_000).contains(&n))
+        .unwrap_or(500u32);
+    let host_db_max_offset = std::env::var("CONTROL_API_HOST_DB_MAX_OFFSET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u32| n <= 1_000_000_000)
+        .unwrap_or(10_000_000u32);
+    let host_db_max_sql_bytes = std::env::var("CONTROL_API_HOST_DB_MAX_SQL_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n >= 64 && n <= 2_000_000)
+        .unwrap_or(200_000usize);
+    let host_db_max_redis_pattern_bytes = std::env::var("CONTROL_API_HOST_DB_MAX_REDIS_PATTERN_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n >= 1 && n <= 16_000)
+        .unwrap_or(512usize);
+
+    let host_db_workspace_v2 = std::env::var("CONTROL_API_HOST_DB_WORKSPACE_V2")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| matches!(s.as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    let host_db_write_enabled = std::env::var("CONTROL_API_HOST_DB_WRITE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| matches!(s.as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    let host_db_sql_jobs_enabled = std::env::var("CONTROL_API_HOST_DB_SQL_JOBS")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| matches!(s.as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    let host_db_migrations_enabled = std::env::var("CONTROL_API_HOST_DB_MIGRATIONS")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| matches!(s.as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    let host_db_admin_create_enabled = std::env::var("CONTROL_API_HOST_DB_ADMIN_CREATE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| matches!(s.as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    let host_db_migration_run_enabled = std::env::var("CONTROL_API_HOST_DB_MIGRATION_RUN")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| matches!(s.as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+
     let host_deploy_env_write_script = std::env::var("CONTROL_API_WRITE_DEPLOY_ENV_SCRIPT")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -2454,6 +2793,7 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         nginx_site_path: args.nginx_site_path.clone(),
         nginx_ensure_script: args.nginx_ensure_script.clone(),
         nginx_apply_site_script: args.nginx_apply_site_script.clone(),
+        nginx_ops_script: args.nginx_ops_script.clone(),
         host_service_dispatch_script: args.host_service_dispatch_script.clone(),
         antiddos_state_dir: args.antiddos_state_dir.clone(),
         antiddos_apply_script: args.antiddos_apply_script.clone(),
@@ -2463,7 +2803,40 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         deploy_upload_session_chunk_bytes: args.deploy_upload_session_chunk_bytes,
         deploy_upload_session_ttl_secs: args.deploy_upload_session_ttl_secs,
         deploy_upload_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+        nginx_action_lock: Arc::new(Mutex::new(())),
+        storage_root: args.pirate_storage_root.clone(),
+        storage_max_bytes: args.pirate_storage_max_bytes,
+        storage_max_upload_bytes: if args.pirate_storage_max_upload_bytes > 0 {
+            args.pirate_storage_max_upload_bytes
+        } else {
+            args.max_artifact_upload_bytes
+        },
+        storage_upload_session_chunk_bytes: args.storage_upload_session_chunk_bytes,
+        storage_upload_session_ttl_secs: args.storage_upload_session_ttl_secs,
+        storage_upload_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+        storage_bind_script: args.storage_bind_script.clone(),
+        storage_bind_state_path: args.storage_bind_state_path.clone(),
+        storage_bind_source_prefixes: args.pirate_storage_bind_source_prefixes.clone(),
+        host_databases_enabled,
+        host_db_max_query_rows,
+        host_db_max_preview_limit,
+        host_db_max_offset,
+        host_db_max_sql_bytes,
+        host_db_max_redis_pattern_bytes,
+        host_db_workspace_v2,
+        host_db_write_enabled,
+        host_db_sql_jobs_enabled,
+        host_db_sql_jobs: Arc::new(Mutex::new(HashMap::new())),
+        host_db_migrations_enabled,
+        host_db_admin_create_enabled,
+        host_db_migration_run_enabled,
     };
+
+    let default_body_limit = (args
+        .max_artifact_upload_bytes
+        .max(state.storage_max_upload_bytes) as usize)
+        .saturating_add(64 * 1024 * 1024)
+        .max(10 * 1024 * 1024);
 
     let app = Router::new()
         .route("/health", get(health))
@@ -2571,6 +2944,100 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             get(api_database_relationships),
         )
         .route(
+            "/api/v1/host-databases",
+            get(host_databases_api::api_host_databases_list),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/schemas",
+            get(host_databases_api::api_host_db_schemas),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/tables",
+            get(host_databases_api::api_host_db_tables),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/columns/:schema/:table",
+            get(host_databases_api::api_host_db_columns),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/rows",
+            get(host_databases_api::api_host_db_rows),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/relationships",
+            get(host_databases_api::api_host_db_relationships),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/query",
+            post(host_databases_api::api_host_db_query),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/redis/keys",
+            get(host_databases_api::api_host_db_redis_keys),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/mongo/databases",
+            get(host_databases_api::api_host_db_mongo_databases),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/mongo/collections",
+            get(host_databases_api::api_host_db_mongo_collections),
+        )
+        .route(
+            "/api/v1/host-databases/:instance_id/mongo/preview",
+            get(host_databases_api::api_host_db_mongo_preview),
+        )
+        .route(
+            "/api/v2/host-databases/capabilities",
+            get(host_databases_v2_api::api_host_db_v2_capabilities),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/object-tree",
+            get(host_databases_v2_api::api_host_db_v2_object_tree),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/grid",
+            post(host_databases_v2_api::api_host_db_v2_grid),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/row-mutate",
+            post(host_databases_v2_api::api_host_db_v2_row_mutate),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/sql-jobs",
+            post(host_databases_v2_api::api_host_db_v2_sql_job_start),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/sql-jobs/:job_id",
+            get(host_databases_v2_api::api_host_db_v2_sql_job_get)
+                .delete(host_databases_v2_api::api_host_db_v2_sql_job_cancel),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/migration-status",
+            get(host_databases_v2_api::api_host_db_v2_migration_status_get)
+                .post(host_databases_v2_api::api_host_db_v2_migration_status_post),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/admin/create-database",
+            post(host_databases_v2_api::api_host_db_v2_admin_create_database),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/admin/create-table",
+            post(host_databases_v2_api::api_host_db_v2_admin_create_table),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/admin/create-user",
+            post(host_databases_v2_api::api_host_db_v2_admin_create_user),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/admin/delete-user",
+            post(host_databases_v2_api::api_host_db_v2_admin_delete_user),
+        )
+        .route(
+            "/api/v2/host-databases/:instance_id/migration-run",
+            post(host_databases_v2_api::api_host_db_v2_migration_run),
+        )
+        .route(
             "/api/v1/data-sources",
             get(data_sources_api::api_data_sources_list),
         )
@@ -2590,6 +3057,72 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             "/api/v1/data-sources/:id/browse",
             get(data_sources_api::api_smb_browse),
         )
+        .route(
+            "/api/v1/storage/upload-sessions",
+            post(storage_api::api_storage_upload_session_create),
+        )
+        .route(
+            "/api/v1/storage/upload-sessions/:upload_id/chunk",
+            put(storage_api::api_storage_upload_session_chunk),
+        )
+        .route(
+            "/api/v1/storage/upload-sessions/:upload_id/complete",
+            post(storage_api::api_storage_upload_session_complete),
+        )
+        .route(
+            "/api/v1/storage/upload-sessions/:upload_id",
+            delete(storage_api::api_storage_upload_session_delete),
+        )
+        // POST+JSON: reverse proxies / CDNs that only pass GET+POST; prefer these from the desktop app.
+        .route(
+            "/api/v1/storage/delete-file",
+            post(storage_api::api_storage_delete_file_post),
+        )
+        .route(
+            "/api/v1/storage/delete-folder",
+            post(storage_api::api_storage_delete_folder_post),
+        )
+        .route(
+            "/api/v1/storage/rename",
+            post(storage_api::api_storage_rename_post),
+        )
+        .route(
+            "/api/v1/storage/tree",
+            get(storage_api::api_storage_tree),
+        )
+        .route(
+            "/api/v1/storage/usage",
+            get(storage_api::api_storage_usage),
+        )
+        .route(
+            "/api/v1/storage/folders",
+            post(storage_api::api_storage_folders_create)
+                .delete(storage_api::api_storage_folders_delete)
+                .patch(storage_api::api_storage_folders_patch),
+        )
+        .route(
+            "/api/v1/storage/files",
+            post(storage_api::api_storage_files_upload)
+                .delete(storage_api::api_storage_files_delete)
+                .patch(storage_api::api_storage_files_patch),
+        )
+        .route(
+            "/api/v1/storage/files/download",
+            get(storage_api::api_storage_files_download),
+        )
+        .route(
+            "/api/v1/storage/extract",
+            post(storage_api::api_storage_extract),
+        )
+        .route(
+            "/api/v1/storage/bind-sources",
+            get(storage_api::api_storage_bind_sources),
+        )
+        .route("/api/v1/storage/bind", post(storage_api::api_storage_bind))
+        .route(
+            "/api/v1/storage/unbind",
+            post(storage_api::api_storage_unbind),
+        )
         .route("/api/v1/rollback", post(api_rollback))
         .route("/api/v1/process/stop", post(api_process_stop))
         .route("/api/v1/process/restart", post(api_process_restart))
@@ -2608,7 +3141,11 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/nginx/config", get(get_nginx_config))
         .route("/api/v1/nginx/config", put(put_nginx_config))
         .route("/api/v1/nginx/status", get(api_nginx_status))
+        .route("/api/v1/nginx/sites", get(api_nginx_sites))
+        .route("/api/v1/nginx/preflight", post(api_nginx_preflight))
+        .route("/api/v1/nginx/action", post(api_nginx_action))
         .route("/api/v1/nginx/site", get(api_nginx_site_get).put(api_nginx_site_put))
+        .route("/api/v1/nginx/file", get(get_nginx_file).put(put_nginx_file))
         .route("/api/v1/nginx/ensure", post(api_nginx_ensure))
         .route("/api/v1/host-services", get(api_host_services))
         .route(
@@ -2618,6 +3155,14 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/v1/host-services/:id/remove",
             post(api_host_service_remove),
+        )
+        .route(
+            "/api/v1/host-services/:id/runtime-config",
+            get(api_host_service_runtime_get).put(api_host_service_runtime_put),
+        )
+        .route(
+            "/api/v1/host-services/:id/restart",
+            post(api_host_service_restart),
         )
         .route("/api/v1/antiddos", get(antiddos_api::api_antiddos_get).put(antiddos_api::api_antiddos_put))
         .route(
@@ -2638,11 +3183,7 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             put(antiddos_api::api_antiddos_project_put)
                 .delete(antiddos_api::api_antiddos_project_delete),
         )
-        .layer(DefaultBodyLimit::max(
-            (args.max_artifact_upload_bytes as usize)
-                .saturating_add(64 * 1024 * 1024)
-                .max(10 * 1024 * 1024),
-        ))
+        .layer(DefaultBodyLimit::max(default_body_limit))
         .layer(cors::build_cors_layer())
         .with_state(state);
 

@@ -63,6 +63,12 @@ service DeployService {
 
   // Client-reported monitor list for dashboard display-stream UI (signed like GetStatus).
   rpc ReportDisplayTopology(ReportDisplayTopologyRequest) returns (ReportDisplayTopologyResponse);
+
+  // ACME / Certbot: host TLS cert lifecycle (signed like GetStatus). Requires root/sudo for certbot on the host.
+  rpc SslCreate(SslCreateRequest) returns (SslCreateResponse);
+  rpc SslStatus(SslStatusRequest) returns (SslStatusResponse);
+  rpc SslUpdate(SslUpdateRequest) returns (SslUpdateResponse);
+  rpc SslCheckAndRenew(SslCheckAndRenewRequest) returns (SslCheckAndRenewResponse);
 }
 
 message PairRequest {
@@ -684,4 +690,136 @@ message SessionLogEvent {
 message QuerySessionLogsResponse {
   repeated SessionLogEvent events = 1;
   bool has_more = 2;
+}
+
+// --- SSL (Certbot) ---
+
+enum SslMode {
+  SSL_MODE_UNSPECIFIED = 0;
+  SSL_MODE_NGINX = 1;
+  SSL_MODE_STANDALONE = 2;
+  SSL_MODE_WEBROOT = 3;
+  // Wildcard / DNS-01: uses SSL_CERTBOT_DNS_PLUGIN / SSL_CERTBOT_EXTRA_ARGS
+  SSL_MODE_DNS = 4;
+}
+
+enum SslCertStatus {
+  SSL_CERT_STATUS_UNSPECIFIED = 0;
+  SSL_CERT_STATUS_VALID = 1;
+  SSL_CERT_STATUS_EXPIRING_SOON = 2;
+  SSL_CERT_STATUS_EXPIRED = 3;
+  SSL_CERT_STATUS_ERROR = 4;
+}
+
+message SslDomainSpec {
+  // Domains and/or wildcard labels (e.g. "*.example.com").
+  repeated string domains = 1;
+  // Override env; UNSPECIFIED = use process env SSL_MODE.
+  SslMode mode = 2;
+  bool dry_run = 3;
+  // Use Let's Encrypt staging (verbose in logs, not a secret).
+  bool staging = 4;
+  // For WEBROOT; required when mode is WEBROOT and not default from env.
+  string webroot_path = 5;
+  // For signing: empty = default.
+  string project_id = 6;
+}
+
+message SslCertRecord {
+  string primary_domain = 1;
+  repeated string domains = 2;
+  // Expiry: milliseconds since Unix epoch, 0 if unknown.
+  int64 expiry_unix_ms = 3;
+  SslCertStatus status = 4;
+  // e.g. /etc/letsencrypt/live/<name>/
+  string live_path = 5;
+  string last_error = 6;
+  int64 updated_at_ms = 7;
+  string cert_name = 8;
+}
+
+message SslCreateRequest {
+  SslDomainSpec spec = 1;
+}
+
+// Result of end-to-end checks after certbot + nginx reload (optional for backward compatibility).
+message SslPostCheckDetail {
+  string step = 1;
+  bool ok = 2;
+  string message = 3;
+}
+
+message SslPostCheckResult {
+  bool nginx_test_ok = 1;
+  bool reload_ok = 2;
+  bool tls_handshake_ok = 3;
+  bool hostname_match_ok = 4;
+  bool chain_ok = 5;
+  bool upstream_health_ok = 6;
+  bool rollback_performed = 7;
+  string summary = 8;
+  repeated SslPostCheckDetail details = 9;
+  int32 http_status = 10;
+  // e.g. upstream_5xx, connect_failed, tls_name_mismatch, skipped_wildcard
+  string classified_error = 11;
+  // SNI hostname used for the HTTPS probe (when set).
+  string probe_host = 12;
+  // curl exit code when probe failed (0 if N/A).
+  int32 curl_exit = 13;
+}
+
+message SslCreateResponse {
+  string status = 1;
+  SslCertRecord cert = 2;
+  repeated string log_lines = 3;
+  SslPostCheckResult post_check = 4;
+}
+
+message SslStatusRequest {
+  bool include_paths = 1;
+  string project_id = 2;
+}
+
+message SslStatusResponse {
+  repeated SslCertRecord certs = 1;
+  int32 threshold_days = 2;
+}
+
+message SslUpdateSelector {
+  // Exactly one of the following:
+  string exact_domain = 1;
+  // Glob style: e.g. "*.example.com" (not shell-expanded).
+  string glob_pattern = 2;
+  // Rust regex; invalid regex returns invalid_argument.
+  string regex = 3;
+}
+
+message SslUpdateRequest {
+  SslUpdateSelector selector = 1;
+  SslMode mode = 2;
+  bool dry_run = 3;
+  bool staging = 4;
+  string project_id = 5;
+}
+
+message SslUpdateResponse {
+  string status = 1;
+  repeated SslCertRecord updated = 2;
+  repeated string log_lines = 3;
+  SslPostCheckResult post_check = 4;
+}
+
+message SslCheckAndRenewRequest {
+  // true = re-check all known certs; false = use threshold/scheduler rules only.
+  bool force_all = 1;
+  string project_id = 2;
+}
+
+message SslCheckAndRenewResponse {
+  string status = 1;
+  int32 checked = 2;
+  int32 attempted_renew = 3;
+  int32 failed = 4;
+  repeated string log_lines = 5;
+  SslPostCheckResult post_check = 6;
 }

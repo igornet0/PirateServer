@@ -20,4 +20,3 @@ Typical directories:
 
 Order: PostgreSQL (if used) → deploy-server (applies DB migrations) → control-api → nginx.
 
-See docs/PHASE6.md for environment variables.
