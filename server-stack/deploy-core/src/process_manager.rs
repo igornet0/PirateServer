@@ -57,6 +57,13 @@ pub fn read_runtime_state(project_root: &Path) -> Option<RuntimeState> {
 
 /// Generate `run.sh` in release dir from manifest (POSIX sh).
 pub fn generate_run_sh(release_dir: &Path, manifest: &PirateManifest) -> std::io::Result<()> {
+    // Dotenv from packed `[project].env_path` (default `.env`), then `[env]` exports override.
+    let rel = manifest.project.effective_env_path_rel();
+    let dotenv_path_esc = shell_escape_single(&rel);
+    let dotenv_block = format!(
+        "if [ -f {p} ]; then\n  set -a\n  . {p}\n  set +a\nfi\n",
+        p = dotenv_path_esc
+    );
     let mut exports = String::new();
     for (k, v) in &manifest.env {
         let esc = shell_escape_single(v);
@@ -71,9 +78,9 @@ pub fn generate_run_sh(release_dir: &Path, manifest: &PirateManifest) -> std::io
         r#"#!/bin/sh
 set -e
 cd "$(dirname "$0")"
-{exports}
-exec sh -c {start_esc}
+{dotenv_block}{exports}exec sh -c {start_esc}
 "#,
+        dotenv_block = dotenv_block,
         exports = exports,
         start_esc = shell_escape_single(&start),
     );
@@ -155,12 +162,18 @@ pub fn write_nginx_snippet(release_dir: &Path, manifest: &PirateManifest) -> std
     Ok(())
 }
 
-/// Merge `.env` file into env map (later entries in file win if duplicate).
-pub fn load_dotenv(project_root: &Path) -> BTreeMap<String, String> {
-    let p = project_root.join(".env");
+/// Merge dotenv file at [`crate::pirate_project::resolve_project_env_join`] into env map.
+pub fn load_dotenv(project_root: &Path, manifest: &PirateManifest) -> BTreeMap<String, String> {
+    let Ok(p) = crate::pirate_project::resolve_project_env_join(project_root, manifest) else {
+        return BTreeMap::new();
+    };
     let Ok(raw) = std::fs::read_to_string(&p) else {
         return BTreeMap::new();
     };
+    parse_dotenv_lines(&raw)
+}
+
+fn parse_dotenv_lines(raw: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in raw.lines() {
         let line = line.trim();

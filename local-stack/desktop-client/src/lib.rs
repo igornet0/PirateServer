@@ -12,6 +12,7 @@ pub mod display_ingest;
 pub mod bookmarks;
 pub mod connection;
 pub mod control_api;
+mod control_api_keychain;
 mod db_tunnel;
 pub mod host_agent;
 pub mod deploy;
@@ -32,9 +33,11 @@ pub use bookmarks::{
     upsert_bookmark, ServerBookmark,
 };
 pub use connection::{
-    add_bookmark_from_input, clear_endpoint, connect_from_bundle, load_endpoint, load_project_id,
+    add_bookmark_from_input, clear_endpoint, connect_from_bundle, ensure_unified_client_config_migrated,
+    load_endpoint, load_project_id,
     control_api_recent_restart_hint,
-    load_control_api_base, load_control_api_direct_url, parse_grpc_endpoint_from_bundle,
+    load_control_api_base, load_control_api_direct_url, migrate_grpc_public_endpoint,
+    parse_grpc_endpoint_from_bundle,
     save_endpoint, set_active_project,
     mark_control_api_recent_restart, set_control_api_base, verify_grpc_endpoint,
     verify_grpc_status_for_project, verify_grpc_status_for_project_async, GrpcConnectResult,
@@ -49,7 +52,8 @@ pub use db_tunnel::{
     db_tunnel_tcp_stop,
 };
 pub use control_api::{
-    allocate_and_apply_remote_project_id, allocate_remote_project_id, control_api_ensure_nginx,
+    allocate_and_apply_remote_project_id, allocate_remote_project_id, control_api_apply_project_nginx,
+    control_api_ensure_nginx,
     control_api_antiddos_apply, control_api_antiddos_disable, control_api_antiddos_enable,
     control_api_antiddos_get_json, control_api_antiddos_project_delete,
     control_api_antiddos_project_put_json, control_api_antiddos_put_json,
@@ -90,9 +94,14 @@ pub use control_api::{
     fetch_server_projects_overview, write_pirate_toml_deploy_project_id, ServerProjectRow,
     ServerProjectsOverview,
 };
+pub use control_api_keychain::{
+    control_api_keychain_delete, control_api_keychain_load, control_api_keychain_save,
+    ControlApiKeychainCreds,
+};
 pub use deploy::{
     analyze_network_access, check_project_uploaded, read_release_version_from_manifest,
-    validate_network_access_remote, AnalyzeNetworkAccessOverrides, DeployOutcome, DeployProgressEvent,
+    save_project_network_manifest, validate_network_access_remote, AnalyzeNetworkAccessOverrides,
+    DeployOutcome, DeployProgressEvent, SaveProjectNetworkManifestInput,
     NetworkAccessAnalysis, NetworkAccessRouteOverride, ProjectDeployCheck, RemoveProjectOutcome,
     RollbackOutcome,
 };

@@ -2,6 +2,7 @@ use crate::types::{
     NginxConfigView, NginxEnsureView, NginxPutResponseView, NginxStatusView,
 };
 use crate::ControlError;
+use deploy_core::nginx_snippet;
 use deploy_core::pirate_project::PirateManifest;
 use std::fs;
 use std::io::Write;
@@ -54,17 +55,126 @@ pub fn generate_nginx_server_config(manifest: &PirateManifest) -> Result<String,
             path, target
         ));
     }
+    let listen_port = if manifest.proxy.port > 0 && manifest.proxy.port < 1024 {
+        manifest.proxy.port
+    } else {
+        80
+    };
     Ok(format!(
-        r#"server {{
-    listen {};
-    server_name {};
-{}
-}}
+        r#"# Pirate: project vhost (control-api apply)
+server {{
+    listen {listen_port};
+    listen [::]:{listen_port};
+    server_name {server_name};
+{blocks}}}
 "#,
-        manifest.proxy.port.max(1),
-        server_name,
-        blocks
+        listen_port = listen_port,
+        server_name = server_name,
+        blocks = blocks
     ))
+}
+
+/// Path for a per-project nginx site under `sites-available`.
+pub fn project_nginx_site_path(sites_available_dir: &Path, project_id: &str) -> PathBuf {
+    let id = deploy_core::normalize_project_id(project_id);
+    sites_available_dir.join(format!("pirate-project-{id}"))
+}
+
+/// Write project vhost, enable site symlink, validate and reload nginx.
+pub fn apply_project_nginx_vhost(
+    project_id: &str,
+    manifest_toml: &str,
+    sites_available_dir: &Path,
+    apply_site_script: &Path,
+    ops_script: &Path,
+) -> Result<crate::types::ProjectNginxApplyView, ControlError> {
+    use crate::nginx_universal::apply_nginx_universal_action;
+    use crate::types::{NginxActionBody, ProjectNginxApplyView};
+
+    let manifest = PirateManifest::parse(manifest_toml)
+        .map_err(|e| ControlError::NginxOp(format!("invalid manifest: {e}")))?;
+    let expected = deploy_core::normalize_project_id(project_id);
+    let actual = manifest.project.deploy_target_project_id();
+    if actual != expected {
+        return Err(ControlError::NginxOp(format!(
+            "manifest project id `{actual}` does not match path `{expected}`"
+        )));
+    }
+    if let Err(e) = manifest.validate_network_proxy() {
+        return Err(ControlError::NginxOp(e));
+    }
+
+    let mut warnings = nginx_route_conflicts(&manifest);
+    if !nginx_snippet::nginx_edge_intended(&manifest) {
+        warnings.push(
+            "proxy is not configured as nginx edge; vhost will still be written".to_string(),
+        );
+    }
+
+    let content = generate_nginx_server_config(&manifest)?;
+    let site_path = project_nginx_site_path(sites_available_dir, project_id);
+
+    let put = apply_nginx_site_via_sudo(&site_path, &content, apply_site_script)?;
+    if !put.ok {
+        return Ok(ProjectNginxApplyView {
+            ok: false,
+            path: site_path.display().to_string(),
+            enabled: false,
+            message: put.message,
+            test_output: put.test_output,
+            warnings,
+        });
+    }
+
+    let enable = apply_nginx_universal_action(
+        apply_site_script,
+        ops_script,
+        &NginxActionBody {
+            action: "enable_site".into(),
+            available_path: Some(site_path.display().to_string()),
+            path: None,
+            enabled_path: None,
+            server_name: None,
+            ssl_enabled: None,
+            ssl_cert_path: None,
+            ssl_key_path: None,
+            issue_certificate_if_missing: None,
+            post_check_host: None,
+            post_check_enabled: None,
+            post_check_path: None,
+            post_check_port: None,
+            post_check_loopback: None,
+            acme_email: None,
+            acme_staging: None,
+            acme_dry_run: None,
+        },
+    )?;
+
+    let enabled = enable.ok;
+    let message = if enabled {
+        format!(
+            "project nginx site applied at {}; {}",
+            site_path.display(),
+            enable.message
+        )
+    } else {
+        format!(
+            "site file written at {} but enable failed: {}",
+            site_path.display(),
+            enable.message
+        )
+    };
+
+    Ok(ProjectNginxApplyView {
+        ok: put.ok && enabled,
+        path: site_path.display().to_string(),
+        enabled,
+        message,
+        test_output: put
+            .test_output
+            .or(enable.detail),
+        warnings,
+    })
 }
 
 /// Read nginx config file for API response.
@@ -463,4 +573,58 @@ pub fn ensure_nginx_via_sudo(mode: &str, helper: &Path) -> Result<NginxEnsureVie
         output: Some(merged),
         env_update: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deploy_core::pirate_project::PirateManifest;
+
+    fn manifest_for_nginx_gen() -> PirateManifest {
+        PirateManifest::parse(
+            r#"
+[project]
+name = "x"
+version = "1"
+deploy_project_id = "p-testnginx01"
+
+[services.web]
+type = "http"
+port = 3000
+source = "t"
+confidence = 1.0
+
+[proxy]
+type = "nginx"
+port = 3000
+enabled = true
+
+[network]
+mode = "wan"
+
+[network.access]
+public = true
+domain = "app.example.com"
+"#,
+        )
+        .expect("parse")
+    }
+
+    #[test]
+    fn generate_nginx_server_config_listens_on_80_and_proxies_loopback() {
+        let cfg = generate_nginx_server_config(&manifest_for_nginx_gen()).expect("config");
+        assert!(cfg.contains("listen 80;"), "{cfg}");
+        assert!(cfg.contains("server_name app.example.com"), "{cfg}");
+        assert!(cfg.contains("proxy_pass http://127.0.0.1:3000"), "{cfg}");
+        assert!(cfg.contains("# Pirate: project vhost"), "{cfg}");
+    }
+
+    #[test]
+    fn project_nginx_site_path_uses_project_id() {
+        let p = project_nginx_site_path(Path::new("/etc/nginx/sites-available"), "p-abc123");
+        assert_eq!(
+            p,
+            PathBuf::from("/etc/nginx/sites-available/pirate-project-p-abc123")
+        );
+    }
 }

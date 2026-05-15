@@ -13,3 +13,4 @@ Local workstation side of PirateServer.
 
 - RU: [`docs/ru/local-client/README.md`](../docs/ru/local-client/README.md)
 - EN: [`docs/en/local-client/README.md`](../docs/en/local-client/README.md)
+- If `pirate --version` stays old after a desktop update, see [client README: Pirate CLI version and PATH](client/README.md#pirate-cli-version-and-path).

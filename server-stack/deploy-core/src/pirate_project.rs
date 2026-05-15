@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Top-level project manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +70,9 @@ pub struct ProjectSection {
     /// gRPC deploy project id for this tree; empty → `default` (same as deploy form).
     #[serde(default)]
     pub deploy_project_id: String,
+    /// Relative path to dotenv used for local dev and packed into deploy artifacts; empty → `.env`.
+    #[serde(default)]
+    pub env_path: String,
 }
 
 impl ProjectSection {
@@ -82,6 +85,32 @@ impl ProjectSection {
             crate::normalize_project_id(s)
         }
     }
+
+    /// Trimmed `[project].env_path`, or `.env` when unset/blank.
+    pub fn effective_env_path_rel(&self) -> String {
+        let t = self.env_path.trim();
+        if t.is_empty() {
+            ".env".to_string()
+        } else {
+            t.to_string()
+        }
+    }
+}
+
+/// Join `project_root` with `[project].env_path` (default `.env`). Fails on absolute paths or `..`.
+pub fn resolve_project_env_join(project_root: &Path, manifest: &PirateManifest) -> Result<PathBuf, String> {
+    let rel = manifest.project.effective_env_path_rel();
+    let p = Path::new(&rel);
+    if p.is_absolute() {
+        return Err("project.env_path must be a relative path".to_string());
+    }
+    for c in p.components() {
+        use std::path::Component;
+        if matches!(c, Component::ParentDir) {
+            return Err("project.env_path must not contain '..'".to_string());
+        }
+    }
+    Ok(project_root.join(&rel))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -365,6 +394,7 @@ impl PirateManifest {
                 name: name.to_string(),
                 version: "0.1.0".to_string(),
                 deploy_project_id: String::new(),
+                env_path: String::new(),
             },
             runtime: RuntimeSection {
                 r#type: runtime_type.to_string(),

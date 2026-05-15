@@ -420,10 +420,11 @@ where
     deploy_core::validate_project_id(project_id).map_err(|e| e.to_string())?;
     let manifest_path = dir.join("pirate.toml");
     let manifest_toml = std::fs::read_to_string(&manifest_path).ok();
-    let release_outputs = match PirateManifest::read_file(&manifest_path) {
-        Ok(m) => m.release_output_paths(),
-        Err(_) => Vec::new(),
-    };
+    let manifest_opt = PirateManifest::read_file(&manifest_path).ok();
+    let release_outputs = manifest_opt
+        .as_ref()
+        .map(|m| m.release_output_paths())
+        .unwrap_or_default();
     if release_outputs.is_empty() {
         eprintln!(
             "warning: [build].output_path(s) is not set; fallback to project root packaging with .pirateignore filtering"
@@ -441,8 +442,15 @@ where
     let dir_for_pack = dir.clone();
     let outputs = release_outputs.clone();
     let ignore = dir.join(".pirateignore");
+    let manifest_for_pack = manifest_opt.clone();
     tokio::task::spawn_blocking(move || {
-        crate::ops::pack_release_sources_to_path(&dir_for_pack, &outputs, Some(&ignore), &pack_dst)
+        crate::ops::pack_release_sources_to_path(
+            &dir_for_pack,
+            &outputs,
+            Some(&ignore),
+            &pack_dst,
+            manifest_for_pack.as_ref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -578,10 +586,11 @@ where
     deploy_core::validate_project_id(project_id).map_err(|e| e.to_string())?;
     let manifest_path = dir.join("pirate.toml");
     let manifest_toml = std::fs::read_to_string(&manifest_path).ok();
-    let release_outputs = match PirateManifest::read_file(&manifest_path) {
-        Ok(m) => m.release_output_paths(),
-        Err(_) => Vec::new(),
-    };
+    let manifest_opt = PirateManifest::read_file(&manifest_path).ok();
+    let release_outputs = manifest_opt
+        .as_ref()
+        .map(|m| m.release_output_paths())
+        .unwrap_or_default();
     if release_outputs.is_empty() {
         eprintln!(
             "warning: [build].output_path(s) is not set; fallback to project root packaging with .pirateignore filtering"
@@ -599,8 +608,15 @@ where
     let dir_for_pack = dir.clone();
     let outputs = release_outputs.clone();
     let ignore = dir.join(".pirateignore");
+    let manifest_for_pack = manifest_opt.clone();
     tokio::task::spawn_blocking(move || {
-        crate::ops::pack_release_sources_to_path(&dir_for_pack, &outputs, Some(&ignore), &pack_dst)
+        crate::ops::pack_release_sources_to_path(
+            &dir_for_pack,
+            &outputs,
+            Some(&ignore),
+            &pack_dst,
+            manifest_for_pack.as_ref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?

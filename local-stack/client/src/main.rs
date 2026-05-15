@@ -614,6 +614,10 @@ async fn run_pair(bundle_arg: Option<String>) -> Result<(), Box<dyn std::error::
         server_pubkey_b64: b.server_pubkey_b64,
         paired: true,
         connection_kind: 0,
+        project_id: load_connection()
+            .map(|c| c.project_id)
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| "default".to_string()),
     })?;
     eprintln!("paired with server; saved connection to config dir");
     println!("status={}", resp.status);

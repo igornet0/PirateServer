@@ -31,6 +31,10 @@ pub fn load_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error
     deploy_auth::load_or_create_identity(&path).map_err(|e| e.into())
 }
 
+fn default_project_id() -> String {
+    "default".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredConnection {
     pub url: String,
@@ -40,6 +44,9 @@ pub struct StoredConnection {
     /// `deploy.proto` `ConnectionKind` as i32 (0 unspecified, 1 proxy, 2 resource).
     #[serde(default)]
     pub connection_kind: i32,
+    /// Active deploy project id (shared with Pirate Client GUI).
+    #[serde(default = "default_project_id")]
+    pub project_id: String,
 }
 
 pub fn load_connection() -> Option<StoredConnection> {

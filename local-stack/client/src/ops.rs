@@ -143,11 +143,15 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), st
 }
 
 /// Write release tarball to `out_path` (`.tar.gz`). Same layout as [`pack_release_sources`].
+///
+/// When `manifest` is set, the file at `[project].env_path` (default `.env`) is included if it exists
+/// and lies under `project_root`, even when not covered by `output_paths`.
 pub fn pack_release_sources_to_path(
     project_root: &Path,
     output_paths: &[String],
     ignore_path: Option<&Path>,
     out_path: &Path,
+    manifest: Option<&deploy_core::pirate_project::PirateManifest>,
 ) -> Result<(), std::io::Error> {
     let project_root = project_root.canonicalize()?;
     let ignore = compile_ignore_globs(ignore_path)?;
@@ -160,6 +164,21 @@ pub fn pack_release_sources_to_path(
             files.push(resolved);
         } else if meta.is_dir() {
             collect_files_recursive(&resolved, &mut files)?;
+        }
+    }
+    if let Some(m) = manifest {
+        if let Ok(env_joined) = deploy_core::pirate_project::resolve_project_env_join(&project_root, m)
+        {
+            if env_joined.is_file() {
+                let env_can = env_joined.canonicalize()?;
+                if !files.iter().any(|p| {
+                    p.canonicalize()
+                        .map(|c| c == env_can)
+                        .unwrap_or(false)
+                }) {
+                    files.push(env_can);
+                }
+            }
         }
     }
     let mut uniq = BTreeSet::<String>::new();
@@ -206,7 +225,7 @@ pub fn pack_release_sources(
         std::process::id(),
         rand::random::<u64>()
     ));
-    pack_release_sources_to_path(project_root, output_paths, ignore_path, &tmp)?;
+    pack_release_sources_to_path(project_root, output_paths, ignore_path, &tmp, None)?;
     let out = fs::read(&tmp)?;
     let _ = fs::remove_file(&tmp);
     Ok(out)

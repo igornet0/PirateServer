@@ -21,6 +21,10 @@
 #   Requires Docker; image: PIRATE_LINUX_DESKTOP_BUILD_IMAGE (default rust:bookworm).
 #   Disable: PIRATE_LINUX_BUILD_NO_DOCKER=1 (then you need a Linux host).
 #
+# macos-dmg-fast: Repacks an existing DMG (README injection only). Does NOT run cargo build for
+#   deploy-client or Tauri, so bundled/cli/pirate and the .app stay exactly as in the prior macos-dmg
+#   output under target/. After any pirate CLI or app code change, use macos-dmg (full), not -fast.
+#
 set -euo pipefail
 
 MODE="${1:?usage: $0 linux-tgz|macos-tgz|macos-dmg|macos-dmg-fast|windows-zip|windows-msi}"
@@ -516,7 +520,8 @@ case "$MODE" in
       echo "==> tauri build (dmg) target=$TARGET version=$REL"
       run_tauri_build "$TARGET" --bundles dmg
     else
-      echo "==> fast DMG repack mode (no Rust/UI rebuild)"
+      echo "==> fast DMG repack mode (no Rust/UI rebuild)" >&2
+      echo "warning: macos-dmg-fast does not refresh bundled/cli/pirate — use full macos-dmg after deploy-client or UI changes." >&2
     fi
     DMG_DIR="$(bundle_macos_dmg_dir "$TARGET")"
     DMG_SRC="$(find "$DMG_DIR" -maxdepth 1 -name '*.dmg' -print | head -n 1 || true)"

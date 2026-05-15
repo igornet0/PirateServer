@@ -14,3 +14,7 @@ The local client stack powers operator workflows on a workstation: artifact pack
 1. Build project artifacts on the workstation.
 2. Pair with the target server and validate status.
 3. Upload artifact and trigger deploy through gRPC/control API.
+
+## Terminal `pirate` version
+
+After updating the desktop app, `pirate --version` in a shell may still show an older `client=` if an old binary remains on `PATH`. Diagnosis and fix: [client README (Pirate CLI version and PATH)](../../../local-stack/client/README.md#pirate-cli-version-and-path).

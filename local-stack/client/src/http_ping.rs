@@ -1,12 +1,141 @@
 //! HTTP ping to control-api `GET /api/v1/ping` (direct or via HTTP CONNECT proxy).
+//!
+//! `reqwest` applies `Proxy::http()` to `http://` destinations using a forward proxy request line,
+//! not HTTP CONNECT. [`pirate board`](crate::board) only accepts CONNECT, so for `http://` URLs
+//! with a proxy we open a TCP tunnel manually (CONNECT then cleartext HTTP on the tunnel).
 
 use reqwest::Proxy;
+use reqwest::Url;
 use serde::Serialize;
 use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const RTT_RUNS: usize = 3;
 const SPEED_RUNS: usize = 3;
 const PING_PATH: &str = "/api/v1/ping";
+
+type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+fn headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+}
+
+async fn read_until_double_crlf(
+    stream: &mut TcpStream,
+    max: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, BoxErr> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        if buf.len() > max {
+            return Err("HTTP headers too large".into());
+        }
+        let n = match tokio::time::timeout(timeout, stream.read(&mut tmp)).await {
+            Err(_) => return Err("read timed out".into()),
+            Ok(Err(e)) => return Err(e.into()),
+            Ok(Ok(0)) => return Err("connection closed before headers complete".into()),
+            Ok(Ok(n)) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(end) = headers_end(&buf) {
+            return Ok(buf[..end].to_vec());
+        }
+    }
+}
+
+/// `http://` GET through an HTTP proxy that only supports CONNECT (e.g. `pirate board`).
+async fn get_http_over_connect(
+    proxy_url: &str,
+    request_url: &str,
+    timeout: std::time::Duration,
+) -> Result<(reqwest::StatusCode, f64, u64), BoxErr> {
+    let t0 = Instant::now();
+    let proxy_u = Url::parse(proxy_url.trim())?;
+    let target = Url::parse(request_url)?;
+    if target.scheme() != "http" {
+        return Err("internal: get_http_over_connect expects http:// target".into());
+    }
+
+    let ph = proxy_u.host_str().ok_or("proxy URL has no host")?;
+    let pp = proxy_u
+        .port()
+        .or_else(|| match proxy_u.scheme() {
+            "http" => Some(80u16),
+            "https" => Some(443u16),
+            _ => None,
+        })
+        .unwrap_or(3128u16);
+
+    let authority = target.authority();
+    if authority.is_empty() {
+        return Err("request URL has no authority".into());
+    }
+
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect((ph, pp)))
+        .await
+        .map_err(|_| -> BoxErr { "connect to proxy timed out".into() })?
+        .map_err(|e| -> BoxErr { e.into() })?;
+
+    let connect_req = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    );
+    stream.write_all(connect_req.as_bytes()).await?;
+
+    let connect_head = read_until_double_crlf(&mut stream, 64 * 1024, timeout).await?;
+    let connect_text = std::str::from_utf8(&connect_head)?;
+    let line1 = connect_text.split("\r\n").next().unwrap_or("");
+    if !line1.starts_with("HTTP/1.") {
+        return Err(format!("bad CONNECT response: {line1}").into());
+    }
+    let code = line1.split_whitespace().nth(1).unwrap_or("");
+    if code != "200" {
+        return Err(format!("CONNECT failed ({code}): {line1}").into());
+    }
+
+    let path = target.path();
+    let path = if path.is_empty() { "/" } else { path };
+    let path_q = match target.query() {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
+    };
+    let get_req = format!(
+        "GET {path_q} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nUser-Agent: pirate-http-ping\r\n\r\n"
+    );
+    stream.write_all(get_req.as_bytes()).await?;
+
+    let mut body_buf = Vec::new();
+    let mut read_buf = [0u8; 8192];
+    loop {
+        let n = match tokio::time::timeout(timeout, stream.read(&mut read_buf)).await {
+            Err(_) => return Err("read response timed out".into()),
+            Ok(Err(e)) => return Err(e.into()),
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+        };
+        body_buf.extend_from_slice(&read_buf[..n]);
+        if body_buf.len() > 512 * 1024 {
+            break;
+        }
+    }
+
+    let resp_head_end = headers_end(&body_buf).ok_or("invalid HTTP response (no header block)")?;
+    let resp_head = std::str::from_utf8(&body_buf[..resp_head_end])?;
+    let resp_line1 = resp_head.split("\r\n").next().unwrap_or("");
+    let status_code: u16 = resp_line1
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let status = reqwest::StatusCode::from_u16(status_code)
+        .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+    let body_len = (body_buf.len().saturating_sub(resp_head_end)) as u64;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Ok((status, elapsed_ms, body_len))
+}
 
 /// Trim and strip trailing `/` from control-api base (scheme + host[:port], optional path segment).
 pub fn normalize_http_base(s: &str) -> String {
@@ -31,7 +160,10 @@ fn build_client(
     if let Some(p) = proxy_url {
         let p = p.trim();
         if !p.is_empty() {
-            b = b.proxy(Proxy::http(p)?);
+            // `http` alone does not attach to https:// URLs; `board` uses CONNECT for both.
+            b = b
+                .proxy(Proxy::http(p)?)
+                .proxy(Proxy::https(p)?);
         }
     }
     Ok(b.build()?)
@@ -106,23 +238,28 @@ pub async fn run_http_ping(opts: HttpPingOptions) -> HttpPingJson {
     let timeout = std::time::Duration::from_secs(opts.timeout_secs.max(1));
     let proxy_ref = opts.proxy_url.as_deref();
     let via_proxy = proxy_ref.is_some_and(|s| !s.trim().is_empty());
+    let use_connect_manual = via_proxy && base.starts_with("http://");
 
-    let client = match build_client(
-        proxy_ref.filter(|s| !s.trim().is_empty()),
-        timeout,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            return HttpPingJson {
-                ok: false,
-                error: Some(e.to_string()),
-                ping_url: None,
-                via_proxy,
-                rtt_min_ms: None,
-                rtt_avg_ms: None,
-                download_bytes: None,
-                download_mbps: None,
-            };
+    let client_opt = if use_connect_manual {
+        None
+    } else {
+        match build_client(
+            proxy_ref.filter(|s| !s.trim().is_empty()),
+            timeout,
+        ) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                return HttpPingJson {
+                    ok: false,
+                    error: Some(e.to_string()),
+                    ping_url: None,
+                    via_proxy,
+                    rtt_min_ms: None,
+                    rtt_avg_ms: None,
+                    download_bytes: None,
+                    download_mbps: None,
+                };
+            }
         }
     };
 
@@ -133,16 +270,24 @@ pub async fn run_http_ping(opts: HttpPingOptions) -> HttpPingJson {
     let mut err_msg: Option<String> = None;
 
     for _ in 0..RTT_RUNS {
-        match fetch_json_ping(&client, &json_url).await {
-            Ok((st, ms)) if st.is_success() => rtt_samples.push(ms),
-            Ok((st, _)) => {
-                ok = false;
-                err_msg = Some(format!("HTTP {} on {}", st, json_url));
-                break;
+        let one = if use_connect_manual {
+            match get_http_over_connect(proxy_ref.unwrap(), &json_url, timeout).await {
+                Ok((st, ms, _)) if st.is_success() => Ok(ms),
+                Ok((st, _, _)) => Err(format!("HTTP {} on {}", st, json_url)),
+                Err(e) => Err(e.to_string()),
             }
+        } else {
+            match fetch_json_ping(client_opt.as_ref().unwrap(), &json_url).await {
+                Ok((st, ms)) if st.is_success() => Ok(ms),
+                Ok((st, _)) => Err(format!("HTTP {} on {}", st, json_url)),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        match one {
+            Ok(ms) => rtt_samples.push(ms),
             Err(e) => {
                 ok = false;
-                err_msg = Some(e.to_string());
+                err_msg = Some(e);
                 break;
             }
         }
@@ -164,18 +309,34 @@ pub async fn run_http_ping(opts: HttpPingOptions) -> HttpPingJson {
         let mut best_mbps = 0_f64;
         let mut last_err: Option<String> = None;
         for _ in 0..SPEED_RUNS {
-            match fetch_bytes_ping(&client, &url).await {
-                Ok((st, n, elapsed_s)) if st.is_success() && elapsed_s > 0.0 => {
+            let run = if use_connect_manual {
+                match get_http_over_connect(proxy_ref.unwrap(), &url, timeout).await {
+                    Ok((st, elapsed_ms, n)) if st.is_success() => {
+                        let elapsed_s = (elapsed_ms / 1000.0).max(1e-9);
+                        Ok((st, n, elapsed_s))
+                    }
+                    Ok((st, _, n)) => Err(format!("HTTP {} ({} bytes)", st, n)),
+                    Err(e) => Err(e.to_string()),
+                }
+            } else {
+                match fetch_bytes_ping(client_opt.as_ref().unwrap(), &url).await {
+                    Ok((st, n, elapsed_s)) if st.is_success() => Ok((st, n, elapsed_s)),
+                    Ok((st, n, _)) => Err(format!("HTTP {} ({} bytes)", st, n)),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            match run {
+                Ok((_st, n, elapsed_s)) if elapsed_s > 0.0 => {
                     download_actual = Some(n);
                     let mbps = (n as f64 * 8.0) / 1_000_000.0 / elapsed_s;
                     if mbps > best_mbps {
                         best_mbps = mbps;
                     }
                 }
-                Ok((st, n, _)) => {
-                    last_err = Some(format!("HTTP {} ({} bytes)", st, n));
+                Ok(_) => {
+                    last_err = Some("HTTP success but zero elapsed".into());
                 }
-                Err(e) => last_err = Some(e.to_string()),
+                Err(e) => last_err = Some(e),
             }
         }
         if best_mbps > 0.0 {
@@ -242,6 +403,13 @@ mod tests {
             "https://ex.com/foo"
         );
         assert_eq!(normalize_http_base("  http://h:8080  "), "http://h:8080");
+    }
+
+    #[test]
+    fn headers_end_finds_double_crlf() {
+        let b = b"HTTP/1.1 200 OK\r\n\r\n";
+        assert_eq!(headers_end(b), Some(b.len()));
+        assert!(headers_end(b"HTTP/1.1 200 OK\r\n").is_none());
     }
 
     #[test]

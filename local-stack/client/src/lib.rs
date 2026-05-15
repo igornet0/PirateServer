@@ -60,8 +60,9 @@ pub use upload::{
 };
 pub use project_control::{init_project, scan_project, ScanReport};
 pub use network_access::{
-    apply_detected_services_to_manifest, detect_services, generate_proxy_config, validate_deploy,
-    DeployValidationReport, DetectedService, ServiceDetectionReport,
+    apply_detected_services_to_manifest, detect_services, generate_proxy_config,
+    resolve_proxy_route_upstream, validate_deploy, DeployValidationReport, DetectedService,
+    ServiceDetectionReport,
 };
 pub use local_pipeline::{
     apply_generated_files, ensure_dockerfile, run_build, run_test, test_local_docker, StepResult,

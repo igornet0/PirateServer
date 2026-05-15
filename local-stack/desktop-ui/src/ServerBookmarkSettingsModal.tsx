@@ -7,6 +7,7 @@ import { AlertCircle, Loader2, Settings, X } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { suggestControlApiFromGrpcUrl } from "./controlApiUrl";
 import { HostServerEnvPanel } from "./serverDeployEnv/HostServerEnvPanel";
+import { parseDotEnv } from "./serverDeployEnv/parseSerialize";
 import { AntiDdosPanel } from "./AntiDdosPanel";
 import { HostServicesPanel } from "./HostServicesPanel";
 import { useI18n } from "./i18n";
@@ -17,6 +18,8 @@ import { SslManagementPanel } from "./SslManagementPanel";
 
 const btnBase =
   "inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050204] active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50";
+
+type ControlApiKeychainCreds = { username: string; password: string };
 
 type NginxSiteRow = {
   site_id: string;
@@ -188,6 +191,8 @@ export function ServerBookmarkSettingsModal({
   const [controlBase, setControlBase] = useState("");
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
+  const [rememberInKeychain, setRememberInKeychain] = useState(false);
+  const [keychainBanner, setKeychainBanner] = useState<string | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
   const [sessionOk, setSessionOk] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -207,6 +212,8 @@ export function ServerBookmarkSettingsModal({
   const [hostEnvBusy, setHostEnvBusy] = useState(false);
   const [hostEnvDirty, setHostEnvDirty] = useState(false);
   const [hostRestartHint, setHostRestartHint] = useState<string | null>(null);
+  const hostEnvGrpcPublicSnapshotRef = useRef<string>("");
+  const [grpcPublicUrlSaveClientHint, setGrpcPublicUrlSaveClientHint] = useState<string | null>(null);
 
   const [envText, setEnvText] = useState("");
   const [envPath, setEnvPath] = useState<string | null>(null);
@@ -297,6 +304,7 @@ export function ServerBookmarkSettingsModal({
     setEnvDirty(false);
     setHostEnvDirty(false);
     setHostRestartHint(null);
+    setGrpcPublicUrlSaveClientHint(null);
     setEnvSection("host");
     setNginxStatus(null);
     setNginxSiteText("");
@@ -314,6 +322,7 @@ export function ServerBookmarkSettingsModal({
     setHaToken(bookmark.host_agent_token ?? "");
     setHaOut(null);
     setHaStackVersion("");
+    setKeychainBanner(null);
     void (async () => {
       try {
         if (sameServerAsActive) {
@@ -497,9 +506,52 @@ export function ServerBookmarkSettingsModal({
     }
   }, [controlBase, projectId]);
 
+  const tryFillFromKeychain = useCallback(async (base: string) => {
+    if (!base.trim()) return;
+    try {
+      const c = await invoke<ControlApiKeychainCreds | null>("control_api_keychain_load", {
+        baseUrl: base.trim(),
+      });
+      if (c?.username != null && c.username !== "") {
+        setUser(c.username);
+        setPass(c.password ?? "");
+      }
+    } catch {
+      /* Tauri unavailable or keychain — ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open || sessionOk) return;
+    const b = controlBase.trim();
+    if (!b) return;
+    void tryFillFromKeychain(b);
+  }, [open, sessionOk, controlBase, tryFillFromKeychain]);
+
+  const onForgetControlApiKeychain = useCallback(async () => {
+    const base = controlBase.trim();
+    if (!base) return;
+    setErr(null);
+    setKeychainBanner(null);
+    try {
+      await invoke("control_api_keychain_delete", { baseUrl: base });
+      setUser("");
+      setPass("");
+      setKeychainBanner(
+        tr(
+          "Учётные данные удалены из связки ключей (Keychain / системное хранилище).",
+          "Credentials removed from the password store (Keychain / OS vault).",
+        ),
+      );
+    } catch (e) {
+      setErr(String(e));
+    }
+  }, [controlBase, tr]);
+
   const onLogin = async () => {
     setLoginBusy(true);
     setErr(null);
+    setKeychainBanner(null);
     try {
       await invoke("set_control_api_base", { url: controlBase.trim() });
       const waitUntilReady = async () => {
@@ -533,8 +585,26 @@ export function ServerBookmarkSettingsModal({
         }
       }
       if (lastErr) throw lastErr;
+      const baseTrim = controlBase.trim();
+      let keychainWarn: string | null = null;
+      if (rememberInKeychain && baseTrim) {
+        try {
+          await invoke("control_api_keychain_save", {
+            baseUrl: baseTrim,
+            username: user.trim(),
+            password: pass,
+          });
+        } catch (kcErr) {
+          keychainWarn = tr(
+            `Вход выполнен, но не удалось сохранить в связке ключей: ${String(kcErr)}`,
+            `Signed in, but saving to the password store failed: ${String(kcErr)}`,
+          );
+        }
+      }
       setPass("");
+      setUser("");
       setSessionOk(true);
+      setKeychainBanner(keychainWarn);
       await loadProjectsHint();
     } catch (e) {
       setSessionOk(false);
@@ -601,6 +671,9 @@ export function ServerBookmarkSettingsModal({
       setHostEnvExists(Boolean(parsed.exists));
       setHostEnvText(typeof parsed.content === "string" ? parsed.content : "");
       setHostEnvDirty(false);
+      const hostContent = typeof parsed.content === "string" ? parsed.content : "";
+      hostEnvGrpcPublicSnapshotRef.current =
+        parseDotEnv(hostContent).get("DEPLOY_GRPC_PUBLIC_URL")?.trim() ?? "";
     } catch (e) {
       setHostEnvPath(null);
       setHostEnvText("");
@@ -655,6 +728,17 @@ export function ServerBookmarkSettingsModal({
       if (scheduled) {
         setRestartPendingUntil(Date.now() + 90_000);
         await invoke("mark_control_api_recent_restart", { seconds: 90 });
+      }
+      const mapNow = parseDotEnv(hostEnvText);
+      const nowGrpc = mapNow.get("DEPLOY_GRPC_PUBLIC_URL")?.trim() ?? "";
+      const wasGrpc = hostEnvGrpcPublicSnapshotRef.current;
+      if (nowGrpc && nowGrpc !== wasGrpc) {
+        setGrpcPublicUrlSaveClientHint(
+          tr(
+            "На этом ПК обновите сохранённый gRPC endpoint: вкладка «Обзор» или «Соединение» → «Перейти на объявленный URL» (после перезапуска сервера, если адрес изменился).",
+            "On this PC, update the saved gRPC endpoint: Overview or Connection → «Switch to advertised URL» (after the server restarts if the address changed).",
+          ),
+        );
       }
       setHostEnvDirty(false);
       await loadHostEnv();
@@ -1212,6 +1296,13 @@ export function ServerBookmarkSettingsModal({
                   <input
                     value={user}
                     onChange={(e) => setUser(e.target.value)}
+                    onFocus={() => {
+                      const b = controlBase.trim();
+                      if (!b) return;
+                      if (!user.trim() && !pass.trim()) {
+                        void tryFillFromKeychain(b);
+                      }
+                    }}
                     autoComplete="username"
                     className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600/50 focus:outline-none"
                   />
@@ -1254,6 +1345,32 @@ export function ServerBookmarkSettingsModal({
                   {sessionOk ? t("auto.ServerBookmarkSettingsModal_tsx.19") : t("auto.ServerBookmarkSettingsModal_tsx.20")}
                 </span>
               </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-3">
+                <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-slate-400">
+                  <input
+                    type="checkbox"
+                    checked={rememberInKeychain}
+                    onChange={(e) => setRememberInKeychain(e.target.checked)}
+                    className="rounded border-white/20 bg-black/40 text-red-600 focus:ring-red-600/60"
+                  />
+                  <span
+                    title={tr(
+                      "После успешного входа сохранить логин и пароль в связке ключей macOS (или в системном хранилище на других ОС).",
+                      "After a successful sign-in, save username and password in macOS Keychain (or the OS credential store elsewhere).",
+                    )}
+                  >
+                    {tr("Сохранить в связке ключей", "Save in password store")}
+                  </span>
+                </label>
+                <button
+                  type="button"
+                  className="text-xs text-slate-500 underline decoration-slate-600 underline-offset-2 hover:text-slate-300"
+                  onClick={() => void onForgetControlApiKeychain()}
+                >
+                  {tr("Удалить из связки ключей", "Remove from password store")}
+                </button>
+              </div>
+              {keychainBanner ? <p className="text-xs text-slate-400">{keychainBanner}</p> : null}
 
               <div className="rounded-xl border border-amber-900/35 bg-amber-950/20 p-4">
                 <p className="text-sm font-semibold text-amber-100/95">
@@ -1455,6 +1572,11 @@ export function ServerBookmarkSettingsModal({
                   {hostRestartHint ? (
                     <p className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-100/95">
                       {hostRestartHint}
+                    </p>
+                  ) : null}
+                  {grpcPublicUrlSaveClientHint ? (
+                    <p className="rounded-lg border border-sky-700/40 bg-sky-950/30 px-3 py-2 text-xs text-sky-100/95">
+                      {grpcPublicUrlSaveClientHint}
                     </p>
                   ) : null}
                   <HostServerEnvPanel

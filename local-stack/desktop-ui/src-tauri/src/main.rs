@@ -40,9 +40,7 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     guard
 }
 
-/// True if `pirate` (CLI from `deploy-client`) resolves in PATH (terminal).
-#[tauri::command]
-fn is_pirate_cli_available() -> bool {
+fn pirate_resolves_in_path() -> bool {
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("cmd")
@@ -62,12 +60,24 @@ fn is_pirate_cli_available() -> bool {
     }
 }
 
+/// True if `pirate` resolves in a typical shell `PATH`, or the managed user-bin copy exists
+/// (after silent sync a new terminal will usually pick it up; `sh -c` may not read `.zshrc`).
+#[tauri::command]
+fn is_pirate_cli_available() -> bool {
+    if pirate_resolves_in_path() {
+        return true;
+    }
+    match pirate_user_cli_bin() {
+        Ok(p) => p.is_file(),
+        Err(_) => false,
+    }
+}
+
 /// `pirate --version` prints a `client=` line; used to detect stale PATH installs after app updates.
 fn parse_pirate_client_version(stdout: &str) -> Option<String> {
     stdout.lines().find_map(|line| {
         let t = line.trim();
-        t.strip_prefix("client=")
-            .map(|s| s.trim().to_string())
+        t.strip_prefix("client=").map(|s| s.trim().to_string())
     })
 }
 
@@ -97,7 +107,11 @@ fn path_to_pirate_in_path() -> Option<PathBuf> {
             return None;
         }
         let p = PathBuf::from(line);
-        if p.is_file() { Some(p) } else { None }
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -114,8 +128,228 @@ fn path_to_pirate_in_path() -> Option<PathBuf> {
             return None;
         }
         let p = PathBuf::from(s);
-        if p.is_file() { Some(p) } else { None }
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
     }
+}
+
+/// Windows: `%LOCALAPPDATA%\\PirateClient\\bin`. macOS/Linux: `PirateClient/bin` under [`dirs::data_dir`].
+fn pirate_user_cli_dir() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let root = dirs::data_local_dir();
+    #[cfg(not(windows))]
+    let root = dirs::data_dir();
+    let root =
+        root.ok_or_else(|| "не удалось определить каталог данных пользователя".to_string())?;
+    Ok(root.join("PirateClient").join("bin"))
+}
+
+fn pirate_user_cli_bin() -> Result<PathBuf, String> {
+    let dir = pirate_user_cli_dir()?;
+    #[cfg(windows)]
+    {
+        Ok(dir.join("pirate.exe"))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(dir.join("pirate"))
+    }
+}
+
+#[cfg(unix)]
+fn chmod755_path(p: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(p)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(p, perm).map_err(|e| e.to_string())
+}
+
+const PIRATE_PATH_BLOCK_BEGIN: &str = "# PirateClient PATH begin";
+const PIRATE_PATH_BLOCK_END: &str = "# PirateClient PATH end";
+
+fn unix_path_export_line(dir: &Path) -> Result<String, String> {
+    let d = dir
+        .to_str()
+        .ok_or_else(|| "некорректный путь к bin".to_string())?;
+    // Prepend so this `pirate` wins over older copies (e.g. /usr/local/bin) after a new app install.
+    // `hash -r`: zsh/bash may have cached `pirate` → /usr/local/bin before PATH changed (same session / re-source).
+    Ok(format!(
+        "{}\nexport PATH={}:$PATH\nhash -r 2>/dev/null || true\n{}\n",
+        PIRATE_PATH_BLOCK_BEGIN,
+        sh_single_quote_unix(d),
+        PIRATE_PATH_BLOCK_END
+    ))
+}
+
+/// Remove a prior PirateClient PATH block so we can rewrite it (prepend order, path changes, migrations).
+#[cfg(unix)]
+fn remove_pirate_client_path_block(content: &str) -> String {
+    let Some(start) = content.find(PIRATE_PATH_BLOCK_BEGIN) else {
+        return content.to_string();
+    };
+    let tail = &content[start..];
+    let Some(rel) = tail.find(PIRATE_PATH_BLOCK_END) else {
+        return content[..start].trim_end().to_string();
+    };
+    let end = start + rel + PIRATE_PATH_BLOCK_END.len();
+    let after = content[end..].trim_start_matches('\n');
+    let before = content[..start].trim_end();
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_string(),
+        (false, true) => before.to_string(),
+        (false, false) => format!("{before}\n{after}"),
+    }
+}
+
+#[cfg(unix)]
+fn sh_single_quote_unix(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(not(unix))]
+fn sh_single_quote_unix(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Ensure a guarded `export PATH=dir:$PATH` block exists in common shell rc files (prepend; rewrite if stale).
+#[cfg(unix)]
+fn ensure_unix_user_bin_on_path(dir: &Path) -> Result<(), String> {
+    let block = unix_path_export_line(dir)?;
+    let home = dirs::home_dir().ok_or_else(|| "нет домашнего каталога".to_string())?;
+    for rel in [
+        ".zprofile", // login zsh: before /etc/zshrc + ~/.zshrc (path_helper already ran from /etc/zprofile)
+        ".zshrc",
+        ".zlogin", // login zsh: runs *after* ~/.zshrc — wins if OMZ / other rc reset PATH
+        ".profile",
+        ".bash_profile",
+        ".bashrc", // non-login interactive bash (many terminals)
+    ] {
+        let p = home.join(rel);
+        let existing = if p.is_file() {
+            std::fs::read_to_string(&p).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let base = remove_pirate_client_path_block(&existing);
+        let mut out = base.trim_end().to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&block);
+        if existing == out {
+            continue;
+        }
+        std::fs::write(&p, out).map_err(|e| format!("{p:?}: {e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_unix_user_bin_on_path(_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_windows_user_bin_on_path() -> Result<(), String> {
+    let dir = pirate_user_cli_dir()?;
+    let dir_json = serde_json::to_string(&dir.to_string_lossy()).map_err(|e| e.to_string())?;
+    let ps = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$destDir = {dir_json}
+if (-not (Test-Path -LiteralPath $destDir)) {{ New-Item -ItemType Directory -Force -Path $destDir | Out-Null }}
+$u = [Environment]::GetEnvironmentVariable('Path','User')
+if ($null -eq $u) {{ $u = '' }}
+$sep = ';'
+$parts = foreach ($e in $u.Split($sep, [System.StringSplitOptions]::RemoveEmptyEntries)) {{
+  if ($e -and ($e -ne $destDir)) {{ $e }}
+}}
+$newPath = if ($parts.Count -gt 0) {{ $destDir + $sep + ($parts -join $sep) }} else {{ $destDir }}
+[Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+Write-Output 'OK'
+"#,
+    );
+    let tmp = std::env::temp_dir().join(format!("pirate-path-env-{}.ps1", std::process::id()));
+    std::fs::write(&tmp, ps.as_bytes()).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            tmp.to_str().ok_or_else(|| "temp path".to_string())?,
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        let err = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+        return Err(if err.is_empty() {
+            "PowerShell (PATH) завершился с ошибкой.".into()
+        } else {
+            err
+        });
+    }
+    Ok(())
+}
+
+fn ensure_user_cli_on_path() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        ensure_windows_user_bin_on_path()
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = pirate_user_cli_dir()?;
+        ensure_unix_user_bin_on_path(&dir)
+    }
+}
+
+/// Copy bundled `pirate` into the managed user `bin` if missing or older than bundled.
+fn sync_user_cli_from_bundle(app: &tauri::AppHandle, force_copy: bool) -> Result<(), String> {
+    let bundled = resolve_pirate_cli_source(app)?;
+    verify_cli_blob(&bundled)?;
+    let dir = pirate_user_cli_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = pirate_user_cli_bin()?;
+    let bv = pirate_version_from_bin(&bundled);
+    let uv = dest
+        .is_file()
+        .then(|| pirate_version_from_bin(&dest))
+        .flatten();
+    let need = force_copy
+        || !dest.is_file()
+        || match (&uv, &bv) {
+            (Some(a), Some(b)) => a != b,
+            (None, _) if dest.is_file() => true,
+            _ => bv.is_some() && uv != bv,
+        };
+    if need {
+        std::fs::copy(&bundled, &dest).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        chmod755_path(&dest)?;
+    }
+    Ok(())
+}
+
+fn silent_sync_user_cli(app: &tauri::AppHandle) -> Result<(), String> {
+    let copy_res = sync_user_cli_from_bundle(app, false);
+    if let Err(e) = ensure_user_cli_on_path() {
+        tracing::warn!(error = %e, "ensure_user_cli_on_path");
+    }
+    copy_res
 }
 
 fn same_executable(a: &Path, b: &Path) -> bool {
@@ -125,13 +359,41 @@ fn same_executable(a: &Path, b: &Path) -> bool {
     }
 }
 
+fn pirate_cli_default_install_auth_kind() -> &'static str {
+    "user_local"
+}
+
+fn pirate_cli_system_wide_install_auth_kind() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        return Some("macos_admin");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Some("linux_pkexec");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PirateCliPathInfo {
     path_in_path: Option<String>,
     path_version: Option<String>,
     bundled_version: Option<String>,
+    user_bin_path: Option<String>,
+    user_bin_version: Option<String>,
+    /// Managed user copy is missing or older than bundled.
     needs_update: bool,
+    /// `command -v pirate` resolves to a different file than the managed user bin.
+    first_on_path_differs_from_user_bin: bool,
+    /// Default install (`install_pirate_cli` without elevation): always `user_local`.
+    install_auth_kind: String,
+    /// OS-specific auth for optional system-wide install (`systemWide: true`).
+    system_wide_install_auth_kind: Option<String>,
 }
 
 #[tauri::command]
@@ -139,39 +401,43 @@ fn pirate_cli_path_info(app: tauri::AppHandle) -> Result<PirateCliPathInfo, Stri
     let bundled = resolve_pirate_cli_source(&app)?;
     verify_cli_blob(&bundled)?;
     let bundled_version = pirate_version_from_bin(&bundled);
-    let path_bin = path_to_pirate_in_path();
-    let path_in_path = path_bin
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string());
-    let path_version = path_bin
-        .as_ref()
-        .and_then(|p| pirate_version_from_bin(p));
 
-    let needs_update = match &path_bin {
-        None => false,
-        Some(pb) => {
-            if same_executable(pb, &bundled) {
-                false
-            } else {
-                match (&path_version, &bundled_version) {
-                    // Normal path: compare semantic versions from `pirate --version`.
-                    (Some(pv), Some(bv)) => pv != bv,
-                    // If PATH binary can't report version, still force refresh.
-                    (None, _) => true,
-                    // If bundled binary version can't be read (e.g. platform execution restrictions),
-                    // still force refresh because PATH points to a different executable.
-                    (Some(_), None) => true,
-                }
-            }
-        }
+    let user_bin = pirate_user_cli_bin()?;
+    let user_bin_path = user_bin.is_file().then(|| user_bin.display().to_string());
+    let user_bin_version = user_bin
+        .is_file()
+        .then(|| pirate_version_from_bin(&user_bin))
+        .flatten();
+
+    let needs_update = !user_bin.is_file()
+        || match (&user_bin_version, &bundled_version) {
+            (Some(uv), Some(bv)) => uv != bv,
+            (None, _) if user_bin.is_file() => true,
+            _ => bundled_version.is_some() && user_bin_version != bundled_version,
+        };
+
+    let path_bin = path_to_pirate_in_path();
+    let path_in_path = path_bin.as_ref().map(|p| p.to_string_lossy().to_string());
+    let path_version = path_bin.as_ref().and_then(|p| pirate_version_from_bin(p));
+
+    let first_on_path_differs_from_user_bin = match (path_bin.as_ref(), user_bin.is_file()) {
+        (Some(pb), true) => !same_executable(pb, &user_bin),
+        _ => false,
     };
+
+    let install_auth_kind = pirate_cli_default_install_auth_kind().to_string();
+    let system_wide_install_auth_kind =
+        pirate_cli_system_wide_install_auth_kind().map(String::from);
 
     tracing::info!(
         path_in_path = ?path_in_path,
         path_version = ?path_version,
+        user_bin_path = ?user_bin_path,
+        user_bin_version = ?user_bin_version,
         bundled = %bundled.display(),
         bundled_version = ?bundled_version,
         needs_update,
+        first_on_path_differs_from_user_bin,
         "pirate_cli_path_info"
     );
 
@@ -179,10 +445,16 @@ fn pirate_cli_path_info(app: tauri::AppHandle) -> Result<PirateCliPathInfo, Stri
         path_in_path,
         path_version,
         bundled_version,
+        user_bin_path,
+        user_bin_version,
         needs_update,
+        first_on_path_differs_from_user_bin,
+        install_auth_kind,
+        system_wide_install_auth_kind,
     })
 }
 
+#[cfg(target_os = "macos")]
 fn sh_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -201,7 +473,10 @@ fn verify_cli_blob(p: &Path) -> Result<(), String> {
 }
 
 fn resolve_pirate_cli_source(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    if let Ok(p) = app.path().resolve("bundled/cli/pirate", BaseDirectory::Resource) {
+    if let Ok(p) = app
+        .path()
+        .resolve("bundled/cli/pirate", BaseDirectory::Resource)
+    {
         if p.is_file() {
             return Ok(p);
         }
@@ -227,8 +502,10 @@ fn resolve_pirate_cli_source(app: &tauri::AppHandle) -> Result<PathBuf, String> 
 }
 
 #[cfg(target_os = "linux")]
-fn install_pirate_to_path_linux(src: &Path) -> Result<String, String> {
-    let src_s = src.to_str().ok_or_else(|| "некорректный путь".to_string())?;
+fn install_pirate_to_path_linux_system_wide(src: &Path) -> Result<String, String> {
+    let src_s = src
+        .to_str()
+        .ok_or_else(|| "некорректный путь".to_string())?;
     let st = std::process::Command::new("pkexec")
         .args(["install", "-m", "0755", src_s, "/usr/local/bin/pirate"])
         .status()
@@ -245,108 +522,158 @@ fn install_pirate_to_path_linux(src: &Path) -> Result<String, String> {
     )
 }
 
+/// Keep in sync with `identifier` in `tauri.conf.json`.
 #[cfg(target_os = "macos")]
-fn install_pirate_to_path_macos(src: &Path) -> Result<String, String> {
-    let cmd = format!(
-        "/bin/mkdir -p /usr/local/bin && /usr/bin/install -m 0755 {} /usr/local/bin/pirate",
-        sh_single_quote(&src.to_string_lossy())
-    );
-    let script = format!(
-        "do shell script {} with administrator privileges",
-        serde_json::to_string(&cmd).map_err(|e| e.to_string())?
-    );
-    let out = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        return Ok(
-            "pirate установлен в /usr/local/bin/pirate. Откройте новый терминал.".into(),
-        );
-    }
-    Err(format!(
-        "Ошибка: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    ))
+const MACOS_APP_BUNDLE_ID: &str = "com.pirate.client";
+
+#[cfg(target_os = "macos")]
+fn macos_path_pirate_wrapper_sh() -> String {
+    format!(
+        r#"#!/bin/sh
+set -e
+for app in "/Applications/PirateClient.app" $(/usr/bin/mdfind "kMDItemCFBundleIdentifier == '{}'" 2>/dev/null); do
+  [ -e "$app" ] || continue
+  cli="$app/Contents/Resources/bundled/cli/pirate"
+  if [ -x "$cli" ]; then
+    exec "$cli" "$@"
+  fi
+done
+echo "pirate: PirateClient.app not found or bundled CLI missing (bundle {})." >&2
+exit 127
+"#,
+        MACOS_APP_BUNDLE_ID, MACOS_APP_BUNDLE_ID
+    )
 }
 
-#[cfg(target_os = "windows")]
-fn install_pirate_to_path_windows(src: &Path) -> Result<String, String> {
-    let src_s = src.to_string_lossy().to_string();
-    let ps = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$src = {src_json}
-$destDir = Join-Path $env:LOCALAPPDATA 'PirateClient\bin'
-New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-Copy-Item -LiteralPath $src -Destination (Join-Path $destDir 'pirate.exe') -Force
-$u = [Environment]::GetEnvironmentVariable('Path','User')
-if ($null -eq $u) {{ $u = '' }}
-if ($u -notlike "*$destDir*") {{
-  [Environment]::SetEnvironmentVariable('Path', ($u.TrimEnd(';') + ';' + $destDir), 'User')
-}}
-Write-Output 'OK'
-"#,
-        src_json = serde_json::to_string(&src_s).map_err(|e| e.to_string())?,
+#[cfg(target_os = "macos")]
+fn format_osascript_output(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output".into()
+    }
+}
+
+/// Escape for use inside AppleScript double-quoted string (e.g. `quoted form of "…"`).
+#[cfg(target_os = "macos")]
+fn applescript_string_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn install_pirate_to_path_macos_system_wide() -> Result<String, String> {
+    let body = macos_path_pirate_wrapper_sh();
+    let launcher =
+        std::env::temp_dir().join(format!("pirate-path-launcher-{}.sh", std::process::id()));
+    std::fs::write(&launcher, body.as_bytes()).map_err(|e| e.to_string())?;
+    chmod755_path(&launcher)?;
+
+    let runner = std::env::temp_dir().join(format!(
+        "pirate-path-install-runner-{}.sh",
+        std::process::id()
+    ));
+    let lq = sh_single_quote(&launcher.to_string_lossy());
+    let runner_body = format!(
+        "#!/bin/bash\n\
+set -e\n\
+LAUNCHER={lq}\n\
+cleanup() {{ rm -f \"$LAUNCHER\" \"$0\" 2>/dev/null || true; }}\n\
+trap cleanup EXIT\n\
+/bin/mkdir -p /usr/local/bin\n\
+sudo /usr/bin/install -m 0755 \"$LAUNCHER\" /usr/local/bin/pirate\n\
+echo \"[PirateClient] pirate installed to /usr/local/bin/pirate.\"\n\
+read -r -p \"Press Enter to close this tab…\" _\n",
     );
-    let tmp = std::env::temp_dir().join(format!("pirate-install-{}.ps1", std::process::id()));
-    std::fs::write(&tmp, ps.as_bytes()).map_err(|e| e.to_string())?;
-    let out = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            tmp.to_str().ok_or_else(|| "temp path".to_string())?,
-        ])
+    std::fs::write(&runner, runner_body.as_bytes()).map_err(|e| e.to_string())?;
+    chmod755_path(&runner)?;
+
+    let rp = applescript_string_escape(&runner.to_string_lossy());
+    let apple = format!(
+        "tell application id \"com.apple.Terminal\"\n\
+activate\n\
+do script (\"exec bash \" & quoted form of \"{rp}\")\n\
+end tell"
+    );
+
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &apple])
         .output()
         .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&tmp);
+
     if !out.status.success() {
-        let err = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stderr).trim(),
-            String::from_utf8_lossy(&out.stdout).trim()
-        );
-        return Err(if err.is_empty() {
-            "PowerShell завершился с ошибкой.".into()
-        } else {
-            err
-        });
+        let _ = std::fs::remove_file(&launcher);
+        let _ = std::fs::remove_file(&runner);
+        let detail = format_osascript_output(&out);
+        return Err(format!(
+            "Не удалось открыть Terminal для установки: {detail}\n\
+Разрешите PirateClient управлять Terminal: «Системные настройки → Конфиденциальность и безопасность → Автоматизация» (или Automation), если macOS блокировал запрос.\n\
+Также нужна запись NSAppleEventsUsageDescription в Info.plist (входит в сборку приложения)."
+        ));
     }
+
     Ok(
-        "pirate.exe установлен в %LOCALAPPDATA%\\PirateClient\\bin и добавлен в PATH пользователя. Закройте и снова откройте терминал, затем: pirate --help"
+        "Открылся Terminal: в его окне появится запрос пароля от sudo — введите пароль этого Mac, чтобы записать pirate в /usr/local/bin. \
+Дождитесь строки «[PirateClient] pirate installed…», затем Enter.\n\n\
+В /usr/local/bin ставится launcher из приложения: после обновления PirateClient версия `pirate --version` в терминале совпадёт с приложением."
             .into(),
     )
 }
 
-fn install_pirate_cli_sync(app: tauri::AppHandle) -> Result<String, String> {
+fn install_pirate_cli_user(app: &tauri::AppHandle) -> Result<String, String> {
+    sync_user_cli_from_bundle(app, true)?;
+    ensure_user_cli_on_path()?;
+    let dest = pirate_user_cli_bin()?;
+    Ok(format!(
+        "pirate установлен в {} (копия из приложения). Каталог добавлен в PATH пользователя; полностью закройте и снова откройте терминал, затем: pirate --version",
+        dest.display()
+    ))
+}
+
+fn install_pirate_cli_sync(app: tauri::AppHandle, system_wide: bool) -> Result<String, String> {
     let src = resolve_pirate_cli_source(&app)?;
     verify_cli_blob(&src)?;
 
-    #[cfg(target_os = "linux")]
-    return install_pirate_to_path_linux(&src);
-
-    #[cfg(target_os = "macos")]
-    return install_pirate_to_path_macos(&src);
-
-    #[cfg(target_os = "windows")]
-    return install_pirate_to_path_windows(&src);
-
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "windows"
-    )))]
-    {
-        Err("Установка CLI на этой ОС не поддерживается.".into())
+    if system_wide {
+        #[cfg(windows)]
+        {
+            let _ = src;
+            return Err(
+                "На Windows используется установка в каталог пользователя без прав администратора."
+                    .into(),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return install_pirate_to_path_linux_system_wide(&src);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = src;
+            return install_pirate_to_path_macos_system_wide();
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            let _ = (app, src);
+            return Err("Системная установка на этой ОС не поддерживается.".into());
+        }
     }
+
+    install_pirate_cli_user(&app)
 }
 
-/// Копирует встроенный `pirate` в каталог из PATH (ОС: macOS → /usr/local/bin, Linux → pkexec, Windows → %LOCALAPPDATA%\\PirateClient\\bin + user PATH).
+/// Default: user-local copy + PATH. Pass `systemWide: true` on macOS/Linux for `/usr/local/bin` (password).
 #[tauri::command]
-async fn install_pirate_cli(app: tauri::AppHandle) -> Result<String, String> {
+async fn install_pirate_cli(
+    app: tauri::AppHandle,
+    system_wide: Option<bool>,
+) -> Result<String, String> {
+    let sw = system_wide.unwrap_or(false);
     let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || install_pirate_cli_sync(app))
+    tauri::async_runtime::spawn_blocking(move || install_pirate_cli_sync(app, sw))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -383,8 +710,7 @@ fn test_grpc_endpoint(endpoint: String) -> Result<pirate_desktop::GrpcConnectRes
 
 #[tauri::command]
 fn refresh_grpc_status() -> Result<pirate_desktop::GrpcConnectResult, String> {
-    let ep =
-        pirate_desktop::load_endpoint().ok_or_else(|| "no saved connection".to_string())?;
+    let ep = pirate_desktop::load_endpoint().ok_or_else(|| "no saved connection".to_string())?;
     pirate_desktop::verify_grpc_endpoint(&ep)
 }
 
@@ -545,7 +871,9 @@ fn set_active_project(project_id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn pick_deploy_directory() -> Result<Option<String>, String> {
-    Ok(rfd::FileDialog::new().pick_folder().map(|p| p.to_string_lossy().to_string()))
+    Ok(rfd::FileDialog::new()
+        .pick_folder()
+        .map(|p| p.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -589,7 +917,9 @@ fn check_project_uploaded(directory: String) -> Result<pirate_desktop::ProjectDe
 }
 
 #[tauri::command]
-fn remove_server_project(project_id: String) -> Result<pirate_desktop::RemoveProjectOutcome, String> {
+fn remove_server_project(
+    project_id: String,
+) -> Result<pirate_desktop::RemoveProjectOutcome, String> {
     pirate_desktop::deploy::run_remove_project(project_id)
 }
 
@@ -605,6 +935,19 @@ fn analyze_network_access(
 fn validate_network_access(directory: String) -> Result<String, String> {
     let r = pirate_desktop::validate_network_access_remote(PathBuf::from(directory))?;
     serde_json::to_string(&r).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_project_network_manifest(
+    directory: String,
+    input: pirate_desktop::SaveProjectNetworkManifestInput,
+) -> Result<(), String> {
+    pirate_desktop::save_project_network_manifest(PathBuf::from(directory), input)
+}
+
+#[tauri::command]
+fn control_api_apply_project_nginx(directory: String) -> Result<String, String> {
+    pirate_desktop::control_api_apply_project_nginx(&PathBuf::from(directory))
 }
 
 #[tauri::command]
@@ -656,6 +999,27 @@ fn probe_local_toolchain() -> pirate_desktop::ToolchainReport {
 #[tauri::command]
 fn control_api_login(base_url: String, username: String, password: String) -> Result<(), String> {
     pirate_desktop::control_api_login(&base_url, &username, &password)
+}
+
+#[tauri::command]
+fn control_api_keychain_save(
+    base_url: String,
+    username: String,
+    password: String,
+) -> Result<(), String> {
+    pirate_desktop::control_api_keychain_save(&base_url, &username, &password)
+}
+
+#[tauri::command]
+fn control_api_keychain_load(
+    base_url: String,
+) -> Result<Option<pirate_desktop::ControlApiKeychainCreds>, String> {
+    pirate_desktop::control_api_keychain_load(&base_url)
+}
+
+#[tauri::command]
+fn control_api_keychain_delete(base_url: String) -> Result<(), String> {
+    pirate_desktop::control_api_keychain_delete(&base_url)
 }
 
 #[tauri::command]
@@ -750,7 +1114,10 @@ fn control_api_host_service_runtime_get_json(id: String) -> Result<String, Strin
 }
 
 #[tauri::command]
-fn control_api_host_service_runtime_put_json(id: String, body_json: String) -> Result<String, String> {
+fn control_api_host_service_runtime_put_json(
+    id: String,
+    body_json: String,
+) -> Result<String, String> {
     pirate_desktop::control_api_host_service_runtime_put_json(&id, &body_json)
 }
 
@@ -1293,10 +1660,7 @@ fn db_direct_profile_list_json() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn db_direct_profile_upsert(
-    body: String,
-    password: Option<String>,
-) -> Result<String, String> {
+fn db_direct_profile_upsert(body: String, password: Option<String>) -> Result<String, String> {
     let u: pirate_desktop::DirectProfileUpsert =
         serde_json::from_str(&body).map_err(|e| e.to_string())?;
     pirate_desktop::direct_profile_upsert(&u, password.as_deref())
@@ -1368,12 +1732,18 @@ fn control_api_storage_rename(from: String, to: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn control_api_storage_upload_file(remote_path: String, local_file: String) -> Result<String, String> {
+fn control_api_storage_upload_file(
+    remote_path: String,
+    local_file: String,
+) -> Result<String, String> {
     pirate_desktop::control_api_storage_upload_file(&remote_path, &local_file)
 }
 
 #[tauri::command]
-fn control_api_storage_download_file(remote_path: String, local_path: String) -> Result<(), String> {
+fn control_api_storage_download_file(
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
     pirate_desktop::control_api_storage_download_file(&remote_path, &local_path)
 }
 
@@ -1393,7 +1763,10 @@ fn control_api_storage_bind_sources_json() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn control_api_storage_bind_json(source_path: String, volume_name: String) -> Result<String, String> {
+fn control_api_storage_bind_json(
+    source_path: String,
+    volume_name: String,
+) -> Result<String, String> {
     pirate_desktop::control_api_storage_bind_json(&source_path, &volume_name)
 }
 
@@ -1488,7 +1861,10 @@ fn control_api_antiddos_stats_json() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn control_api_antiddos_project_put_json(project_id: String, content: String) -> Result<String, String> {
+fn control_api_antiddos_project_put_json(
+    project_id: String,
+    content: String,
+) -> Result<String, String> {
     pirate_desktop::control_api_antiddos_project_put_json(&project_id, &content)
 }
 
@@ -1556,6 +1932,14 @@ fn activate_server_bookmark(url: String) -> Result<pirate_desktop::GrpcConnectRe
 }
 
 #[tauri::command]
+fn migrate_grpc_public_endpoint(
+    old_url: String,
+    new_url: String,
+) -> Result<pirate_desktop::GrpcConnectResult, String> {
+    pirate_desktop::migrate_grpc_public_endpoint(&old_url, &new_url)
+}
+
+#[tauri::command]
 fn rename_server_bookmark(id: String, label: String) -> Result<(), String> {
     pirate_desktop::set_bookmark_label(&id, label)
 }
@@ -1580,7 +1964,11 @@ fn host_agent_status_json(base_url: String, token: String) -> Result<String, Str
 }
 
 #[tauri::command]
-fn host_agent_reboot_json(base_url: String, token: String, delay_sec: u64) -> Result<String, String> {
+fn host_agent_reboot_json(
+    base_url: String,
+    token: String,
+    delay_sec: u64,
+) -> Result<String, String> {
     pirate_desktop::host_agent_reboot_json(&base_url, &token, delay_sec, None)
 }
 
@@ -1787,12 +2175,17 @@ async fn apply_server_stack_update(
     let path = PathBuf::from(path);
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        pirate_desktop::run_server_stack_update_with_progress(path, version, chunk, move |sent, total| {
-            let _ = app.emit(
-                "server_stack_upload_progress",
-                serde_json::json!({ "sent": sent, "total": total }),
-            );
-        })
+        pirate_desktop::run_server_stack_update_with_progress(
+            path,
+            version,
+            chunk,
+            move |sent, total| {
+                let _ = app.emit(
+                    "server_stack_upload_progress",
+                    serde_json::json!({ "sent": sent, "total": total }),
+                );
+            },
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1800,6 +2193,7 @@ async fn apply_server_stack_update(
 
 fn main() {
     let _guard = init_tracing();
+    pirate_desktop::ensure_unified_client_config_migrated();
     if let Err(e) = pirate_desktop::spawn_monitoring_server() {
         tracing::warn!(%e, "monitoring HTTP server not started");
     } else {
@@ -1809,42 +2203,53 @@ fn main() {
         );
     }
     tauri::Builder::default()
+        .setup(|app| {
+            if let Err(e) = silent_sync_user_cli(&app.handle()) {
+                tracing::warn!(error = %e, "silent_sync_user_cli");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             is_pirate_cli_available,
             pirate_cli_path_info,
             install_pirate_cli,
-            get_status, // app status
-            parse_grpc_bundle, // parse install JSON from bundle
-            connect_grpc_bundle, // connect from bundle
-            get_saved_grpc_endpoint, // saved gRPC endpoint
-            clear_grpc_connection, // clear saved gRPC endpoint
-            test_grpc_endpoint, // test gRPC endpoint
-            refresh_grpc_status, // refresh gRPC endpoint status
-            get_control_api_base, // control-api base URL
-            set_control_api_base, // set control-api base URL
+            get_status,                                      // app status
+            parse_grpc_bundle,                               // parse install JSON from bundle
+            connect_grpc_bundle,                             // connect from bundle
+            get_saved_grpc_endpoint,                         // saved gRPC endpoint
+            clear_grpc_connection,                           // clear saved gRPC endpoint
+            test_grpc_endpoint,                              // test gRPC endpoint
+            refresh_grpc_status,                             // refresh gRPC endpoint status
+            get_control_api_base,                            // control-api base URL
+            set_control_api_base,                            // set control-api base URL
             mark_control_api_recent_restart, // mark restart window for diagnostics/retry
             control_api_recent_restart_hint, // true while restart window is active
-            get_active_project, // active project ID
-            set_active_project, // set active project ID
-            pick_deploy_directory, // pick deploy directory
-            deploy_from_directory, // deploy from directory
-            rollback_deploy, // rollback deploy
+            get_active_project,              // active project ID
+            set_active_project,              // set active project ID
+            pick_deploy_directory,           // pick deploy directory
+            deploy_from_directory,           // deploy from directory
+            rollback_deploy,                 // rollback deploy
             read_release_version_from_manifest, // read [project].version from pirate.toml
-            check_project_uploaded, // project deployed status for selected path
+            check_project_uploaded,          // project deployed status for selected path
             remove_server_project, // remove project on server (stop process + delete files + db rows)
             analyze_network_access, // local detect services + nginx preview from manifest
             validate_network_access, // server-side deploy validation blockers/warnings
-            projects_preflight, // projects preflight
+            save_project_network_manifest,
+            control_api_apply_project_nginx,
+            projects_preflight,    // projects preflight
             list_registered_projects, // list registered projects
             register_project_from_directory, // register project from directory
             remove_registered_project, // remove registered project
-            local_dev_start, // local stack: compose + start.cmd
-            local_dev_stop, // local stack: compose + stop.cmd
-            local_dev_status, // local stack: status
+            local_dev_start,       // local stack: compose + start.cmd
+            local_dev_stop,        // local stack: compose + stop.cmd
+            local_dev_status,      // local stack: status
             probe_local_toolchain, // local CLI toolchain probe
-            control_api_login, // control-api JWT login
+            control_api_login,     // control-api JWT login
+            control_api_keychain_save, // OS keychain: save control-api credentials
+            control_api_keychain_load, // OS keychain: load control-api credentials
+            control_api_keychain_delete, // OS keychain: remove control-api credentials
             control_api_health_probe, // quick GET /health probe
-            control_api_logout, // clear control-api JWT
+            control_api_logout,    // clear control-api JWT
             control_api_session_active, // JWT present and not expired (for UI)
             control_api_bearer_token, // JWT for WebSocket access_token (host terminal)
             control_api_fetch_status_json, // GET /api/v1/status (JWT)
@@ -1915,9 +2320,9 @@ fn main() {
             db_direct_password_set,
             db_direct_query_history_list,
             control_api_fetch_nginx_site_json, // GET /api/v1/nginx/site (JWT)
-            control_api_put_nginx_site, // PUT /api/v1/nginx/site (JWT)
+            control_api_put_nginx_site,        // PUT /api/v1/nginx/site (JWT)
             control_api_fetch_nginx_file_json, // GET /api/v1/nginx/file (JWT)
-            control_api_put_nginx_file_json, // PUT /api/v1/nginx/file (JWT)
+            control_api_put_nginx_file_json,   // PUT /api/v1/nginx/file (JWT)
             control_api_storage_tree_json,
             control_api_storage_usage_json,
             control_api_storage_create_folder,
@@ -1949,55 +2354,56 @@ fn main() {
             control_api_antiddos_project_delete,
             fetch_server_projects_overview, // projects list + per-project status
             ensure_deploy_project_id_for_deploy, // resolve deploy slot (default vs allocate) before deploy
-            open_project_folder, // reveal project folder in file manager
-            deploy_upload_cancel, // cancel deploy upload
-            server_stack_upload_cancel, // cancel server stack upload
-            list_server_bookmarks, // list server bookmarks
-            delete_server_bookmark, // delete server bookmark
-            add_server_bookmark, // add server bookmark
-            activate_server_bookmark, // activate server bookmark
-            rename_server_bookmark, // rename server bookmark
-            save_bookmark_host_agent, // out-of-band host-agent URL + token
+            open_project_folder,                 // reveal project folder in file manager
+            deploy_upload_cancel,                // cancel deploy upload
+            server_stack_upload_cancel,          // cancel server stack upload
+            list_server_bookmarks,               // list server bookmarks
+            delete_server_bookmark,              // delete server bookmark
+            add_server_bookmark,                 // add server bookmark
+            activate_server_bookmark,            // activate server bookmark
+            migrate_grpc_public_endpoint,        // move saved gRPC URL + pairing to new public URL
+            rename_server_bookmark,              // rename server bookmark
+            save_bookmark_host_agent,            // out-of-band host-agent URL + token
             host_agent_health_json,
             host_agent_status_json,
             host_agent_reboot_json,
             host_agent_upload_server_stack_cmd,
-            monitoring_api_base, // monitoring API base URL
-            monitoring_set_economy, // set monitoring economy mode
-            start_display_ingest, // start display ingest
-            display_ingest_base, // display ingest base URL
+            monitoring_api_base,                   // monitoring API base URL
+            monitoring_set_economy,                // set monitoring economy mode
+            start_display_ingest,                  // start display ingest
+            display_ingest_base,                   // display ingest base URL
             display_ingest_export_consumer_config, // display ingest export consumer config
-            get_display_stream_prefs, // get display stream prefs
-            set_display_stream_prefs, // set display stream prefs
-            internet_proxy_start, // start internet proxy
-            internet_proxy_stop, // stop internet proxy
-            internet_proxy_status, // internet proxy status
-            internet_proxy_logs, // internet proxy logs
-            internet_proxy_logs_clear, // internet proxy logs clear
-            load_client_settings_json, // load client settings
-            save_client_settings_json, // save client settings
-            apply_default_rules_preset_cmd, // apply default rules preset
-            load_default_rules_bundles_form, // load default rules bundles form
-            save_default_rules_bundles_form, // save default rules bundles form
-            load_board_rules_form, // load board rules form
-            save_board_rules_form, // save board rules form
-            fetch_remote_host_stats, // fetch remote host stats
-            fetch_remote_host_stats_detail, // fetch remote host stats detail
-            fetch_remote_host_stats_series, // fetch remote host stats series
-            ssl_status_json, // gRPC SslStatus (JSON)
-            ssl_create, // gRPC SslCreate
-            ssl_update, // gRPC SslUpdate
-            ssl_check_and_renew, // gRPC SslCheckAndRenew
-            pick_server_stack_tar_gz, // pick server stack tar.gz
-            fetch_server_stack_info_cmd, // fetch server stack info 
-            apply_server_stack_update, // apply server stack update
-            paas_init_project, // paas init project
-            paas_scan_project, // paas scan project
-            paas_project_build, // paas project build
-            paas_project_test, // paas project test
-            paas_test_local, // paas test local
-            paas_apply_gen, // paas apply gen
-            paas_pipeline, // paas pipeline
+            get_display_stream_prefs,              // get display stream prefs
+            set_display_stream_prefs,              // set display stream prefs
+            internet_proxy_start,                  // start internet proxy
+            internet_proxy_stop,                   // stop internet proxy
+            internet_proxy_status,                 // internet proxy status
+            internet_proxy_logs,                   // internet proxy logs
+            internet_proxy_logs_clear,             // internet proxy logs clear
+            load_client_settings_json,             // load client settings
+            save_client_settings_json,             // save client settings
+            apply_default_rules_preset_cmd,        // apply default rules preset
+            load_default_rules_bundles_form,       // load default rules bundles form
+            save_default_rules_bundles_form,       // save default rules bundles form
+            load_board_rules_form,                 // load board rules form
+            save_board_rules_form,                 // save board rules form
+            fetch_remote_host_stats,               // fetch remote host stats
+            fetch_remote_host_stats_detail,        // fetch remote host stats detail
+            fetch_remote_host_stats_series,        // fetch remote host stats series
+            ssl_status_json,                       // gRPC SslStatus (JSON)
+            ssl_create,                            // gRPC SslCreate
+            ssl_update,                            // gRPC SslUpdate
+            ssl_check_and_renew,                   // gRPC SslCheckAndRenew
+            pick_server_stack_tar_gz,              // pick server stack tar.gz
+            fetch_server_stack_info_cmd,           // fetch server stack info
+            apply_server_stack_update,             // apply server stack update
+            paas_init_project,                     // paas init project
+            paas_scan_project,                     // paas scan project
+            paas_project_build,                    // paas project build
+            paas_project_test,                     // paas project test
+            paas_test_local,                       // paas test local
+            paas_apply_gen,                        // paas apply gen
+            paas_pipeline,                         // paas pipeline
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

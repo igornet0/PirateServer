@@ -1,22 +1,32 @@
 //! Connection bundle parsing, pairing, and signed `GetStatus`.
+//!
+//! gRPC deploy URL, pairing, project id, and Ed25519 identity use the same files as the `pirate` CLI
+//! (`deploy_client::config`: `connection.json` + `identity.json`). SQLite `connection` row mirrors
+//! those fields for legacy UI queries; app-only columns (control-api JWT, etc.) stay in SQLite.
 
 use deploy_auth::{
     attach_auth_metadata, load_or_create_identity, pair_request_canonical, pubkey_b64_url,
     verify_pair_response, ConnectionBundle, now_unix_ms,
 };
+use deploy_client::config::{
+    self as client_config, load_connection, save_connection, StoredConnection,
+};
 use deploy_proto::deploy::{PairRequest, StatusRequest, StatusResponse};
-use ed25519_dalek::SigningKey;
 use deploy_proto::DeployServiceClient;
+use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Request;
 
 use crate::bookmarks::bookmark_pairing_pubkey_for_url;
 use crate::desktop_store;
+
+static UNIFIED_CONFIG_MIGRATE: Once = Once::new();
 
 const CONTROL_API_BASE_MODE_AUTO: &str = "auto";
 const CONTROL_API_BASE_MODE_MANUAL: &str = "manual";
@@ -25,6 +35,9 @@ const CONTROL_API_BASE_MODE_MANUAL: &str = "manual";
 #[serde(rename_all = "camelCase")]
 pub struct GrpcConnectResult {
     pub endpoint: String,
+    /// `DEPLOY_GRPC_PUBLIC_URL` from deploy-server (`StatusResponse.client_connect_url`).
+    #[serde(default)]
+    pub server_advertised_grpc_url: String,
     pub current_version: String,
     /// `[project].version` from deployed `pirate.toml` (GetStatus).
     pub project_version: String,
@@ -40,15 +53,141 @@ pub struct GrpcConnectResult {
     pub max_upload_bytes: Option<u64>,
 }
 
-fn identity_path() -> PathBuf {
+fn default_project_id() -> String {
+    "default".to_string()
+}
+
+fn signing_identity_path() -> Result<PathBuf, String> {
+    client_config::identity_path().ok_or_else(|| "no config directory for pirate-client".to_string())
+}
+
+fn legacy_desktop_identity_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("PirateClient")
         .join("identity.json")
 }
 
-fn default_project_id() -> String {
-    "default".to_string()
+/// Run once at app startup: migrate legacy `PirateClient/identity.json` + SQLite pairing into
+/// `deploy_client::config` so the `pirate` CLI sees the same connection.
+pub fn ensure_unified_client_config_migrated() {
+    UNIFIED_CONFIG_MIGRATE.call_once(|| {
+        if let Err(e) = migrate_unified_client_config_inner() {
+            tracing::warn!(%e, "unified client config migration skipped");
+        }
+    });
+}
+
+fn canon_connection_covers_signed_grpc(c: &StoredConnection) -> bool {
+    c.paired
+        && !c.url.trim().is_empty()
+        && !c.server_pubkey_b64.trim().is_empty()
+}
+
+fn mirror_connection_row_to_sqlite(c: &StoredConnection) -> Result<(), String> {
+    let db = desktop_store::open().map_err(|e| e.to_string())?;
+    let paired = i64::from(c.paired);
+    let pk = c.server_pubkey_b64.trim();
+    let pk_param: Option<String> = if pk.is_empty() {
+        None
+    } else {
+        Some(pk.to_string())
+    };
+    let pid = deploy_core::normalize_project_id(c.project_id.trim());
+    db.execute(
+        "UPDATE connection SET url = ?1, server_pubkey_b64 = ?2, paired = ?3, project_id = ?4 WHERE id = 1",
+        params![c.url.clone(), pk_param, paired, pid],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn save_canon_connection(c: &StoredConnection) -> Result<(), String> {
+    save_connection(c).map_err(|e| e.to_string())?;
+    mirror_connection_row_to_sqlite(c)
+}
+
+fn load_legacy_sqlite_grpc_row() -> Option<(String, Option<String>, bool, String)> {
+    let path = desktop_store::db_path();
+    if !path.exists() {
+        return None;
+    }
+    let db = rusqlite::Connection::open(&path).ok()?;
+    let mut stmt = db
+        .prepare("SELECT url, server_pubkey_b64, paired, project_id FROM connection WHERE id = 1")
+        .ok()?;
+    stmt
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .ok()
+}
+
+fn migrate_legacy_identity_file_if_needed() -> Result<(), String> {
+    let new_path = signing_identity_path()?;
+    if new_path.exists() {
+        return Ok(());
+    }
+    let old = legacy_desktop_identity_path();
+    if !old.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = new_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::copy(&old, &new_path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn migrate_unified_client_config_inner() -> Result<(), String> {
+    let canon = load_connection();
+    if let Some(ref c) = canon {
+        if canon_connection_covers_signed_grpc(c) {
+            mirror_connection_row_to_sqlite(c)?;
+            return Ok(());
+        }
+    }
+
+    let Some((url, pk_opt, paired, project_id)) = load_legacy_sqlite_grpc_row() else {
+        return Ok(());
+    };
+    if !(paired && !url.trim().is_empty()) {
+        return Ok(());
+    }
+    let Some(pk) = pk_opt.filter(|s| !s.trim().is_empty()) else {
+        return Ok(());
+    };
+
+    let should_write_json = match &canon {
+        None => true,
+        Some(c) => !canon_connection_covers_signed_grpc(c),
+    };
+    if !should_write_json {
+        return Ok(());
+    }
+
+    migrate_legacy_identity_file_if_needed()?;
+
+    let pid = project_id.trim();
+    let body = StoredConnection {
+        url: normalize_endpoint(&url),
+        server_pubkey_b64: pk,
+        paired: true,
+        connection_kind: 0,
+        project_id: if pid.is_empty() {
+            default_project_id()
+        } else {
+            deploy_core::normalize_project_id(pid)
+        },
+    };
+    save_connection(&body).map_err(|e| e.to_string())?;
+    mirror_connection_row_to_sqlite(&body)?;
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -56,19 +195,6 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredConnection {
-    /// New field name; `endpoint` accepted for backward compatibility.
-    #[serde(alias = "endpoint")]
-    url: String,
-    #[serde(default)]
-    server_pubkey_b64: Option<String>,
-    #[serde(default)]
-    paired: bool,
-    #[serde(default = "default_project_id")]
-    project_id: String,
 }
 
 fn normalize_endpoint(s: &str) -> String {
@@ -162,22 +288,6 @@ pub fn parse_grpc_endpoint_from_bundle(text: &str) -> Result<String, String> {
     )
 }
 
-fn load_stored() -> Option<StoredConnection> {
-    let c = desktop_store::open().ok()?;
-    let mut stmt = c
-        .prepare("SELECT url, server_pubkey_b64, paired, project_id FROM connection WHERE id = 1")
-        .ok()?;
-    stmt.query_row([], |row| {
-        Ok(StoredConnection {
-            url: row.get(0)?,
-            server_pubkey_b64: row.get(1)?,
-            paired: row.get::<_, i64>(2)? != 0,
-            project_id: row.get(3)?,
-        })
-    })
-    .ok()
-}
-
 fn apply_control_api_hint_from_status(r: &StatusResponse) {
     // Always keep direct URL in sync (used as fallback for bootstrap, e.g. `ensure_nginx` when HTTPS is not up yet).
     let direct = r.control_api_http_url_direct.trim();
@@ -239,8 +349,10 @@ pub fn load_control_api_direct_url() -> Option<String> {
 
 fn grpc_connect_result(endpoint: String, r: StatusResponse) -> GrpcConnectResult {
     apply_control_api_hint_from_status(&r);
+    let server_advertised_grpc_url = normalize_endpoint(r.client_connect_url.as_str());
     GrpcConnectResult {
         endpoint,
+        server_advertised_grpc_url,
         current_version: r.current_version,
         project_version: r.project_version,
         state: r.state,
@@ -250,25 +362,13 @@ fn grpc_connect_result(endpoint: String, r: StatusResponse) -> GrpcConnectResult
     }
 }
 
-fn use_signed_for_endpoint(endpoint: &str) -> bool {
-    load_stored()
-        .map(|s| {
-            s.paired
-                && deploy_auth::endpoints_equivalent_for_signing(
-                    &normalize_endpoint(&s.url),
-                    &normalize_endpoint(endpoint),
-                )
-        })
-        .unwrap_or(false)
-}
-
 /// When the saved connection is paired, returns the client signing key for gRPC auth.
 pub fn load_signing_key_for_endpoint(endpoint: &str) -> Result<Option<SigningKey>, String> {
-    let endpoint = normalize_endpoint(endpoint);
-    if !use_signed_for_endpoint(&endpoint) {
+    if !client_config::use_signed_requests(endpoint) {
         return Ok(None);
     }
-    load_or_create_identity(&identity_path())
+    let path = signing_identity_path()?;
+    load_or_create_identity(&path)
         .map(Some)
         .map_err(|e| e.to_string())
 }
@@ -290,8 +390,8 @@ pub fn verify_grpc_endpoint(endpoint: &str) -> Result<GrpcConnectResult, String>
         let mut req = Request::new(StatusRequest {
             project_id: pid.clone(),
         });
-        if use_signed_for_endpoint(&endpoint) {
-            let sk = load_or_create_identity(&identity_path()).map_err(|e| e.to_string())?;
+        if client_config::use_signed_requests(&endpoint) {
+            let sk = load_or_create_identity(&signing_identity_path()?).map_err(|e| e.to_string())?;
             attach_auth_metadata(&mut req, &sk, "GetStatus", &pid, "").map_err(|e| e.to_string())?;
         }
         let r: StatusResponse = client
@@ -317,8 +417,8 @@ pub async fn verify_grpc_status_for_project_async(project_id: &str) -> Result<Gr
     let mut req = Request::new(StatusRequest {
         project_id: pid.clone(),
     });
-    if use_signed_for_endpoint(&endpoint) {
-        let sk = load_or_create_identity(&identity_path()).map_err(|e| e.to_string())?;
+    if client_config::use_signed_requests(&endpoint) {
+        let sk = load_or_create_identity(&signing_identity_path()?).map_err(|e| e.to_string())?;
         attach_auth_metadata(&mut req, &sk, "GetStatus", &pid, "").map_err(|e| e.to_string())?;
     }
     let r: StatusResponse = client
@@ -342,33 +442,40 @@ pub fn verify_grpc_status_for_project(project_id: &str) -> Result<GrpcConnectRes
 }
 
 pub fn save_endpoint(endpoint: &str) -> Result<(), String> {
+    ensure_unified_client_config_migrated();
     validate_endpoint(endpoint)?;
     let endpoint = normalize_endpoint(endpoint);
-    let c = desktop_store::open().map_err(|e| e.to_string())?;
-    let project_id = load_stored()
-        .map(|s| s.project_id)
+    let existing = load_connection();
+    let connection_kind = existing.as_ref().map(|c| c.connection_kind).unwrap_or(0);
+    let project_id = existing
+        .as_ref()
+        .map(|c| c.project_id.as_str())
         .filter(|p| !p.trim().is_empty())
+        .map(|p| deploy_core::normalize_project_id(p))
         .unwrap_or_else(default_project_id);
-    if let Some(pk) = bookmark_pairing_pubkey_for_url(&endpoint) {
-        c.execute(
-            "UPDATE connection SET url = ?1, server_pubkey_b64 = ?2, paired = 1, project_id = ?3 WHERE id = 1",
-            params![endpoint, pk, project_id],
-        )
-        .map_err(|e| e.to_string())?;
+
+    let (paired, server_pubkey_b64) = if let Some(pk) = bookmark_pairing_pubkey_for_url(&endpoint) {
+        (true, pk)
     } else {
-        c.execute(
-            "UPDATE connection SET url = ?1, server_pubkey_b64 = NULL, paired = 0, project_id = ?2 WHERE id = 1",
-            params![endpoint, project_id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
+        (false, String::new())
+    };
+
+    let body = StoredConnection {
+        url: endpoint.clone(),
+        server_pubkey_b64,
+        paired,
+        connection_kind,
+        project_id,
+    };
+    save_canon_connection(&body)?;
     let _ = crate::bookmarks::upsert_bookmark(&endpoint, &endpoint);
     Ok(())
 }
 
 pub fn load_endpoint() -> Option<String> {
-    load_stored().and_then(|s| {
-        let u = s.url.trim();
+    ensure_unified_client_config_migrated();
+    load_connection().and_then(|c| {
+        let u = c.url.trim();
         if u.is_empty() {
             None
         } else {
@@ -499,9 +606,10 @@ pub(crate) fn load_control_api_jwt() -> Option<(String, i64)> {
 
 /// Active deploy project id (persisted with the gRPC connection).
 pub fn load_project_id() -> String {
-    load_stored()
-        .map(|s| {
-            let p = s.project_id.trim();
+    ensure_unified_client_config_migrated();
+    load_connection()
+        .map(|c| {
+            let p = c.project_id.trim();
             if p.is_empty() {
                 "default".to_string()
             } else {
@@ -513,16 +621,11 @@ pub fn load_project_id() -> String {
 
 /// Set active project id (requires an existing saved connection file).
 pub fn set_active_project(project_id: String) -> Result<(), String> {
+    ensure_unified_client_config_migrated();
     deploy_core::validate_project_id(&project_id).map_err(|e| e.to_string())?;
-    let _ = load_stored().ok_or_else(|| "save a gRPC connection first".to_string())?;
-    let pid = deploy_core::normalize_project_id(&project_id);
-    let c = desktop_store::open().map_err(|e| e.to_string())?;
-    c.execute(
-        "UPDATE connection SET project_id = ?1 WHERE id = 1",
-        params![pid],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    let mut conn = load_connection().ok_or_else(|| "save a gRPC connection first".to_string())?;
+    conn.project_id = deploy_core::normalize_project_id(&project_id);
+    save_canon_connection(&conn)
 }
 
 /// Switch active connection to saved URL and verify gRPC (GetStatus).
@@ -551,6 +654,9 @@ pub fn add_bookmark_from_input(raw: &str) -> Result<String, String> {
 }
 
 pub fn clear_endpoint() -> Result<(), String> {
+    if let Some(p) = client_config::connection_path() {
+        let _ = std::fs::remove_file(p);
+    }
     let c = desktop_store::open().map_err(|e| e.to_string())?;
     c.execute(
         "UPDATE connection SET url = '', server_pubkey_b64 = NULL, paired = 0, control_api_base_url = '', control_api_base_mode = 'auto', control_api_direct_url = '', control_api_jwt = '', control_api_jwt_expires_at_ms = 0, control_api_recent_restart_until_ms = 0 WHERE id = 1",
@@ -562,6 +668,7 @@ pub fn clear_endpoint() -> Result<(), String> {
 
 /// Parse install JSON, run `Pair`, verify server, save connection + identity.
 pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
+    ensure_unified_client_config_migrated();
     let t = bundle.trim();
     if !install_json_has_token(t)? {
         let ep = parse_grpc_endpoint_from_bundle(bundle)?;
@@ -577,7 +684,14 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
         .filter(|s| !s.is_empty())
         .ok_or("bundle must include pairing code from the server")?;
 
-    let sk = load_or_create_identity(&identity_path()).map_err(|e| e.to_string())?;
+    let project_id = load_connection()
+        .map(|c| c.project_id)
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| deploy_core::normalize_project_id(&p))
+        .unwrap_or_else(default_project_id);
+
+    let id_path = signing_identity_path()?;
+    let sk = load_or_create_identity(&id_path).map_err(|e| e.to_string())?;
     let client_pub = pubkey_b64_url(&sk);
     let ts_ms = now_unix_ms();
     let nonce = format!("{:016x}", OsRng.next_u64());
@@ -616,23 +730,12 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
 
         let body = StoredConnection {
             url: normalize_endpoint(&b.url),
-            server_pubkey_b64: Some(b.server_pubkey_b64.clone()),
+            server_pubkey_b64: b.server_pubkey_b64.clone(),
             paired: true,
-            project_id: load_stored()
-                .map(|s| s.project_id)
-                .filter(|p| !p.trim().is_empty())
-                .unwrap_or_else(default_project_id),
+            connection_kind: 0,
+            project_id: project_id.clone(),
         };
-        let c = desktop_store::open().map_err(|e| e.to_string())?;
-        c.execute(
-            "UPDATE connection SET url = ?1, server_pubkey_b64 = ?2, paired = 1, project_id = ?3 WHERE id = 1",
-            params![
-                body.url.clone(),
-                body.server_pubkey_b64.clone(),
-                body.project_id.clone(),
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+        save_canon_connection(&body).map_err(|e| e.to_string())?;
 
         let mut client = DeployServiceClient::connect(b.url.clone())
             .await
@@ -654,6 +757,53 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
 
         Ok(grpc_connect_result(endpoint, r))
     })
+}
+
+/// Copy deploy pairing from `old_url` to `new_url`, persist [`StoredConnection`], then verify with `GetStatus`.
+pub fn migrate_grpc_public_endpoint(old_url: &str, new_url: &str) -> Result<GrpcConnectResult, String> {
+    ensure_unified_client_config_migrated();
+    let old_n = normalize_endpoint(old_url);
+    let new_n = normalize_endpoint(new_url);
+    validate_endpoint(&old_n)?;
+    validate_endpoint(&new_n)?;
+    if old_n == new_n {
+        return verify_grpc_endpoint(&new_n);
+    }
+
+    let pk = bookmark_pairing_pubkey_for_url(&old_n).or_else(|| {
+        load_connection().and_then(|c| {
+            if normalize_endpoint(&c.url) == old_n
+                && c.paired
+                && !c.server_pubkey_b64.trim().is_empty()
+            {
+                Some(c.server_pubkey_b64)
+            } else {
+                None
+            }
+        })
+    }).ok_or_else(|| {
+        "no paired identity for the current address; pair again or add a bookmark for the old URL"
+            .to_string()
+    })?;
+
+    crate::bookmarks::migrate_bookmark_url_keep_pairing(&old_n, &new_n, &pk)?;
+
+    let conn = load_connection();
+    let project_id = conn
+        .as_ref()
+        .map(|c| deploy_core::normalize_project_id(c.project_id.trim()))
+        .unwrap_or_else(default_project_id);
+    let connection_kind = conn.as_ref().map(|c| c.connection_kind).unwrap_or(0);
+
+    let body = StoredConnection {
+        url: new_n.clone(),
+        server_pubkey_b64: pk,
+        paired: true,
+        connection_kind,
+        project_id,
+    };
+    save_canon_connection(&body)?;
+    verify_grpc_endpoint(&new_n)
 }
 
 #[cfg(test)]

@@ -129,6 +129,15 @@ if [[ "${NGINX_E2E_TESTS:-}" == "1" ]]; then
     echo "$RESP"
     exit 1
   }
+  echo "==> project nginx apply API (route + path; ok may be false without host sudo scripts)"
+  MANIFEST=$(cat /fixtures/project-nginx-apply.toml)
+  APPLY_BODY=$(jq -n --arg m "$MANIFEST" '{manifest_toml: $m}')
+  APPLY=$(curl_api -X POST "$API/api/v1/projects/p-e2enginxapply01/nginx/apply" \
+    -H "Content-Type: application/json" -d "$APPLY_BODY")
+  echo "$APPLY" | grep -q 'pirate-project-p-e2enginxapply01' || {
+    echo "$APPLY"
+    exit 1
+  }
 fi
 
 echo "OK: Docker e2e passed"

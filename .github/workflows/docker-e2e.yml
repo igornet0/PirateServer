@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: VERSION matches deploy-client (release hygiene)
+        run: ./scripts/check-deploy-client-version-matches-root-version.sh
+
       - name: Default stack (deploy + HTTP + rollback + history)
         run: ./scripts/run-docker-e2e.sh --down
 

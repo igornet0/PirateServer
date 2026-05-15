@@ -150,7 +150,7 @@ fn assert_port_free(port: u16) -> Result<(), String> {
 }
 
 fn apply_manifest_env(cmd: &mut Command, project_root: &Path, manifest: &PirateManifest) {
-    for (k, v) in process_manager::load_dotenv(project_root) {
+    for (k, v) in process_manager::load_dotenv(project_root, manifest) {
         cmd.env(k, v);
     }
     for (k, v) in &manifest.env {

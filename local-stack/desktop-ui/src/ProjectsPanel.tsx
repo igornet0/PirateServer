@@ -568,7 +568,61 @@ export function ProjectsPanel({
     }
   };
 
-  const onSetupProxy = async () => {
+  const networkManifestInput = useCallback(
+    () => ({
+      accessMode,
+      domain: domain.trim(),
+      routes: routeRows.map((r) => ({ path: r.path, target: r.target })),
+      httpsEnabled,
+    }),
+    [accessMode, domain, routeRows, httpsEnabled],
+  );
+
+  const onApplyProjectNginx = async () => {
+    if (!deployDir?.trim()) return;
+    if (accessMode === "public" && !domain.trim()) {
+      toast.error(
+        language === "ru" ? "Укажите домен для публичного доступа." : "Set a domain for public access.",
+      );
+      return;
+    }
+    if (routeRows.length === 0) {
+      toast.error(
+        language === "ru"
+          ? "Добавьте хотя бы один маршрут (web/api)."
+          : "Add at least one route (web/api).",
+      );
+      return;
+    }
+    setNetworkBusy(true);
+    setNetworkMsg(null);
+    try {
+      await invoke<string>("ensure_deploy_project_id_for_deploy", { path: deployDir });
+      await invoke("save_project_network_manifest", {
+        directory: deployDir,
+        input: networkManifestInput(),
+      });
+      const msg = await invoke<string>("control_api_apply_project_nginx", {
+        directory: deployDir,
+      });
+      toast.success(
+        language === "ru" ? "Nginx проекта применён на сервере" : "Project nginx applied on server",
+        { description: msg.length > 400 ? `${msg.slice(0, 400)}…` : msg },
+      );
+      await refreshNetworkAccess();
+    } catch (e) {
+      const msg = String(e);
+      setNetworkMsg(msg);
+      toast.error(
+        language === "ru" ? "Не удалось применить nginx проекта" : "Failed to apply project nginx",
+        { description: msg },
+      );
+    } finally {
+      setNetworkBusy(false);
+    }
+  };
+
+  const onSetupDashboardNginx = async () => {
     setNetworkMsg(null);
     try {
       const hasWeb = (networkAnalysis?.detection.services ?? []).some((s) => s.name === "web");
@@ -1512,11 +1566,25 @@ export function ProjectsPanel({
                 <div className="mt-2 flex flex-wrap gap-2">
                   <button
                     type="button"
-                    disabled={!endpoint}
-                    onClick={() => void onSetupProxy()}
+                    disabled={!endpoint || networkBusy || !deployDir}
+                    onClick={() => void onApplyProjectNginx()}
                     className={`${btnBase} border border-red-900/50 bg-red-950/30 text-orange-100`}
                   >
-                    {t("auto.ProjectsPanel_tsx.99")}
+                    {networkBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                    {language === "ru" ? "Применить nginx проекта на сервер" : "Apply project nginx on server"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!endpoint}
+                    onClick={() => void onSetupDashboardNginx()}
+                    className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200`}
+                    title={
+                      language === "ru"
+                        ? "Общий vhost Pirate: дашборд и /api/ (не UI вашего проекта)"
+                        : "Shared Pirate vhost: dashboard and /api/ (not your project UI)"
+                    }
+                  >
+                    {language === "ru" ? "Nginx дашборда Pirate" : "Pirate dashboard nginx"}
                   </button>
                   <button
                     type="button"
@@ -1811,8 +1879,8 @@ export function ProjectsPanel({
                 </h4>
                 <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
                   {tr(
-                    "Текущий файл сайта на хосте (обычно /etc/nginx/sites-available/pirate): UI дашборда и /api/ → control-api. Это общий vhost Pirate, не фрагмент из releases/…/pirate-nginx-snippet.conf.",
-                    "The site file on the host (typically /etc/nginx/sites-available/pirate): dashboard UI and /api/ to control-api. This is the shared Pirate vhost, not the per-release snippet under releases/…/pirate-nginx-snippet.conf.",
+                    "Файл /etc/nginx/sites-available/pirate — дашборд Pirate. Vhost UI проекта: /etc/nginx/sites-available/pirate-project-<id> (кнопка «Применить nginx проекта»). Snippet в releases/…/pirate-nginx-snippet.conf на nginx не подключается автоматически.",
+                    "File /etc/nginx/sites-available/pirate is the Pirate dashboard. Project UI vhost: /etc/nginx/sites-available/pirate-project-<id> (use “Apply project nginx on server”). The release snippet under releases/…/pirate-nginx-snippet.conf is not auto-enabled in nginx.",
                   )}
                 </p>
                 {!controlApiBase?.trim() ? (

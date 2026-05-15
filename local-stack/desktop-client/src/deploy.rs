@@ -8,7 +8,8 @@ use crate::control_api::{
 };
 use deploy_auth::attach_auth_metadata;
 use deploy_client::{
-    detect_services, generate_proxy_config, pack_directory_for_deploy, upload_packed_tar_gz_grpc,
+    detect_services, generate_proxy_config, pack_directory_for_deploy, resolve_proxy_route_upstream,
+    upload_packed_tar_gz_grpc,
     validate_version_label, DeployValidationReport, ServiceDetectionReport,
 };
 
@@ -236,6 +237,71 @@ pub struct ProjectDeployCheck {
 pub struct NetworkAccessRouteOverride {
     pub path: String,
     pub target: String,
+}
+
+/// Network wizard fields persisted into `pirate.toml` before server-side nginx apply.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveProjectNetworkManifestInput {
+    /// `local` | `lan` | `public`
+    pub access_mode: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub routes: Vec<NetworkAccessRouteOverride>,
+    #[serde(default)]
+    pub https_enabled: bool,
+}
+
+/// Write `[network]` / `[proxy]` from the desktop network wizard into `pirate.toml`.
+pub fn save_project_network_manifest(
+    project_dir: PathBuf,
+    input: SaveProjectNetworkManifestInput,
+) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    let manifest_path = project_dir.join("pirate.toml");
+    let mut m = PirateManifest::read_file(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+
+    let mode = match input.access_mode.trim().to_ascii_lowercase().as_str() {
+        "public" => "wan",
+        "lan" => "lan",
+        "local" | "private" => "private",
+        other => {
+            return Err(format!(
+                "invalid access_mode `{other}` (expected local|lan|public)"
+            ));
+        }
+    };
+    m.network.mode = mode.to_string();
+    m.network.access.public = mode == "wan";
+    m.network.access.domain = if mode == "wan" {
+        input.domain.trim().to_string()
+    } else {
+        String::new()
+    };
+    m.network.tls.https = input.https_enabled && mode == "wan";
+
+    m.proxy.r#type = "nginx".to_string();
+    m.proxy.enabled = mode != "private";
+    m.proxy.backend = String::new();
+
+    let mut routes = BTreeMap::<String, String>::new();
+    for r in &input.routes {
+        let path = r.path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let upstream = resolve_proxy_route_upstream(r.target.trim())?;
+        routes.insert(path.to_string(), upstream);
+    }
+    m.proxy.routes = routes;
+
+    let s = m
+        .to_toml_string()
+        .map_err(|e| format!("serialize pirate.toml: {e}"))?;
+    std::fs::write(&manifest_path, s).map_err(|e| format!("write {}: {e}", manifest_path.display()))
 }
 
 /// UI-only overrides so nginx preview matches the network wizard before `pirate.toml` is saved.

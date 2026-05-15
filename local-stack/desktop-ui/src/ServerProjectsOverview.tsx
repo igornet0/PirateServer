@@ -27,6 +27,8 @@ import { ModalDialog } from "./ui/ModalDialog";
 const btnSm =
   "inline-flex items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/80 disabled:pointer-events-none disabled:opacity-50";
 
+type ControlApiKeychainCreds = { username: string; password: string };
+
 function controlApiAuthLostMessage(msg: string): boolean {
   const m = msg.toLowerCase();
   return (
@@ -201,6 +203,7 @@ export function ServerProjectsOverview({
   const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [rememberInKeychain, setRememberInKeychain] = useState(false);
   const [sessionActive, setSessionActive] = useState(false);
   const [overview, setOverview] = useState<ServerProjectsOverviewData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -225,6 +228,47 @@ export function ServerProjectsOverview({
       }
     })();
   }, [controlApiBase]);
+
+  const tryFillFromKeychain = useCallback(async (base: string) => {
+    if (!base.trim()) return;
+    try {
+      const c = await invoke<ControlApiKeychainCreds | null>("control_api_keychain_load", {
+        baseUrl: base.trim(),
+      });
+      if (c?.username != null && c.username !== "") {
+        setUsername(c.username);
+        setPassword(c.password ?? "");
+      }
+    } catch {
+      /* Tauri unavailable or keychain error — ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (sessionActive) return;
+    const base = controlApiBase.trim();
+    if (!base) return;
+    void tryFillFromKeychain(base);
+  }, [sessionActive, controlApiBase, tryFillFromKeychain]);
+
+  const onForgetControlApiKeychain = useCallback(async () => {
+    const base = controlApiBase.trim();
+    if (!base) return;
+    setLoginMsg(null);
+    try {
+      await invoke("control_api_keychain_delete", { baseUrl: base });
+      setUsername("");
+      setPassword("");
+      setLoginMsg(
+        tr(
+          "Учётные данные удалены из связки ключей (Keychain / системное хранилище).",
+          "Credentials removed from the password store (Keychain / OS vault).",
+        ),
+      );
+    } catch (e) {
+      setLoginMsg(String(e));
+    }
+  }, [controlApiBase, tr]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -279,10 +323,25 @@ export function ServerProjectsOverview({
         }
       }
       if (lastErr) throw lastErr;
+      let keychainWarn: string | null = null;
+      if (rememberInKeychain) {
+        try {
+          await invoke("control_api_keychain_save", {
+            baseUrl: base,
+            username: u,
+            password: p,
+          });
+        } catch (kcErr) {
+          keychainWarn = tr(
+            `Вход выполнен, но не удалось сохранить в связке ключей: ${String(kcErr)}`,
+            `Signed in, but saving to the password store failed: ${String(kcErr)}`,
+          );
+        }
+      }
       setPassword("");
       setUsername("");
       setSessionActive(true);
-      setLoginMsg(null);
+      setLoginMsg(keychainWarn);
       await refresh();
     } catch (e) {
       const raw = String(e);
@@ -855,6 +914,13 @@ export function ServerProjectsOverview({
                   autoComplete="username"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
+                  onFocus={() => {
+                    const b = controlApiBase.trim();
+                    if (!b) return;
+                    if (!username.trim() && !password.trim()) {
+                      void tryFillFromKeychain(b);
+                    }
+                  }}
                   className="rounded-lg border border-white/10 bg-black/30 px-2 py-1.5 text-sm text-slate-100"
                 />
               </label>
@@ -876,6 +942,31 @@ export function ServerProjectsOverview({
               >
                 <LogIn className="h-3.5 w-3.5" />
                 {t("auto.ServerProjectsOverview_tsx.15")}
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/5 pt-2">
+              <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-slate-400">
+                <input
+                  type="checkbox"
+                  checked={rememberInKeychain}
+                  onChange={(e) => setRememberInKeychain(e.target.checked)}
+                  className="rounded border-white/20 bg-black/40 text-red-600 focus:ring-red-600/60"
+                />
+                <span
+                  title={tr(
+                    "После успешного входа сохранить логин и пароль в связке ключей macOS (или в системном хранилище на других ОС).",
+                    "After a successful sign-in, save username and password in macOS Keychain (or the OS credential store elsewhere).",
+                  )}
+                >
+                  {tr("Сохранить в связке ключей", "Save in password store")}
+                </span>
+              </label>
+              <button
+                type="button"
+                className="text-xs text-slate-500 underline decoration-slate-600 underline-offset-2 hover:text-slate-300"
+                onClick={() => void onForgetControlApiKeychain()}
+              >
+                {tr("Удалить из связки ключей", "Remove from password store")}
               </button>
             </div>
             {loginMsg ? <p className="text-xs text-slate-400">{loginMsg}</p> : null}

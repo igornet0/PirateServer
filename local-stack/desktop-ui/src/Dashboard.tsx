@@ -13,7 +13,7 @@
  * - `deploy_upload_cancel` / `server_stack_upload_cancel` — прерывание потока чанков (best-effort)
  * - `deploy-progress` — этапы деплоя (prepare/archive/upload/apply) и байты при отправке
  * - `pick_server_stack_tar_gz` / `apply_server_stack_update` / `fetch_server_stack_info_cmd` (OTA host bundle)
- * - `pirate_cli_path_info` / `install_pirate_cli` — сравнение версии CLI в PATH с встроенной; напоминание обновить после апдейта приложения
+ * - `pirate_cli_path_info` / `install_pirate_cli` — копия CLI в каталог пользователя (без пароля) и сравнение с бандлом; опционально `systemWide: true` (macOS/Linux, пароль); поля `userBin*`, `firstOnPathDiffersFromUserBin`
  * - `start_display_ingest` / `display_ingest_base` / `display_ingest_export_consumer_config` — display stream receive
  * - `get_display_stream_prefs` / `set_display_stream_prefs` — local stream send/receive flags
  * - `internet_proxy_start` / `internet_proxy_stop` / `internet_proxy_status` — локальный CONNECT-прокси
@@ -35,6 +35,7 @@ import {
   FileArchive,
   FolderOpen,
   Loader2,
+  Lock,
   Plus,
   RefreshCw,
   Server,
@@ -67,6 +68,7 @@ import {
   type HostStatsSnapshot,
 } from "./host-stats-types";
 import { suggestControlApiFromGrpcUrl } from "./controlApiUrl";
+import { looksLikeInstallBundle } from "./installBundle";
 import { ModalDialog } from "./ui/ModalDialog";
 
 // -----------------------------------------------------------------------------
@@ -78,11 +80,50 @@ type PirateCliPathInfo = {
   pathInPath: string | null;
   pathVersion: string | null;
   bundledVersion: string | null;
+  userBinPath: string | null;
+  userBinVersion: string | null;
   needsUpdate: boolean;
+  firstOnPathDiffersFromUserBin: boolean;
+  /** Default `install_pirate_cli` (no elevation): `user_local`. */
+  installAuthKind: string;
+  /** Optional system-wide install (`systemWide: true`): `macos_admin` | `linux_pkexec`. */
+  systemWideInstallAuthKind: string | null;
 };
+
+function pirateCliInstallAuthExplainer(kind: string, tr: (ru: string, en: string) => string) {
+  switch (kind) {
+    case "user_local":
+      return tr(
+        "CLI копируется в каталог данных приложения и в PATH пользователя; пароль администратора не нужен. Новый терминал подхватит обновление (или выполните hash -r / rehash).",
+        "The CLI is copied to the app data folder and your user PATH; no administrator password. Open a new terminal to pick it up (or run hash -r / rehash).",
+      );
+    case "macos_admin":
+      return tr(
+        "Откроется Terminal: пароль нужно ввести прямо в его окне по запросу sudo (запись в /usr/local/bin).",
+        "Terminal opens: enter your Mac password in that window when sudo asks (installs to /usr/local/bin).",
+      );
+    case "linux_pkexec":
+      return tr(
+        "Появится системный запрос прав администратора (Polkit / pkexec) для записи в /usr/local/bin.",
+        "The system will prompt for administrator credentials (Polkit / pkexec) to update /usr/local/bin/pirate.",
+      );
+    case "windows_user":
+      return tr(
+        "Обычно отдельное окно прав администратора не требуется: CLI копируется в каталог пользователя и в PATH пользователя.",
+        "Usually no administrator UAC prompt is needed: the CLI is copied under your user profile and added to your user PATH.",
+      );
+    default:
+      return tr(
+        "Может потребоваться подтверждение системы для обновления CLI в PATH.",
+        "The operating system may ask you to confirm before updating the CLI on PATH.",
+      );
+  }
+}
 
 type GrpcConnectResult = {
   endpoint: string;
+  /** `DEPLOY_GRPC_PUBLIC_URL` from server (`client_connect_url`); may differ from saved endpoint. */
+  serverAdvertisedGrpcUrl?: string;
   currentVersion: string;
   projectVersion: string;
   state: string;
@@ -379,10 +420,14 @@ export function Dashboard() {
   const [copied, setCopied] = useState(false);
 
   const [connectionSwitching, setConnectionSwitching] = useState(false);
+  const [migrateGrpcBusy, setMigrateGrpcBusy] = useState(false);
 
   const [serverSettingsBookmark, setServerSettingsBookmark] = useState<ServerBookmark | null>(null);
 
   const [pirateCliPromptOpen, setPirateCliPromptOpen] = useState(false);
+  /** When managed user-bin copy is stale or missing (after silent sync failed or first run). */
+  const [pirateCliAuthPromptOpen, setPirateCliAuthPromptOpen] = useState(false);
+  const [pirateCliAuthPromptInfo, setPirateCliAuthPromptInfo] = useState<PirateCliPathInfo | null>(null);
   const [pirateCliUpdatePromptOpen, setPirateCliUpdatePromptOpen] = useState(false);
   const [pirateCliUpdateInfo, setPirateCliUpdateInfo] = useState<PirateCliPathInfo | null>(null);
   const [pirateCliInstallBusy, setPirateCliInstallBusy] = useState(false);
@@ -446,6 +491,43 @@ export function Dashboard() {
     }
   }, [commitGrpcLive]);
 
+  const grpcAdvertisedMismatch = useMemo(() => {
+    const adv = grpcLive?.serverAdvertisedGrpcUrl?.trim();
+    if (!adv || !endpoint) return null;
+    if (normalizeGrpcUrl(adv) === normalizeGrpcUrl(endpoint)) return null;
+    return adv;
+  }, [grpcLive?.serverAdvertisedGrpcUrl, endpoint]);
+
+  const onMigrateToAdvertisedGrpc = useCallback(async () => {
+    const adv = grpcLive?.serverAdvertisedGrpcUrl?.trim();
+    if (!adv || !endpoint || migrateGrpcBusy) return;
+    setMigrateGrpcBusy(true);
+    setGrpcErr(null);
+    try {
+      const r = await invoke<GrpcConnectResult>("migrate_grpc_public_endpoint", {
+        oldUrl: endpoint,
+        newUrl: adv,
+      });
+      commitGrpcLive(r);
+      setEndpoint(r.endpoint);
+      await loadBookmarks();
+      toast.message(
+        tr("Сохранённый gRPC endpoint обновлён под адрес сервера.", "Saved gRPC endpoint updated to match the server."),
+      );
+    } catch (e) {
+      setGrpcErr(String(e));
+    } finally {
+      setMigrateGrpcBusy(false);
+    }
+  }, [
+    grpcLive?.serverAdvertisedGrpcUrl,
+    endpoint,
+    migrateGrpcBusy,
+    commitGrpcLive,
+    loadBookmarks,
+    tr,
+  ]);
+
   const init = useCallback(async () => {
     try {
       const ep = await invoke<string | null>("get_saved_grpc_endpoint");
@@ -498,6 +580,66 @@ export function Dashboard() {
     };
   }, []);
 
+  const runPirateCliInstall = useCallback(
+    async (systemWide: boolean, info: PirateCliPathInfo | null) => {
+      setPirateCliAuthPromptOpen(false);
+      setPirateCliInstallResult(null);
+      setPirateCliInstallResultErr(false);
+      setPirateCliInstallBusy(true);
+      const swKind = info?.systemWideInstallAuthKind;
+      if (systemWide && swKind === "macos_admin") {
+        toast.message(
+          tr(
+            "Откройте появившееся окно Terminal и введите пароль там, когда увидите «Password:».",
+            "Switch to the Terminal window that opened and type your password when you see Password:.",
+          ),
+          { duration: 12_000 },
+        );
+      } else if (systemWide && swKind === "linux_pkexec") {
+        toast.message(
+          tr(
+            "Должен появиться системный запрос пароля (Polkit). Если его не видно — сверните PirateClient или откройте Mission Control.",
+            "A system password prompt (Polkit) should appear. If you do not see it, minimize PirateClient or open Mission Control.",
+          ),
+          { duration: 10_000 },
+        );
+      }
+      try {
+        const msg = await invoke<string>("install_pirate_cli", { systemWide });
+        const after = await invoke<PirateCliPathInfo>("pirate_cli_path_info");
+        if (!after.needsUpdate && after.firstOnPathDiffersFromUserBin && !systemWide) {
+          toast.message(
+            tr(
+              "Копия в каталоге пользователя обновлена. Откройте новый терминал или выполните hash -r / rehash, чтобы shell подхватил `pirate` из PATH.",
+              "Your user-local pirate binary is updated. Open a new terminal or run hash -r / rehash so the shell picks up PATH.",
+            ),
+            { duration: 14_000 },
+          );
+        }
+        if (after.needsUpdate) {
+          setPirateCliUpdateInfo(after);
+          setPirateCliInstallResultErr(false);
+          setPirateCliInstallResult(msg);
+          setPirateCliUpdatePromptOpen(true);
+        } else {
+          setPirateCliUpdatePromptOpen(false);
+          setPirateCliUpdateInfo(null);
+          setPirateCliInstallResultErr(false);
+          setPirateCliInstallResult(msg);
+        }
+      } catch (e) {
+        if (info) setPirateCliUpdateInfo(info);
+        setPirateCliInstallResultErr(true);
+        setPirateCliInstallResult(String(e));
+        setPirateCliUpdatePromptOpen(true);
+      } finally {
+        setPirateCliInstallBusy(false);
+        setPirateCliAuthPromptInfo(null);
+      }
+    },
+    [tr],
+  );
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -516,33 +658,10 @@ export function Dashboard() {
         const info = await invoke<PirateCliPathInfo>("pirate_cli_path_info");
         if (cancelled) return;
         if (info.needsUpdate) {
-          // Try to refresh PATH copy immediately so users get the new CLI right after app update.
           setPirateCliInstallResult(null);
           setPirateCliInstallResultErr(false);
-          setPirateCliInstallBusy(true);
-          try {
-            const msg = await invoke<string>("install_pirate_cli");
-            if (cancelled) return;
-            const after = await invoke<PirateCliPathInfo>("pirate_cli_path_info");
-            if (cancelled) return;
-            if (after.needsUpdate) {
-              setPirateCliUpdateInfo(after);
-              setPirateCliInstallResultErr(false);
-              setPirateCliInstallResult(msg);
-              setPirateCliUpdatePromptOpen(true);
-            } else {
-              setPirateCliUpdatePromptOpen(false);
-              setPirateCliUpdateInfo(null);
-            }
-          } catch (e) {
-            if (cancelled) return;
-            setPirateCliUpdateInfo(info);
-            setPirateCliInstallResultErr(true);
-            setPirateCliInstallResult(String(e));
-            setPirateCliUpdatePromptOpen(true);
-          } finally {
-            if (!cancelled) setPirateCliInstallBusy(false);
-          }
+          setPirateCliAuthPromptInfo(info);
+          setPirateCliAuthPromptOpen(true);
         }
       } catch {
         /* Tauri unavailable (browser dev) or command missing */
@@ -655,7 +774,14 @@ export function Dashboard() {
       return;
     }
     try {
-      await invoke<ServerBookmark>("add_server_bookmark", { url: pasted });
+      if (looksLikeInstallBundle(pasted)) {
+        const r = await invoke<GrpcConnectResult>("connect_grpc_bundle", { bundle: pasted });
+        setEndpoint(r.endpoint);
+        commitGrpcLive(r);
+        setGrpcErr(null);
+      } else {
+        await invoke<ServerBookmark>("add_server_bookmark", { url: pasted });
+      }
       setModalAddServerOpen(false);
       setAddUrlInput("");
       await loadBookmarks();
@@ -1266,6 +1392,28 @@ export function Dashboard() {
                                   ) : null}
                                 </p>
                               ) : null}
+                              {grpcAdvertisedMismatch ? (
+                                <div className="mt-2 rounded-lg border border-amber-700/40 bg-amber-950/25 px-2 py-2 text-[11px] leading-snug text-amber-100/95">
+                                  <p>
+                                    {tr(
+                                      "Сервер объявляет другой публичный gRPC URL (DEPLOY_GRPC_PUBLIC_URL). Пока вы на старом адресе, после его отключения соединение пропадёт.",
+                                      "The server advertises a different public gRPC URL (DEPLOY_GRPC_PUBLIC_URL). While you stay on the old address, the connection will break if that host stops working.",
+                                    )}
+                                  </p>
+                                  <p className="mt-1 break-all font-mono text-amber-200/90">{grpcAdvertisedMismatch}</p>
+                                  <button
+                                    type="button"
+                                    disabled={migrateGrpcBusy}
+                                    onClick={() => void onMigrateToAdvertisedGrpc()}
+                                    className={`${btnBase} mt-2 border border-amber-600/50 bg-amber-900/35 px-3 py-1.5 text-xs text-amber-50 hover:bg-amber-900/50 disabled:opacity-50`}
+                                  >
+                                    {migrateGrpcBusy ? (
+                                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                    ) : null}
+                                    {tr("Перейти на объявленный URL", "Switch to advertised URL")}
+                                  </button>
+                                </div>
+                              ) : null}
                             </div>
                           </div>
                           <button
@@ -1400,6 +1548,32 @@ export function Dashboard() {
                                 </span>
                               ) : null}
                             </div>
+                            {grpcAdvertisedMismatch ? (
+                              <div className="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-xs text-amber-100/95">
+                                <p className="font-medium text-amber-100">
+                                  {tr("Рассинхрон с DEPLOY_GRPC_PUBLIC_URL", "Mismatch with DEPLOY_GRPC_PUBLIC_URL")}
+                                </p>
+                                <p className="mt-1 text-slate-400">
+                                  {tr("Подключено:", "Connected:")}{" "}
+                                  <code className="break-all text-orange-200/85">{endpoint}</code>
+                                </p>
+                                <p className="mt-1 text-slate-400">
+                                  {tr("Сервер объявляет:", "Server advertises:")}{" "}
+                                  <code className="break-all text-emerald-200/85">{grpcAdvertisedMismatch}</code>
+                                </p>
+                                <button
+                                  type="button"
+                                  disabled={migrateGrpcBusy}
+                                  onClick={() => void onMigrateToAdvertisedGrpc()}
+                                  className={`${btnBase} mt-3 border border-amber-600/50 bg-amber-900/35 px-3 py-2 text-xs text-amber-50 hover:bg-amber-900/50 disabled:opacity-50`}
+                                >
+                                  {migrateGrpcBusy ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : null}
+                                  {tr("Перейти на объявленный URL", "Switch to advertised URL")}
+                                </button>
+                              </div>
+                            ) : null}
                           </div>
                         )}
                         <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
@@ -1628,6 +1802,107 @@ export function Dashboard() {
         </ModalDialog>
       ) : null}
 
+      {/* Modal: install / update CLI (default: user bin, no password; optional system-wide on macOS/Linux) */}
+      {pirateCliAuthPromptOpen && pirateCliAuthPromptInfo ? (
+        <ModalDialog
+          open
+          zClassName="z-modalConfirm"
+          onClose={() => {
+            setPirateCliAuthPromptOpen(false);
+            setPirateCliAuthPromptInfo(null);
+          }}
+          aria-labelledby="pirate-cli-auth-title"
+        >
+          <div className="rounded-2xl border border-white/10 bg-surface p-6 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-lg bg-sky-500/15 p-2 text-sky-200">
+                <Lock className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 id="pirate-cli-auth-title" className="text-lg font-semibold text-slate-100">
+                  {tr("Обновить команду pirate", "Update the pirate CLI")}
+                </h3>
+                <p className="mt-2 text-sm text-slate-400">
+                  {tr(
+                    "Копия CLI в каталоге приложения не совпадает с версией из этого клиента (автообновление не сработало или не завершилось).",
+                    "The managed CLI copy does not match this app (automatic sync did not finish or failed).",
+                  )}
+                </p>
+                <p className="mt-2 text-sm text-slate-300">
+                  {pirateCliInstallAuthExplainer("user_local", tr)}
+                </p>
+                {pirateCliAuthPromptInfo.systemWideInstallAuthKind ? (
+                  <p className="mt-2 text-sm text-slate-400">
+                    {pirateCliInstallAuthExplainer(
+                      pirateCliAuthPromptInfo.systemWideInstallAuthKind,
+                      tr,
+                    )}
+                  </p>
+                ) : null}
+                <dl className="mt-3 space-y-1 rounded-xl border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs text-slate-300">
+                  <div className="flex flex-wrap gap-x-2">
+                    <dt className="text-slate-500">{tr("В приложении", "Bundled")}</dt>
+                    <dd>{pirateCliAuthPromptInfo.bundledVersion ?? "—"}</dd>
+                  </div>
+                  <div className="flex flex-wrap gap-x-2">
+                    <dt className="text-slate-500">{tr("Каталог пользователя", "User install")}</dt>
+                    <dd>{pirateCliAuthPromptInfo.userBinVersion ?? "—"}</dd>
+                  </div>
+                  {pirateCliAuthPromptInfo.userBinPath ? (
+                    <div className="break-all text-slate-500">{pirateCliAuthPromptInfo.userBinPath}</div>
+                  ) : null}
+                  <div className="flex flex-wrap gap-x-2">
+                    <dt className="text-slate-500">{tr("В терминале (PATH)", "On PATH")}</dt>
+                    <dd>{pirateCliAuthPromptInfo.pathVersion ?? "—"}</dd>
+                  </div>
+                </dl>
+              </div>
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                disabled={pirateCliInstallBusy}
+                onClick={() => void runPirateCliInstall(false, pirateCliAuthPromptInfo)}
+                className={`${btnBase} bg-gradient-to-r from-sky-700 to-sky-950 text-white shadow-md shadow-sky-950/50 disabled:opacity-60`}
+              >
+                {pirateCliInstallBusy ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Terminal className="h-4 w-4" />
+                )}
+                {tr("Установить без пароля", "Install without password")}
+              </button>
+              {pirateCliAuthPromptInfo.systemWideInstallAuthKind ? (
+                <button
+                  type="button"
+                  disabled={pirateCliInstallBusy}
+                  onClick={() => void runPirateCliInstall(true, pirateCliAuthPromptInfo)}
+                  className={`${btnBase} border border-amber-500/40 bg-amber-950/30 text-amber-100 hover:bg-amber-950/45 disabled:opacity-60`}
+                >
+                  {pirateCliInstallBusy ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Lock className="h-4 w-4" />
+                  )}
+                  {tr("В /usr/local/bin (пароль)", "To /usr/local/bin (password)")}
+                </button>
+              ) : null}
+              <button
+                type="button"
+                disabled={pirateCliInstallBusy}
+                onClick={() => {
+                  setPirateCliAuthPromptOpen(false);
+                  setPirateCliAuthPromptInfo(null);
+                }}
+                className={`${btnBase} border border-white/10 bg-white/5`}
+              >
+                {tr("Позже", "Later")}
+              </button>
+            </div>
+          </div>
+        </ModalDialog>
+      ) : null}
+
       {/* Modal: pirate CLI missing from PATH */}
       {pirateCliPromptOpen ? (
         <ModalDialog
@@ -1650,6 +1925,12 @@ export function Dashboard() {
                   <code className="rounded bg-black/30 px-1">pirate auth</code> {t("auto.Dashboard_tsx.40")}{" "}
                   <code className="rounded bg-black/30 px-1">pirate</code>{" "}
                   {t("auto.Dashboard_tsx.41")}
+                </p>
+                <p className="mt-2 text-sm text-slate-500">
+                  {tr(
+                    "Клиент копирует `pirate` в каталог пользователя и добавляет его в PATH — без sudo и без pkexec. Откройте новый терминал после установки.",
+                    "The client copies `pirate` to your user folder and updates your PATH — no sudo or pkexec. Open a new terminal after install.",
+                  )}
                 </p>
                 {pirateCliInstallResult ? (
                   <p
@@ -1674,7 +1955,7 @@ export function Dashboard() {
                   setPirateCliInstallBusy(true);
                   void (async () => {
                     try {
-                      const msg = await invoke<string>("install_pirate_cli");
+                      const msg = await invoke<string>("install_pirate_cli", { systemWide: false });
                       setPirateCliInstallResultErr(false);
                       setPirateCliInstallResult(msg);
                       const ok = await invoke<boolean>("is_pirate_cli_available");
@@ -1741,8 +2022,14 @@ export function Dashboard() {
                 </h3>
                 <p className="mt-2 text-sm text-slate-400">
                   {tr(
-                    "В PATH всё ещё старая версия CLI. Обновите установку, чтобы она совпадала с этим приложением.",
-                    "The CLI on your PATH is still an older build. Refresh the install so it matches this app.",
+                    "Копия CLI в каталоге пользователя или первая команда `pirate` в PATH не совпадает с этим приложением.",
+                    "Your user-local CLI copy or the first `pirate` on PATH does not match this app.",
+                  )}
+                </p>
+                <p className="mt-2 text-sm text-slate-500">
+                  {tr(
+                    "После обновления клиента откройте новый терминал (или hash -r). Если первым в PATH остаётся старый файл (например /usr/local/bin/pirate), можно обновить только пользовательскую копию или записать в /usr/local/bin (пароль).",
+                    "After updating the app, open a new terminal (or hash -r). If an old path stays first on PATH (e.g. /usr/local/bin/pirate), refresh the user-local copy or install system-wide (password).",
                   )}
                 </p>
                 <dl className="mt-3 space-y-1 rounded-xl border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs text-slate-300">
@@ -1750,6 +2037,13 @@ export function Dashboard() {
                     <dt className="text-slate-500">{tr("В приложении", "Bundled")}</dt>
                     <dd>{pirateCliUpdateInfo.bundledVersion ?? "—"}</dd>
                   </div>
+                  <div className="flex flex-wrap gap-x-2">
+                    <dt className="text-slate-500">{tr("Каталог пользователя", "User install")}</dt>
+                    <dd>{pirateCliUpdateInfo.userBinVersion ?? "—"}</dd>
+                  </div>
+                  {pirateCliUpdateInfo.userBinPath ? (
+                    <div className="break-all text-slate-500">{pirateCliUpdateInfo.userBinPath}</div>
+                  ) : null}
                   <div className="flex flex-wrap gap-x-2">
                     <dt className="text-slate-500">{tr("В терминале (PATH)", "On PATH")}</dt>
                     <dd>{pirateCliUpdateInfo.pathVersion ?? "—"}</dd>
@@ -1780,24 +2074,7 @@ export function Dashboard() {
                 onClick={() => {
                   setPirateCliInstallResult(null);
                   setPirateCliInstallResultErr(false);
-                  setPirateCliInstallBusy(true);
-                  void (async () => {
-                    try {
-                      const msg = await invoke<string>("install_pirate_cli");
-                      setPirateCliInstallResultErr(false);
-                      setPirateCliInstallResult(msg);
-                      const info = await invoke<PirateCliPathInfo>("pirate_cli_path_info");
-                      if (!info.needsUpdate) {
-                        setPirateCliUpdatePromptOpen(false);
-                        setPirateCliUpdateInfo(null);
-                      }
-                    } catch (e) {
-                      setPirateCliInstallResultErr(true);
-                      setPirateCliInstallResult(String(e));
-                    } finally {
-                      setPirateCliInstallBusy(false);
-                    }
-                  })();
+                  void runPirateCliInstall(false, pirateCliUpdateInfo);
                 }}
                 className={`${btnBase} bg-gradient-to-r from-amber-700 to-amber-950 text-white shadow-md shadow-amber-950/50 disabled:opacity-60`}
               >
@@ -1806,8 +2083,27 @@ export function Dashboard() {
                 ) : (
                   <RefreshCw className="h-4 w-4" />
                 )}
-                {tr("Обновить pirate в PATH", "Update pirate in PATH")}
+                {tr("Обновить pirate (без пароля)", "Update pirate (no password)")}
               </button>
+              {pirateCliUpdateInfo.systemWideInstallAuthKind ? (
+                <button
+                  type="button"
+                  disabled={pirateCliInstallBusy}
+                  onClick={() => {
+                    setPirateCliInstallResult(null);
+                    setPirateCliInstallResultErr(false);
+                    void runPirateCliInstall(true, pirateCliUpdateInfo);
+                  }}
+                  className={`${btnBase} border border-amber-500/40 bg-amber-950/30 text-amber-100 hover:bg-amber-950/45 disabled:opacity-60`}
+                >
+                  {pirateCliInstallBusy ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Lock className="h-4 w-4" />
+                  )}
+                  {tr("В /usr/local/bin (пароль)", "To /usr/local/bin (password)")}
+                </button>
+              ) : null}
               <button
                 type="button"
                 disabled={pirateCliInstallBusy}

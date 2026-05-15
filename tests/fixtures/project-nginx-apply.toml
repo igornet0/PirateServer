@@ -1,0 +1,29 @@
+[project]
+name = "e2e-nginx-project"
+version = "1.0.0"
+deploy_project_id = "p-e2enginxapply01"
+
+[services.web]
+type = "http"
+port = 3000
+source = "test"
+confidence = 1.0
+
+[proxy]
+type = "nginx"
+port = 3000
+enabled = true
+backend = ""
+
+[proxy.routes]
+"/" = "127.0.0.1:3000"
+
+[network]
+mode = "wan"
+
+[network.access]
+public = true
+domain = "e2e-project.example.test"
+
+[network.tls]
+https = false

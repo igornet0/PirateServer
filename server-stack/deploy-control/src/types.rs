@@ -418,6 +418,25 @@ pub struct NginxPutResponseView {
     pub reload_output: Option<String>,
 }
 
+/// `POST /api/v1/projects/:project_id/nginx/apply` request body.
+#[derive(Debug, Deserialize)]
+pub struct ProjectNginxApplyBody {
+    pub manifest_toml: String,
+}
+
+/// Result of applying a per-project nginx vhost on the host.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectNginxApplyView {
+    pub ok: bool,
+    pub path: String,
+    pub enabled: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 // --- Nginx inventory / universal API (pirate-nginx-ops) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

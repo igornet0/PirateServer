@@ -1,5 +1,6 @@
 //! Named server URLs (several targets on the operator PC).
 
+use deploy_client::config::load_connection;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
@@ -31,9 +32,15 @@ fn normalize_url(s: &str) -> String {
     s.trim().trim_end_matches('/').to_string()
 }
 
-/// One-time copy of `connection` pairing into the matching bookmark row (upgrade path).
+/// One-time copy of current pairing into the matching bookmark row (upgrade path).
 fn migrate_connection_pairing_into_bookmarks_once() {
     MIGRATE_PAIRING_FROM_CONNECTION.call_once(|| {
+        if let Some(c) = load_connection() {
+            if c.paired && !c.url.trim().is_empty() && !c.server_pubkey_b64.trim().is_empty() {
+                let _ = set_bookmark_pairing_inner(&normalize_url(&c.url), c.server_pubkey_b64);
+                return;
+            }
+        }
         let Ok(c) = desktop_store::open() else {
             return;
         };
@@ -248,4 +255,74 @@ pub fn set_bookmark_label(id: &str, label: String) -> Result<(), String> {
         .ok_or_else(|| "bookmark not found".to_string())?;
     upsert_bookmark(label, url)?;
     Ok(())
+}
+
+/// After changing `DEPLOY_GRPC_PUBLIC_URL` on the host, point the saved bookmark + pairing at `new_url`
+/// (same server identity). Drops other rows already using `new_url` unless they share the same pubkey.
+pub fn migrate_bookmark_url_keep_pairing(
+    old_url: &str,
+    new_url: &str,
+    server_pubkey_b64: &str,
+) -> Result<(), String> {
+    let old_n = normalize_url(old_url);
+    let new_n = normalize_url(new_url);
+    let pk = server_pubkey_b64.trim().to_string();
+    if pk.is_empty() {
+        return Err("missing server public key for migration".into());
+    }
+    if old_n.is_empty() || new_n.is_empty() {
+        return Err("old or new gRPC URL is empty".into());
+    }
+    migrate_connection_pairing_into_bookmarks_once();
+    let mut list = load_bookmarks_raw();
+
+    let old_ids: Vec<String> = list
+        .iter()
+        .filter(|b| normalize_url(&b.url) == old_n)
+        .map(|b| b.id.clone())
+        .collect();
+    let primary_id = old_ids.first().cloned();
+    if old_ids.len() > 1 {
+        let keep = old_ids[0].clone();
+        list.retain(|b| normalize_url(&b.url) != old_n || b.id == keep);
+    }
+
+    for b in &list {
+        if normalize_url(&b.url) != new_n {
+            continue;
+        }
+        if b.paired {
+            let op = b.server_pubkey_b64.as_deref().unwrap_or("").trim();
+            if !op.is_empty() && op != pk {
+                return Err(
+                    "another bookmark already uses the new gRPC URL with a different server identity"
+                        .into(),
+                );
+            }
+        }
+    }
+
+    list.retain(|b| normalize_url(&b.url) != new_n);
+
+    if let Some(pid) = primary_id {
+        let b = list
+            .iter_mut()
+            .find(|b| b.id == pid)
+            .ok_or_else(|| "bookmark disappeared during migration".to_string())?;
+        b.url = new_n.clone();
+        b.paired = true;
+        b.server_pubkey_b64 = Some(pk.clone());
+    } else {
+        list.push(ServerBookmark {
+            id: new_id(),
+            label: new_n.clone(),
+            url: new_n.clone(),
+            server_pubkey_b64: Some(pk),
+            paired: true,
+            host_agent_base_url: None,
+            host_agent_token: None,
+        });
+    }
+
+    save_bookmarks(&list)
 }

@@ -14,3 +14,7 @@
 1. Собрать проект и артефакт на ПК.
 2. Выполнить pair с сервером и проверить статус.
 3. Загрузить артефакт и запустить deploy через gRPC/control API.
+
+## Версия `pirate` в терминале
+
+После обновления приложения `pirate --version` в shell может показывать старый `client=`, если в `PATH` осталась прежняя копия бинарника. Диагностика и решение: [client README (раздел Pirate CLI version and PATH)](../../../local-stack/client/README.md#pirate-cli-version-and-path).

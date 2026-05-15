@@ -98,7 +98,7 @@ pub struct ServerProjectsOverview {
     pub error: Option<String>,
 }
 
-fn normalize_base(base: &str) -> String {
+pub(crate) fn normalize_base(base: &str) -> String {
     base.trim().trim_end_matches('/').to_string()
 }
 
@@ -1231,6 +1231,100 @@ pub fn control_api_ensure_nginx(mode: &str) -> Result<String, String> {
         ));
     }
     resp.text().map_err(|e| e.to_string())
+}
+
+/// `POST /api/v1/projects/:id/nginx/apply` — write per-project vhost on the host from `pirate.toml`.
+pub fn control_api_apply_project_nginx(project_dir: &Path) -> Result<String, String> {
+    let manifest_path = project_dir.join("pirate.toml");
+    let manifest_toml = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let m = PirateManifest::read_file(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let project_id = m.project.deploy_target_project_id();
+    deploy_core::validate_project_id(&project_id).map_err(|e| e.to_string())?;
+
+    let base =
+        load_control_api_base().ok_or_else(|| "control-api base URL is not set".to_string())?;
+    let base = normalize_base(&base);
+    let token = bearer()?;
+    let url = format!("{}/api/v1/projects/{}/nginx/apply", base, project_id);
+    let body = serde_json::json!({ "manifest_toml": manifest_toml });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => {
+            let Some(fb) = load_control_api_direct_url() else {
+                return Err(fmt_reqwest_send_err(e, &url));
+            };
+            let fb = normalize_base(&fb);
+            if fb == base {
+                return Err(fmt_reqwest_send_err(e, &url));
+            }
+            if direct_url_likely_loopback_for_remote_client(&fb) {
+                let mut m = fmt_reqwest_send_err(e, &url);
+                m.push_str(" — GetStatus direct control-api URL is loopback; set DEPLOY_CONTROL_API_DIRECT_URL on the server or use SSH port-forward to :8080.");
+                return Err(m);
+            }
+            let url2 = format!("{}/api/v1/projects/{}/nginx/apply", fb, project_id);
+            client
+                .post(&url2)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&body)
+                .send()
+                .map_err(|e2| {
+                    format!(
+                        "primary base failed ({}), retried with GetStatus direct URL {}: {}",
+                        fmt_reqwest_send_err(e, &url),
+                        fb,
+                        fmt_reqwest_send_err(e2, &url2)
+                    )
+                })?
+        }
+        Err(e) => return Err(fmt_reqwest_send_err(e, &url)),
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let _ = clear_control_api_jwt();
+        return Err("control-api returned 401; sign in again".into());
+    }
+    let text = resp.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "project nginx apply HTTP {}: {}",
+            status,
+            text.chars().take(400).collect::<String>()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct ApplyView {
+        ok: bool,
+        path: String,
+        message: String,
+        #[serde(default)]
+        warnings: Vec<String>,
+    }
+    let v: ApplyView = serde_json::from_str(&text).map_err(|e| format!("invalid JSON: {e}: {text}"))?;
+    if !v.ok {
+        return Err(if v.message.is_empty() {
+            format!("project nginx apply failed at {}", v.path)
+        } else {
+            format!("{} (path: {})", v.message, v.path)
+        });
+    }
+    let mut msg = format!("OK: {} — {}", v.path, v.message);
+    if !v.warnings.is_empty() {
+        msg.push_str("\nWarnings: ");
+        msg.push_str(&v.warnings.join("; "));
+    }
+    Ok(msg)
 }
 
 /// `GET /api/v1/nginx/sites` — full inventory JSON (`NginxSitesView`).

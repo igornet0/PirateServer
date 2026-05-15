@@ -36,8 +36,9 @@ pub use host_services::{
 };
 pub use nginx::{
     apply_nginx_inventory_file_put, apply_nginx_put, apply_nginx_site_via_sudo,
-    collect_nginx_status, ensure_nginx_via_sudo, generate_nginx_server_config, nginx_route_conflicts,
-    parse_nginx_inventory_path, read_nginx_config, read_nginx_inventory_file, read_nginx_site_file,
+    apply_project_nginx_vhost, collect_nginx_status, ensure_nginx_via_sudo,
+    generate_nginx_server_config, nginx_route_conflicts, parse_nginx_inventory_path,
+    project_nginx_site_path, read_nginx_config, read_nginx_inventory_file, read_nginx_site_file,
     NginxPutOutcome,
 };
 pub use nginx_probe::{
@@ -81,7 +82,7 @@ pub use types::{
     NetworkDetail,     NginxActionBody, NginxActionPostCheckView, NginxActionResponseView, NginxConfigPut, NginxConfigView, NginxEnsureView,
     NginxEnvUpdateView, NginxEnvVarUpdateView, NginxPreflightProposed, NginxPreflightView,
     NginxFilePut, NginxProblemView, NginxPutResponseView, NginxSiteEntryView, NginxSitesView,
-    NginxStatusView,
+    NginxStatusView, ProjectNginxApplyBody, ProjectNginxApplyView,
     ProcessControlView,
     ProcessCpu, ProcessDisk, ProcessMem, ProcessRow, ProcessesDetail, ProjectNginxSnippetView,
     ProjectTelemetryLogLine, ProjectTelemetryView, ProjectView, ProjectsView, ReleasesView,

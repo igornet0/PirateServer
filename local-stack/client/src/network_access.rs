@@ -234,6 +234,28 @@ pub fn apply_detected_services_to_manifest(
     }
 }
 
+/// Resolve UI/manifest route target (`web:3000`, `127.0.0.1:3000`) to nginx upstream `host:port`.
+pub fn resolve_proxy_route_upstream(target: &str) -> Result<String, String> {
+    let t = target.trim();
+    let Some((host, port_s)) = t.rsplit_once(':') else {
+        return Err(format!("invalid proxy route target `{target}`"));
+    };
+    let host = host.trim();
+    let port: u16 = port_s
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid port in proxy route target `{target}`"))?;
+    if port == 0 {
+        return Err(format!("invalid port in proxy route target `{target}`"));
+    }
+    let upstream_host = match host.to_ascii_lowercase().as_str() {
+        "web" | "api" | "127.0.0.1" | "localhost" | "::1" => "127.0.0.1",
+        other if !other.is_empty() => host,
+        _ => return Err(format!("invalid proxy route target `{target}`")),
+    };
+    Ok(format!("{upstream_host}:{port}"))
+}
+
 pub fn generate_proxy_config(manifest: &PirateManifest, server_name: &str) -> Result<String, String> {
     let mut routes = manifest.proxy.routes.clone();
     if routes.is_empty() {
@@ -253,22 +275,17 @@ pub fn generate_proxy_config(manifest: &PirateManifest, server_name: &str) -> Re
     }
     let mut blocks = String::new();
     for (path, target) in routes {
-        let mut split = target.split(':');
-        let host = split.next().unwrap_or("");
-        let port = split.next().unwrap_or("");
-        if host.is_empty() || port.is_empty() {
-            return Err(format!("invalid proxy route target `{target}`"));
-        }
+        let upstream = resolve_proxy_route_upstream(&target)?;
         blocks.push_str(&format!(
             r#"
     location {} {{
-        proxy_pass http://{}:{};
+        proxy_pass http://{};
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }}
 "#,
-            path, host, port
+            path, upstream
         ));
     }
     Ok(format!(
@@ -333,5 +350,22 @@ pub fn validate_deploy(manifest: &PirateManifest, occupied_ports: &[u16]) -> Dep
         allow: blockers.is_empty(),
         blockers,
         warnings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_proxy_route_upstream_web_port() {
+        assert_eq!(
+            resolve_proxy_route_upstream("web:3000").unwrap(),
+            "127.0.0.1:3000"
+        );
+        assert_eq!(
+            resolve_proxy_route_upstream("api:8080").unwrap(),
+            "127.0.0.1:8080"
+        );
     }
 }

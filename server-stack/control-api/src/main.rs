@@ -31,7 +31,8 @@ use deploy_auth::{
 };
 use deploy_control::{
     apply_nginx_inventory_file_put, apply_nginx_put, apply_nginx_site_via_sudo,
-    apply_nginx_universal_action, collect_host_service_runtime_config, collect_host_services,
+    apply_nginx_universal_action, apply_project_nginx_vhost, collect_host_service_runtime_config,
+    collect_host_services,
     collect_nginx_sites, collect_nginx_status, ensure_nginx_via_sudo, host_service_action_via_sudo,
     host_service_apply_runtime_via_sudo, host_service_restart_runtime_via_sudo,
     parse_nginx_inventory_path, preflight_nginx,
@@ -43,7 +44,8 @@ use deploy_control::{
     HostStatsHistory, MemoryDetail, NginxActionBody, NginxActionResponseView, NginxConfigPut,
     NginxConfigView, NginxEnsureView, NginxEnvUpdateView, NginxEnvVarUpdateView, NginxFilePut,
     NginxPreflightProposed, NginxPreflightView, NginxPutResponseView, NginxSitesView, NginxStatusView,
-    NetworkDetail, ProcessControlView, ProcessesDetail, ProjectsView, RollbackBody, RollbackView,
+    NetworkDetail, ProcessControlView, ProcessesDetail, ProjectNginxApplyBody, ProjectNginxApplyView,
+    ProjectsView, RollbackBody, RollbackView,
     SeriesResponse,
 };
 use deploy_core::{validate_project_id, validate_version};
@@ -2153,6 +2155,32 @@ async fn api_nginx_action(
     Ok(Json(v))
 }
 
+async fn api_project_nginx_apply(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(body): Json<ProjectNginxApplyBody>,
+) -> Result<Json<ProjectNginxApplyView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    validate_project_id(&project_id).map_err(|e| ApiError::bad_request(e))?;
+    let _g = s
+        .nginx_action_lock
+        .lock()
+        .map_err(|_| ApiError::internal("nginx action lock poisoned"))?;
+    let sites_dir = s
+        .nginx_site_path
+        .parent()
+        .ok_or_else(|| ApiError::internal("nginx_site_path has no parent"))?;
+    let v = apply_project_nginx_vhost(
+        &project_id,
+        body.manifest_toml.trim(),
+        sites_dir,
+        &s.nginx_apply_site_script,
+        &s.nginx_ops_script,
+    )?;
+    Ok(Json(v))
+}
+
 async fn api_nginx_ensure(
     State(s): State<ApiState>,
     headers: HeaderMap,
@@ -2899,6 +2927,10 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/v1/projects/:project_id/deploy-artifact",
             post(api_deploy_artifact_multipart),
+        )
+        .route(
+            "/api/v1/projects/:project_id/nginx/apply",
+            post(api_project_nginx_apply),
         )
         .route("/api/v1/history", get(api_history))
         .route("/api/v1/grpc-sessions", get(api_grpc_sessions))

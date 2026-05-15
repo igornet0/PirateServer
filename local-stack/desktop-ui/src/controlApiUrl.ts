@@ -1,7 +1,7 @@
 /**
  * Best-effort control-api HTTP base from a deploy-server gRPC URL.
- * Standard gRPC port `:50051` is mapped to control-api `:8080` (same as server `derive_control_api_url_from_grpc`).
- * Other authorities without a port stay host-only (nginx on :80 / :443).
+ * Standard gRPC port `:50051` → control-api `:8080` for plain HTTP (direct bind).
+ * HTTPS gRPC URLs map to host-only (nginx on :443). Other authorities without a port stay host-only.
  */
 export function suggestControlApiFromGrpcUrl(endpoint: string): string | null {
   const s = endpoint.trim();
@@ -37,6 +37,10 @@ export function suggestControlApiFromGrpcUrl(endpoint: string): string | null {
   }
 
   if (strippedStandardGrpc) {
+    // HTTPS gRPC URL usually means public nginx on :443, not loopback :8080.
+    if (isHttps) {
+      return `${scheme}://${authority}`;
+    }
     return `${scheme}://${authority}:8080`;
   }
   return `${scheme}://${authority}`;
