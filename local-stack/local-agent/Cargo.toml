@@ -1,6 +1,6 @@
 [package]
 name = "local-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Placeholder for workstation gateway (see docs/LOCAL_STACK_DESIGN.md)"
 autobins = false
@@ -12,5 +12,5 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
