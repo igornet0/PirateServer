@@ -184,7 +184,10 @@ fn migrate_connection_control_api(c: &Connection) -> Result<(), rusqlite::Error>
             [],
         )?;
     }
-    if !cols.iter().any(|n| n == "control_api_recent_restart_until_ms") {
+    if !cols
+        .iter()
+        .any(|n| n == "control_api_recent_restart_until_ms")
+    {
         c.execute(
             "ALTER TABLE connection ADD COLUMN control_api_recent_restart_until_ms INTEGER NOT NULL DEFAULT 0",
             [],
@@ -198,4 +201,3 @@ fn migrate_connection_control_api(c: &Connection) -> Result<(), rusqlite::Error>
     }
     Ok(())
 }
-

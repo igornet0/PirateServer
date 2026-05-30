@@ -5,8 +5,8 @@
 //! those fields for legacy UI queries; app-only columns (control-api JWT, etc.) stay in SQLite.
 
 use deploy_auth::{
-    attach_auth_metadata, load_or_create_identity, pair_request_canonical, pubkey_b64_url,
-    verify_pair_response, ConnectionBundle, now_unix_ms,
+    attach_auth_metadata, load_or_create_identity, now_unix_ms, pair_request_canonical,
+    pubkey_b64_url, verify_pair_response, ConnectionBundle,
 };
 use deploy_client::config::{
     self as client_config, load_connection, save_connection, StoredConnection,
@@ -18,9 +18,12 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Once;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{LazyLock, Once};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use parking_lot::Mutex;
+use tonic::transport::Endpoint;
 use tonic::Request;
 
 use crate::bookmarks::bookmark_pairing_pubkey_for_url;
@@ -30,6 +33,29 @@ static UNIFIED_CONFIG_MIGRATE: Once = Once::new();
 
 const CONTROL_API_BASE_MODE_AUTO: &str = "auto";
 const CONTROL_API_BASE_MODE_MANUAL: &str = "manual";
+const GRPC_STATUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const GRPC_STATUS_RPC_TIMEOUT: Duration = Duration::from_secs(6);
+const GRPC_STATUS_TOTAL_TIMEOUT: Duration = Duration::from_secs(7);
+const GRPC_VERIFY_CACHE_TTL: Duration = Duration::from_secs(8);
+
+static GRPC_VERIFY_CACHE: LazyLock<Mutex<HashMap<String, (GrpcConnectResult, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Attach signed gRPC metadata when paired (shared by host_stats, ssl_ops).
+pub fn grpc_attach_if_paired<T>(
+    req: &mut Request<T>,
+    endpoint: &str,
+    method: &str,
+    project_id: &str,
+) -> Result<(), String> {
+    match load_signing_key_for_endpoint(endpoint) {
+        Ok(None) => Ok(()),
+        Ok(Some(sk)) => {
+            attach_auth_metadata(req, &sk, method, project_id, "").map_err(|e| e.to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,7 +84,8 @@ fn default_project_id() -> String {
 }
 
 fn signing_identity_path() -> Result<PathBuf, String> {
-    client_config::identity_path().ok_or_else(|| "no config directory for pirate-client".to_string())
+    client_config::identity_path()
+        .ok_or_else(|| "no config directory for pirate-client".to_string())
 }
 
 fn legacy_desktop_identity_path() -> PathBuf {
@@ -79,9 +106,7 @@ pub fn ensure_unified_client_config_migrated() {
 }
 
 fn canon_connection_covers_signed_grpc(c: &StoredConnection) -> bool {
-    c.paired
-        && !c.url.trim().is_empty()
-        && !c.server_pubkey_b64.trim().is_empty()
+    c.paired && !c.url.trim().is_empty() && !c.server_pubkey_b64.trim().is_empty()
 }
 
 fn mirror_connection_row_to_sqlite(c: &StoredConnection) -> Result<(), String> {
@@ -116,16 +141,15 @@ fn load_legacy_sqlite_grpc_row() -> Option<(String, Option<String>, bool, String
     let mut stmt = db
         .prepare("SELECT url, server_pubkey_b64, paired, project_id FROM connection WHERE id = 1")
         .ok()?;
-    stmt
-        .query_row([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, i64>(2)? != 0,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .ok()
+    stmt.query_row([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, i64>(2)? != 0,
+            row.get::<_, String>(3)?,
+        ))
+    })
+    .ok()
 }
 
 fn migrate_legacy_identity_file_if_needed() -> Result<(), String> {
@@ -266,16 +290,9 @@ pub fn parse_grpc_endpoint_from_bundle(text: &str) -> Result<String, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let rest = line
-            .strip_prefix("export ")
-            .unwrap_or(line)
-            .trim();
+        let rest = line.strip_prefix("export ").unwrap_or(line).trim();
         if let Some(val) = rest.strip_prefix("GRPC_ENDPOINT=") {
-            let v = val
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim();
+            let v = val.trim().trim_matches('"').trim_matches('\'').trim();
             if v.starts_with("http://") || v.starts_with("https://") {
                 return Ok(normalize_endpoint(v));
             }
@@ -312,7 +329,8 @@ fn apply_control_api_hint_from_status(r: &StatusResponse) {
     if current.as_ref().map(|s| normalize_endpoint(s)) == Some(chosen.clone()) {
         return;
     }
-    if current.is_some() && load_control_api_base_mode().as_deref() == Some(CONTROL_API_BASE_MODE_MANUAL)
+    if current.is_some()
+        && load_control_api_base_mode().as_deref() == Some(CONTROL_API_BASE_MODE_MANUAL)
     {
         return;
     }
@@ -377,35 +395,48 @@ pub fn load_signing_key_for_endpoint(endpoint: &str) -> Result<Option<SigningKey
 pub fn verify_grpc_endpoint(endpoint: &str) -> Result<GrpcConnectResult, String> {
     validate_endpoint(endpoint)?;
     let endpoint = normalize_endpoint(endpoint);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    rt.block_on(async move {
-        let mut client = DeployServiceClient::connect(endpoint.clone())
-            .await
-            .map_err(|e| format!("connect failed: {e}"))?;
-        let pid = load_project_id();
-        let mut req = Request::new(StatusRequest {
-            project_id: pid.clone(),
-        });
-        if client_config::use_signed_requests(&endpoint) {
-            let sk = load_or_create_identity(&signing_identity_path()?).map_err(|e| e.to_string())?;
-            attach_auth_metadata(&mut req, &sk, "GetStatus", &pid, "").map_err(|e| e.to_string())?;
+    crate::tokio_runtime::block_on(async move {
+        let status_check = async move {
+            let ep = Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| format!("invalid endpoint: {e}"))?
+                .connect_timeout(GRPC_STATUS_CONNECT_TIMEOUT)
+                .timeout(GRPC_STATUS_RPC_TIMEOUT);
+            let channel = match ep.connect().await {
+                Ok(channel) => channel,
+                Err(e) => return Err(format!("connect failed: {e}")),
+            };
+            let mut client = DeployServiceClient::new(channel);
+            let pid = load_project_id();
+            let mut req = Request::new(StatusRequest {
+                project_id: pid.clone(),
+            });
+            if client_config::use_signed_requests(&endpoint) {
+                let sk = load_or_create_identity(&signing_identity_path()?)
+                    .map_err(|e| e.to_string())?;
+                attach_auth_metadata(&mut req, &sk, "GetStatus", &pid, "")
+                    .map_err(|e| e.to_string())?;
+            }
+            let r: StatusResponse = match client.get_status(req).await {
+                Ok(resp) => resp.into_inner(),
+                Err(e) => return Err(format!("GetStatus failed: {e}")),
+            };
+            Ok(grpc_connect_result(endpoint, r))
+        };
+        match tokio::time::timeout(GRPC_STATUS_TOTAL_TIMEOUT, status_check).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "gRPC status check timed out after {}s",
+                GRPC_STATUS_TOTAL_TIMEOUT.as_secs()
+            )),
         }
-        let r: StatusResponse = client
-            .get_status(req)
-            .await
-            .map_err(|e| format!("GetStatus failed: {e}"))?
-            .into_inner();
-        Ok(grpc_connect_result(endpoint, r))
     })
 }
 
 /// GetStatus for a specific deploy `project_id` (uses saved gRPC endpoint).
 /// Safe to `.await` from Tauri / existing Tokio runtime (unlike [`verify_grpc_status_for_project`]).
-pub async fn verify_grpc_status_for_project_async(project_id: &str) -> Result<GrpcConnectResult, String> {
+pub async fn verify_grpc_status_for_project_async(
+    project_id: &str,
+) -> Result<GrpcConnectResult, String> {
     let endpoint = load_endpoint().ok_or_else(|| "no saved endpoint".to_string())?;
     validate_endpoint(&endpoint)?;
     let endpoint = normalize_endpoint(&endpoint);
@@ -434,11 +465,18 @@ pub async fn verify_grpc_status_for_project_async(project_id: &str) -> Result<Gr
 /// Uses a dedicated runtime + `block_on` — **do not** call from async code that already runs on Tokio
 /// (e.g. inside `async fn` Tauri commands); use [`verify_grpc_status_for_project_async`] instead.
 pub fn verify_grpc_status_for_project(project_id: &str) -> Result<GrpcConnectResult, String> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(verify_grpc_status_for_project_async(project_id))
+    let pid = deploy_core::normalize_project_id(project_id);
+    {
+        let cache = GRPC_VERIFY_CACHE.lock();
+        if let Some((r, t)) = cache.get(&pid) {
+            if t.elapsed() < GRPC_VERIFY_CACHE_TTL {
+                return Ok(r.clone());
+            }
+        }
+    }
+    let result = crate::tokio_runtime::block_on(verify_grpc_status_for_project_async(project_id))?;
+    GRPC_VERIFY_CACHE.lock().insert(pid, (result.clone(), Instant::now()));
+    Ok(result)
 }
 
 pub fn save_endpoint(endpoint: &str) -> Result<(), String> {
@@ -506,6 +544,15 @@ pub fn load_control_api_base() -> Option<String> {
 /// Persist control-api HTTP base (e.g. `http://192.168.0.30:8080`). Empty string clears.
 /// Changing the base URL clears a stored control-api JWT (session is host-specific).
 pub fn set_control_api_base(url: &str) -> Result<(), String> {
+    let t = url.trim();
+    if !t.is_empty() {
+        validate_endpoint(t)?;
+    }
+    let new_base = normalize_endpoint(t);
+    let old = load_control_api_base();
+    if old.as_ref().map(|s| s.as_str()) == Some(new_base.as_str()) {
+        return Ok(());
+    }
     set_control_api_base_with_mode(url, CONTROL_API_BASE_MODE_MANUAL)
 }
 
@@ -698,12 +745,7 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
     let msg = pair_request_canonical(&client_pub, &b.server_pubkey_b64, ts_ms, &nonce, &pairing);
     let client_sig = deploy_auth::sign_bytes(&sk, &msg);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    rt.block_on(async move {
+    crate::tokio_runtime::block_on(async move {
         let mut client = DeployServiceClient::connect(b.url.clone())
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
@@ -760,7 +802,10 @@ pub fn connect_from_bundle(bundle: &str) -> Result<GrpcConnectResult, String> {
 }
 
 /// Copy deploy pairing from `old_url` to `new_url`, persist [`StoredConnection`], then verify with `GetStatus`.
-pub fn migrate_grpc_public_endpoint(old_url: &str, new_url: &str) -> Result<GrpcConnectResult, String> {
+pub fn migrate_grpc_public_endpoint(
+    old_url: &str,
+    new_url: &str,
+) -> Result<GrpcConnectResult, String> {
     ensure_unified_client_config_migrated();
     let old_n = normalize_endpoint(old_url);
     let new_n = normalize_endpoint(new_url);

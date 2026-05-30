@@ -114,8 +114,9 @@ pub fn internet_proxy_start(listen: Option<String>) -> Result<(), String> {
         return Err("gRPC URL must start with http:// or https://".into());
     }
 
-    let sk = load_signing_key_for_endpoint(ep)?
-        .ok_or_else(|| "pair with the server first (signed gRPC required for ProxyTunnel)".to_string())?;
+    let sk = load_signing_key_for_endpoint(ep)?.ok_or_else(|| {
+        "pair with the server first (signed gRPC required for ProxyTunnel)".to_string()
+    })?;
 
     let snap = ensure_settings_loaded()?;
     let pool = pool();
@@ -194,7 +195,8 @@ pub fn load_settings_json() -> Result<String, String> {
 
 /// Replace `settings.json` (validates JSON shape). File watcher reloads compiled rules if proxy was started.
 pub fn save_settings_json(text: &str) -> Result<(), String> {
-    let parsed: SettingsFile = serde_json::from_str(text).map_err(|e| format!("invalid settings: {e}"))?;
+    let parsed: SettingsFile =
+        serde_json::from_str(text).map_err(|e| format!("invalid settings: {e}"))?;
     let path = default_settings_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -316,17 +318,13 @@ pub fn load_board_rules_form() -> Result<BoardRulesForm, String> {
     } else {
         sf.default_board.clone()
     };
-    let cfg = sf
-        .boards
-        .get(&board_id)
-        .cloned()
-        .unwrap_or_default();
+    let cfg = sf.boards.get(&board_id).cloned().unwrap_or_default();
     Ok(BoardRulesForm {
         traffic_rule_source: sf.global.traffic_rule_source.clone(),
         default_board: board_id.clone(),
         board_id,
         global_bypass: sf.global.bypass.clone(),
-        bypass: cfg.bypass
+        bypass: cfg.bypass,
     })
 }
 

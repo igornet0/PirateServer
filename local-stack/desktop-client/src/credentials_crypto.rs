@@ -40,7 +40,9 @@ impl fmt::Display for CryptoError {
             CryptoError::UnsupportedVersion(v) => write!(f, "unsupported envelope version {v}"),
             CryptoError::UnknownAlgorithm(a) => write!(f, "unknown algorithm {a}"),
             CryptoError::InvalidBase64 => write!(f, "invalid base64 in envelope"),
-            CryptoError::InvalidNonceLen => write!(f, "invalid nonce length (expected {NONCE_LEN})"),
+            CryptoError::InvalidNonceLen => {
+                write!(f, "invalid nonce length (expected {NONCE_LEN})")
+            }
             CryptoError::Decrypt => write!(f, "AES-GCM decrypt failed (wrong key or corrupt data)"),
             CryptoError::Encrypt => write!(f, "AES-GCM encrypt failed"),
         }
@@ -87,7 +89,9 @@ fn restrict_key_file_permissions(path: &Path) {
 fn restrict_key_file_permissions(_path: &Path) {}
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| "credential key path has no parent".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "credential key path has no parent".to_string())?;
     let _ = std::fs::create_dir_all(parent);
     let tmp = path.with_extension("key.tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("write temp credential key: {e}"))?;

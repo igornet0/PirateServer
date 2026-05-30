@@ -6,17 +6,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
-use std::time::Duration;
-
 fn normalize_base(s: &str) -> String {
     s.trim().trim_end_matches('/').to_string()
 }
 
-fn client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()
-        .map_err(|e| e.to_string())
+fn client() -> Result<&'static Client, String> {
+    crate::http_client::host_agent_client()
 }
 
 fn auth_header(token: &str) -> Result<HeaderMap, String> {
@@ -41,7 +36,11 @@ pub fn host_agent_health_json(base_url: &str) -> Result<String, String> {
     let status = r.status();
     let text = r.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status, text.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            text.chars().take(500).collect::<String>()
+        ));
     }
     Ok(text)
 }
@@ -65,7 +64,11 @@ pub fn host_agent_status_json(base_url: &str, token: &str) -> Result<String, Str
     let status = r.status();
     let text = r.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status, text.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            text.chars().take(500).collect::<String>()
+        ));
     }
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("JSON: {e}"))?;
     serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
@@ -93,10 +96,7 @@ pub fn host_agent_reboot_json(
         return Err("host agent token is empty".into());
     }
     let url = format!("{}/v1/reboot", base);
-    let body = RebootBody {
-        delay_sec,
-        reason,
-    };
+    let body = RebootBody { delay_sec, reason };
     let c = client()?;
     let r = c
         .post(&url)
@@ -107,7 +107,11 @@ pub fn host_agent_reboot_json(
     let status = r.status();
     let text = r.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status, text.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            text.chars().take(500).collect::<String>()
+        ));
     }
     Ok(text)
 }
@@ -154,7 +158,11 @@ pub fn host_agent_upload_server_stack(
     let status = r.status();
     let text = r.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status, text.chars().take(800).collect::<String>()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            text.chars().take(800).collect::<String>()
+        ));
     }
     Ok(text)
 }

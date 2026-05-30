@@ -1,6 +1,6 @@
 [package]
 name = "pirate-desktop"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Pirate Client desktop shared library (Tauri backend helpers)"
 autobins = false
@@ -14,36 +14,39 @@ deploy-client = { path = "../client" }
 deploy-auth = { path = "../../server-stack/deploy-auth" }
 deploy-core = { path = "../../server-stack/deploy-core" }
 
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-dirs = "5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
 deploy-proto = { path = "../../proto" }
 ed25519-dalek = "2"
-rand_core = { version = "0.6", features = ["getrandom"] }
+rand_core = { workspace = true }
 tonic = { version = "0.12", features = ["transport"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
-sysinfo = "0.32"
-futures-util = "0.3"
+sysinfo = { workspace = true }
+futures-util = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
-parking_lot = "0.12"
-tracing = "0.1"
+parking_lot = { workspace = true }
+tracing = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.12", features = ["json", "blocking", "multipart"] }
-hex = "0.4"
-sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "multipart", "rustls-tls", "http2", "charset", "macos-system-configuration"] }
+hex = { workspace = true }
+sha2 = { workspace = true }
 urlencoding = "2"
 keyring = "2"
 aes-gcm = "0.10"
-base64 = "0.22"
+base64 = { workspace = true }
 fs4 = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "tls-rustls-ring"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [features]
-default = []
+default = ["direct-pg", "direct-mysql", "direct-redis"]
+direct-pg = []
+direct-mysql = []
+direct-redis = []

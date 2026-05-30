@@ -5,6 +5,7 @@ use deploy_client::{
     scan_project, test_local_docker, validate_version_label, ScanReport, StepResult,
 };
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::connection::{load_endpoint, load_project_id, load_signing_key_for_endpoint};
@@ -38,12 +39,18 @@ pub fn run_scan_project(path: PathBuf, dry_run: bool) -> Result<ScanReport, Stri
     scan_project(&path, dry_run)
 }
 
-pub fn run_project_build(path: PathBuf) -> Result<StepResult, String> {
-    run_build(&path)
+pub fn run_project_build(
+    path: PathBuf,
+    cmd_vars: Option<BTreeMap<String, String>>,
+) -> Result<StepResult, String> {
+    run_build(&path, cmd_vars.as_ref())
 }
 
-pub fn run_project_test(path: PathBuf) -> Result<StepResult, String> {
-    run_test(&path)
+pub fn run_project_test(
+    path: PathBuf,
+    cmd_vars: Option<BTreeMap<String, String>>,
+) -> Result<StepResult, String> {
+    run_test(&path, cmd_vars.as_ref())
 }
 
 pub fn run_test_local(path: PathBuf, image: String) -> Result<StepResult, String> {
@@ -62,6 +69,7 @@ pub fn run_pipeline(
     skip_test_local: bool,
     version: Option<String>,
     chunk_size: usize,
+    cmd_vars: Option<BTreeMap<String, String>>,
 ) -> Result<PipelineOutcome, String> {
     let mut out = PipelineOutcome {
         init_path: None,
@@ -76,13 +84,13 @@ pub fn run_pipeline(
         out.init_path = Some(p.display().to_string());
     }
     out.scan = Some(scan_project(&path, false)?);
-    let b = run_build(&path)?;
+    let b = run_build(&path, cmd_vars.as_ref())?;
     if !b.ok {
         out.build = Some(b);
         return Ok(out);
     }
     out.build = Some(b);
-    let t = run_test(&path)?;
+    let t = run_test(&path, cmd_vars.as_ref())?;
     if !t.ok {
         out.test = Some(t);
         return Ok(out);
@@ -93,7 +101,8 @@ pub fn run_pipeline(
     }
     let ver = version.unwrap_or_else(default_version);
     validate_version_label(&ver).map_err(|e| e.to_string())?;
-    let endpoint = load_endpoint().ok_or_else(|| "no saved connection; connect first".to_string())?;
+    let endpoint =
+        load_endpoint().ok_or_else(|| "no saved connection; connect first".to_string())?;
     let sk = load_signing_key_for_endpoint(&endpoint)?;
     let project = load_project_id();
     let rt = runtime()?;

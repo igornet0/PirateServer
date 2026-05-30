@@ -119,10 +119,11 @@ fn atomic_write_json(path: &Path, doc: &CredentialFile) -> Result<(), String> {
         .ok_or_else(|| "credentials path has no parent directory".to_string())?;
     let _ = std::fs::create_dir_all(parent);
     let tmp = path.with_extension("tmp");
-    let body = serde_json::to_string_pretty(doc)
-        .map_err(|e| format!("serialize credentials: {e}"))?;
+    let body =
+        serde_json::to_string_pretty(doc).map_err(|e| format!("serialize credentials: {e}"))?;
     {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("write temp credentials: {e}"))?;
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("write temp credentials: {e}"))?;
         f.write_all(body.as_bytes())
             .map_err(|e| format!("write temp credentials: {e}"))?;
         f.sync_all()
@@ -222,7 +223,8 @@ pub fn db_credentials_save(
                 let prev = doc.instances.get(instance_id).and_then(|r| r.enc.clone());
                 if prev.is_none() {
                     return Err(
-                        "enter a database password, or use Forget to clear saved credentials".into(),
+                        "enter a database password, or use Forget to clear saved credentials"
+                            .into(),
                     );
                 }
                 prev

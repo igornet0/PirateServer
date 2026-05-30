@@ -43,57 +43,52 @@ fn run_tcp_server(
     listener: TcpListener,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
-        .name(format!("pirate-db-fwd-{}", id.chars().take(12).collect::<String>()))
-        .spawn(move || {
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((local, _)) => {
-                        let r = match TcpStream::connect(addr) {
-                            Ok(x) => x,
-                            Err(_) => continue,
-                        };
-                        if let (Ok(mut l1), Ok(mut l2), Ok(mut r1), Ok(mut r2)) = (
-                            local.try_clone(),
-                            local.try_clone(),
-                            r.try_clone(),
-                            r.try_clone(),
-                        ) {
-                            thread::spawn(move || {
-                                let _ = io::copy(&mut l1, &mut r2);
-                            });
-                            thread::spawn(move || {
-                                let _ = io::copy(&mut r1, &mut l2);
-                            });
-                        }
+        .name(format!(
+            "pirate-db-fwd-{}",
+            id.chars().take(12).collect::<String>()
+        ))
+        .spawn(move || loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match listener.accept() {
+                Ok((local, _)) => {
+                    let r = match TcpStream::connect(addr) {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
+                    if let (Ok(mut l1), Ok(mut l2), Ok(mut r1), Ok(mut r2)) = (
+                        local.try_clone(),
+                        local.try_clone(),
+                        r.try_clone(),
+                        r.try_clone(),
+                    ) {
+                        thread::spawn(move || {
+                            let _ = io::copy(&mut l1, &mut r2);
+                        });
+                        thread::spawn(move || {
+                            let _ = io::copy(&mut r1, &mut l2);
+                        });
                     }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(_) if stop.load(Ordering::Relaxed) => break,
-                    Err(_) => thread::sleep(Duration::from_millis(50)),
                 }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) if stop.load(Ordering::Relaxed) => break,
+                Err(_) => thread::sleep(Duration::from_millis(50)),
             }
         })
         .expect("pirate db forward thread")
 }
 
 /// Returns local port. Replaces an existing entry with the same `id`.
-pub fn db_tunnel_tcp_start(
-    id: String,
-    target_host: &str,
-    target_port: u16,
-) -> Result<u16, String> {
+pub fn db_tunnel_tcp_start(id: String, target_host: &str, target_port: u16) -> Result<u16, String> {
     let addr: SocketAddr = format!("{target_host}:{target_port}")
         .parse()
         .map_err(|e: std::net::AddrParseError| e.to_string())?;
     let target = format!("{target_host}:{target_port}");
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let stop = Arc::new(AtomicBool::new(false));
     let s2 = stop.clone();
@@ -173,12 +168,10 @@ pub fn db_tunnel_list_json() -> Result<String, String> {
         let mut g = ssh_map()
             .lock()
             .map_err(|_| "forward state lock".to_string())?;
-        g.retain(|_id, t| {
-            match t.child.try_wait() {
-                Ok(None) => true,
-                Ok(Some(_)) => false,
-                Err(_) => true,
-            }
+        g.retain(|_id, t| match t.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(_) => true,
         });
         for (id, t) in g.iter() {
             out.push(
@@ -274,20 +267,16 @@ pub fn db_tunnel_ssh_start(
             cmd.arg("-i").arg(p);
         }
     }
-    let child = cmd.spawn().map_err(|e| {
-        format!(
-            "failed to start ssh (is OpenSSH in PATH?). {e}"
-        )
-    })?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start ssh (is OpenSSH in PATH?). {e}"))?;
     let t = SshTunnel {
         child,
         local_port,
         ssh_target: ssh_target.clone(),
         remote: format!("{remote_host}:{remote_port}"),
     };
-    let mut g = ssh_map()
-        .lock()
-        .map_err(|_| "ssh map lock".to_string())?;
+    let mut g = ssh_map().lock().map_err(|_| "ssh map lock".to_string())?;
     if let Some(mut old) = g.insert(id, t) {
         let _ = old.child.kill();
         let _ = old.child.wait();
@@ -297,9 +286,7 @@ pub fn db_tunnel_ssh_start(
 
 /// Stop a sidecar SSH by id; best-effort `kill` on the child.
 pub fn db_tunnel_ssh_stop(id: &str) -> Result<(), String> {
-    let mut g = ssh_map()
-        .lock()
-        .map_err(|_| "ssh map lock".to_string())?;
+    let mut g = ssh_map().lock().map_err(|_| "ssh map lock".to_string())?;
     if let Some(mut t) = g.remove(id) {
         let _ = t.child.kill();
         let _ = t.child.wait();

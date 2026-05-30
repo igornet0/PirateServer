@@ -1,6 +1,5 @@
 //! Remote host metrics via `GetHostStats` / `GetHostStatsDetail` (deploy-server gRPC).
 
-use deploy_auth::attach_auth_metadata;
 use deploy_proto::deploy::{
     host_stats_detail_response::Detail as DetailOneof, CpuDetailProto, DiskDetailProto,
     HostStatsDetailKind, HostStatsDetailRequest, HostStatsDetailResponse, HostStatsRequest,
@@ -10,22 +9,7 @@ use deploy_proto::DeployServiceClient;
 use serde_json::{json, Value};
 use tonic::Request;
 
-use crate::connection::{load_endpoint, load_project_id, load_signing_key_for_endpoint};
-
-fn attach_if_paired<T>(
-    req: &mut Request<T>,
-    endpoint: &str,
-    method: &str,
-    project_id: &str,
-) -> Result<(), String> {
-    match load_signing_key_for_endpoint(endpoint) {
-        Ok(None) => Ok(()),
-        Ok(Some(sk)) => {
-            attach_auth_metadata(req, &sk, method, project_id, "").map_err(|e| e.to_string())
-        }
-        Err(e) => Err(e),
-    }
-}
+use crate::connection::{grpc_attach_if_paired, load_endpoint, load_project_id};
 
 fn map_host_stats(r: &HostStatsResponse) -> Value {
     json!({
@@ -158,18 +142,16 @@ fn map_detail_response(r: &HostStatsDetailResponse) -> Result<Value, String> {
         DetailOneof::Memory(p) => json!({ "kind": "memory", "data": map_memory_detail(p) }),
         DetailOneof::Disk(p) => json!({ "kind": "disk", "data": map_disk_detail(p) }),
         DetailOneof::Network(p) => json!({ "kind": "network", "data": map_network_detail(p) }),
-        DetailOneof::Processes(p) => json!({ "kind": "processes", "data": map_processes_detail(p) }),
+        DetailOneof::Processes(p) => {
+            json!({ "kind": "processes", "data": map_processes_detail(p) })
+        }
     })
 }
 
 /// JSON string matching server-stack `HostStatsView` shape (snake_case keys).
 pub fn fetch_host_stats_json() -> Result<String, String> {
     let endpoint = load_endpoint().ok_or_else(|| "no saved gRPC endpoint".to_string())?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(async move {
+    crate::tokio_runtime::block_on(async move {
         let mut client = DeployServiceClient::connect(endpoint.clone())
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
@@ -177,7 +159,7 @@ pub fn fetch_host_stats_json() -> Result<String, String> {
         let mut req = Request::new(HostStatsRequest {
             project_id: pid.clone(),
         });
-        attach_if_paired(&mut req, &endpoint, "GetHostStats", &pid)?;
+        grpc_attach_if_paired(&mut req, &endpoint, "GetHostStats", &pid)?;
         let r = client
             .get_host_stats(req)
             .await
@@ -198,11 +180,7 @@ pub fn fetch_host_stats_detail_json(
         return Err("kind is required".into());
     }
     let endpoint = load_endpoint().ok_or_else(|| "no saved gRPC endpoint".to_string())?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(async move {
+    crate::tokio_runtime::block_on(async move {
         let mut client = DeployServiceClient::connect(endpoint.clone())
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
@@ -214,7 +192,7 @@ pub fn fetch_host_stats_detail_json(
             q,
             limit,
         });
-        attach_if_paired(&mut req, &endpoint, "GetHostStatsDetail", &pid)?;
+        grpc_attach_if_paired(&mut req, &endpoint, "GetHostStatsDetail", &pid)?;
         let r = client
             .get_host_stats_detail(req)
             .await

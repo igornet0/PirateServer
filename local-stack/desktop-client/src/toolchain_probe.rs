@@ -34,7 +34,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn command_output_timeout(program: &str, args: &[&str], timeout_ms: u64) -> Option<std::process::Output> {
+fn command_output_timeout(
+    program: &str,
+    args: &[&str],
+    timeout_ms: u64,
+) -> Option<std::process::Output> {
     let (tx, rx) = std::sync::mpsc::channel();
     let program = program.to_string();
     let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
@@ -77,7 +81,13 @@ fn first_line_version(out: &std::process::Output) -> Option<String> {
     Some(s)
 }
 
-fn probe_simple(id: &'static str, label: &str, program: &str, args: &[&str], hint: String) -> ToolchainItem {
+fn probe_simple(
+    id: &'static str,
+    label: &str,
+    program: &str,
+    args: &[&str],
+    hint: String,
+) -> ToolchainItem {
     let out = command_output_timeout(program, args, 2500);
     let (installed, versions) = match &out {
         Some(o) if o.status.success() => {
@@ -116,26 +126,57 @@ fn probe_multi_simple(
     args: &[&str],
     hint: String,
 ) -> ToolchainItem {
-    let mut versions = Vec::new();
-    for prog in programs {
-        if let Some(line) = version_line_for_program(prog.as_str(), args) {
-            versions.push(line);
+    probe_multi_parallel(id, label, programs, args, hint)
+}
+
+/// Same semantics as [`probe_multi_simple`], but version probes run concurrently
+/// (`node` installs often register many candidate paths sequentially slow).
+fn probe_multi_parallel(
+    id: &'static str,
+    label: &str,
+    programs: &[String],
+    args: &[&str],
+    hint: String,
+) -> ToolchainItem {
+    if programs.is_empty() {
+        return ToolchainItem {
+            id,
+            label: label.to_string(),
+            installed: false,
+            versions: Vec::new(),
+            install_hint: hint,
+        };
+    }
+
+    std::thread::scope(|sp| {
+        let handles: Vec<_> = programs
+            .iter()
+            .map(|prog| {
+                let prog = prog.clone();
+                sp.spawn(move || version_line_for_program(prog.as_str(), args))
+            })
+            .collect();
+
+        let mut versions = Vec::new();
+        for h in handles {
+            match h.join() {
+                Ok(Some(line)) => versions.push(line),
+                _ => {}
+            }
         }
-    }
-    versions = dedupe_versions_preserve_order(versions);
-    let installed = !versions.is_empty();
-    ToolchainItem {
-        id,
-        label: label.to_string(),
-        installed,
-        versions,
-        install_hint: hint,
-    }
+        versions = dedupe_versions_preserve_order(versions);
+        let installed = !versions.is_empty();
+        ToolchainItem {
+            id,
+            label: label.to_string(),
+            installed,
+            versions,
+            install_hint: hint,
+        }
+    })
 }
 
 fn probe_python_versions(hint: String) -> ToolchainItem {
-    let mut versions = Vec::new();
-
     const PY_NAMES: &[&str] = &[
         "python3.14",
         "python3.13",
@@ -147,11 +188,23 @@ fn probe_python_versions(hint: String) -> ToolchainItem {
         "python3",
         "python",
     ];
-    for &name in PY_NAMES {
-        if let Some(line) = version_line_for_program(name, &["--version"]) {
-            versions.push(line);
+
+    let mut versions: Vec<String> = std::thread::scope(|sp| {
+        let handles: Vec<_> = PY_NAMES
+            .iter()
+            .copied()
+            .map(|name| sp.spawn(|| version_line_for_program(name, &["--version"])))
+            .collect();
+
+        let mut out = Vec::new();
+        for h in handles {
+            match h.join() {
+                Ok(Some(line)) => out.push(line),
+                _ => {}
+            }
         }
-    }
+        out
+    });
 
     // pyenv: one line per installed version (no duplicate --version spam).
     if let Some(out) = command_output_timeout("pyenv", &["versions", "--bare"], 1500) {
@@ -170,7 +223,11 @@ fn probe_python_versions(hint: String) -> ToolchainItem {
     #[cfg(windows)]
     {
         if let Some(out) = command_output_timeout("py", &["-0"], 2500) {
-            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
             for line in text.lines() {
                 let line = line.trim();
                 if line.contains("-V:") || line.contains("Python ") {
@@ -240,7 +297,8 @@ fn probe_node_versions(hint: String) -> ToolchainItem {
 fn hint_node() -> String {
     #[cfg(target_os = "macos")]
     {
-        "macOS: brew install node или https://nodejs.org/ . nvm: https://github.com/nvm-sh/nvm".into()
+        "macOS: brew install node или https://nodejs.org/ . nvm: https://github.com/nvm-sh/nvm"
+            .into()
     }
     #[cfg(target_os = "windows")]
     {
@@ -259,7 +317,8 @@ fn hint_docker() -> String {
     }
     #[cfg(target_os = "windows")]
     {
-        "Windows: Docker Desktop — https://docs.docker.com/desktop/setup/install/windows-install/".into()
+        "Windows: Docker Desktop — https://docs.docker.com/desktop/setup/install/windows-install/"
+            .into()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -305,92 +364,107 @@ fn hint_redis_cli() -> String {
     "macOS: brew install redis. Или используйте redis в Docker (redis:7-alpine).".into()
 }
 
-/// Probe common CLI tools; no network; missing binary => `installed: false`.
-pub fn probe_local_toolchain() -> ToolchainReport {
-    let mut items: Vec<ToolchainItem> = Vec::new();
-
-    items.push(probe_simple(
-        "docker",
-        "Docker",
-        "docker",
-        &["--version"],
-        hint_docker(),
-    ));
-
-    items.push(probe_simple(
-        "docker_compose",
-        "Docker Compose (plugin)",
-        "docker",
-        &["compose", "version"],
-        "Docker Compose v2 входит в Docker Desktop. Старый бинарник: pip install docker-compose".into(),
-    ));
-
-    items.push(probe_simple(
-        "docker_compose_v1",
-        "docker-compose (standalone)",
-        "docker-compose",
-        &["--version"],
-        "Нужен только если нет `docker compose`. pip install docker-compose или Docker Desktop".into(),
-    ));
-
-    items.push(probe_node_versions(hint_node()));
-
-    items.push(probe_simple(
-        "npm",
-        "npm",
-        "npm",
-        &["--version"],
-        "Устанавливается вместе с Node.js".into(),
-    ));
-
-    items.push(probe_python_versions(hint_python()));
-
-    items.push(probe_simple(
-        "go",
-        "Go",
-        "go",
-        &["version"],
-        hint_go(),
-    ));
-
-    // nginx -v writes to stderr, often exit 0
-    items.push(probe_simple(
-        "nginx",
-        "nginx",
-        "nginx",
-        &["-v"],
-        hint_nginx(),
-    ));
-
+fn probe_postgres_clients() -> ToolchainItem {
+    let h = hint_psql();
     let psql = probe_simple(
         "psql",
         "psql (PostgreSQL client)",
         "psql",
         &["--version"],
-        hint_psql(),
+        h.clone(),
     );
     if psql.installed {
-        items.push(psql);
+        psql
     } else {
-        items.push(probe_simple(
-            "pg_config",
-            "pg_config",
-            "pg_config",
-            &["--version"],
-            hint_psql(),
-        ));
+        probe_simple("pg_config", "pg_config", "pg_config", &["--version"], h)
     }
+}
 
-    items.push(probe_simple(
-        "redis_cli",
-        "redis-cli",
-        "redis-cli",
-        &["--version"],
-        hint_redis_cli(),
-    ));
+/// Probe common CLI tools; no network; missing binary => `installed: false`.
+pub fn probe_local_toolchain() -> ToolchainReport {
+    let dock_hint = hint_docker();
 
-    ToolchainReport {
-        items,
-        generated_at_ms: now_ms(),
-    }
+    std::thread::scope(|sp| {
+        let t_docker = sp.spawn(|| {
+            probe_simple(
+                "docker",
+                "Docker",
+                "docker",
+                &["--version"],
+                dock_hint.clone(),
+            )
+        });
+
+        let t_compose_plugin = sp.spawn(|| {
+            probe_simple(
+                "docker_compose",
+                "Docker Compose (plugin)",
+                "docker",
+                &["compose", "version"],
+                "Docker Compose v2 входит в Docker Desktop. Старый бинарник: pip install docker-compose"
+                    .into(),
+            )
+        });
+
+        let t_compose_standalone = sp.spawn(|| {
+            probe_simple(
+                "docker_compose_v1",
+                "docker-compose (standalone)",
+                "docker-compose",
+                &["--version"],
+                "Нужен только если нет `docker compose`. pip install docker-compose или Docker Desktop"
+                    .into(),
+            )
+        });
+
+        let t_node = sp.spawn(|| probe_node_versions(hint_node()));
+
+        let t_npm = sp.spawn(|| {
+            probe_simple(
+                "npm",
+                "npm",
+                "npm",
+                &["--version"],
+                "Устанавливается вместе с Node.js".into(),
+            )
+        });
+
+        let t_python = sp.spawn(|| probe_python_versions(hint_python()));
+
+        let t_go = sp.spawn(|| probe_simple("go", "Go", "go", &["version"], hint_go()));
+
+        let t_nginx = sp.spawn(|| probe_simple("nginx", "nginx", "nginx", &["-v"], hint_nginx()));
+
+        let t_psql_client = sp.spawn(probe_postgres_clients);
+
+        let t_redis = sp.spawn(|| {
+            probe_simple(
+                "redis_cli",
+                "redis-cli",
+                "redis-cli",
+                &["--version"],
+                hint_redis_cli(),
+            )
+        });
+
+        let items = vec![
+            t_docker.join().expect("docker probe panic"),
+            t_compose_plugin.join().expect("docker compose probe panic"),
+            t_compose_standalone
+                .join()
+                .expect("docker-compose v1 probe panic"),
+            t_node.join().expect("node probe panic"),
+            t_npm.join().expect("npm probe panic"),
+            t_python.join().expect("python probe panic"),
+            t_go.join().expect("go probe panic"),
+            t_nginx.join().expect("nginx probe panic"),
+            t_psql_client.join().expect("psql probe panic"),
+            t_redis.join().expect("redis probe panic"),
+        ];
+
+        ToolchainReport {
+            items,
+            generated_at_ms: now_ms(),
+        }
+    })
 }

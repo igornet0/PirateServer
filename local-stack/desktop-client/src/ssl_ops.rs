@@ -4,7 +4,6 @@
 //! Server settings → **SSL**; **Refresh** lists certs; **Create** with dry-run + staging;
 //! **Check and renew** without `force_all`; **SSL scheduler** block saves host env with JWT.
 
-use deploy_auth::attach_auth_metadata;
 use deploy_proto::deploy::{
     SslCheckAndRenewRequest, SslCreateRequest, SslDomainSpec, SslStatusRequest, SslUpdateRequest,
     SslUpdateSelector,
@@ -13,24 +12,9 @@ use deploy_proto::DeployServiceClient;
 use serde_json::{json, Value};
 use tonic::Request;
 
-use crate::connection::load_signing_key_for_endpoint;
+use crate::connection::grpc_attach_if_paired;
 use deploy_client::config::normalize_endpoint;
 use deploy_core::normalize_project_id;
-
-fn attach_if_paired<T>(
-    req: &mut Request<T>,
-    endpoint: &str,
-    method: &str,
-    project_id: &str,
-) -> Result<(), String> {
-    match load_signing_key_for_endpoint(endpoint) {
-        Ok(None) => Ok(()),
-        Ok(Some(sk)) => {
-            attach_auth_metadata(req, &sk, method, project_id, "").map_err(|e| e.to_string())
-        }
-        Err(e) => Err(e),
-    }
-}
 
 fn post_check_to_v(p: &deploy_proto::deploy::SslPostCheckResult) -> Value {
     let details: Vec<Value> = p
@@ -80,11 +64,7 @@ pub fn ssl_status_json(grpc_url: &str, project_id: &str) -> Result<String, Strin
     if endpoint.is_empty() {
         return Err("empty gRPC URL".into());
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(async move {
+    crate::tokio_runtime::block_on(async move {
         let mut client = DeployServiceClient::connect(endpoint.clone())
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
@@ -93,7 +73,7 @@ pub fn ssl_status_json(grpc_url: &str, project_id: &str) -> Result<String, Strin
             include_paths: true,
             project_id: pid.clone(),
         });
-        attach_if_paired(&mut req, &endpoint, "SslStatus", &pid)?;
+        grpc_attach_if_paired(&mut req, &endpoint, "SslStatus", &pid)?;
         let r = client
             .ssl_status(req)
             .await
@@ -126,11 +106,7 @@ pub fn ssl_create_json(
         return Err("at least one domain is required".into());
     }
     let pid = normalize_project_id(project_id);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(async move {
+    crate::tokio_runtime::block_on(async move {
         let mut client = DeployServiceClient::connect(endpoint.clone())
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
@@ -142,10 +118,8 @@ pub fn ssl_create_json(
             webroot_path: webroot_path.to_string(),
             project_id: pid.clone(),
         };
-        let mut req = Request::new(SslCreateRequest {
-            spec: Some(spec),
-        });
-        attach_if_paired(&mut req, &endpoint, "SslCreate", &pid)?;
+        let mut req = Request::new(SslCreateRequest { spec: Some(spec) });
+        grpc_attach_if_paired(&mut req, &endpoint, "SslCreate", &pid)?;
         let r = client
             .ssl_create(req)
             .await
@@ -182,11 +156,7 @@ pub fn ssl_update_json(
     if sel_count != 1 {
         return Err("specify exactly one of exact_domain, glob_pattern, regex".into());
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(async move {
+    crate::tokio_runtime::block_on(async move {
         let mut client = DeployServiceClient::connect(endpoint.clone())
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
@@ -202,7 +172,7 @@ pub fn ssl_update_json(
             staging: false,
             project_id: pid.clone(),
         });
-        attach_if_paired(&mut req, &endpoint, "SslUpdate", &pid)?;
+        grpc_attach_if_paired(&mut req, &endpoint, "SslUpdate", &pid)?;
         let r = client
             .ssl_update(req)
             .await
@@ -229,11 +199,7 @@ pub fn ssl_check_and_renew_json(
         return Err("empty gRPC URL".into());
     }
     let pid = normalize_project_id(project_id);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(async move {
+    crate::tokio_runtime::block_on(async move {
         let mut client = DeployServiceClient::connect(endpoint.clone())
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
@@ -241,7 +207,7 @@ pub fn ssl_check_and_renew_json(
             force_all,
             project_id: pid.clone(),
         });
-        attach_if_paired(&mut req, &endpoint, "SslCheckAndRenew", &pid)?;
+        grpc_attach_if_paired(&mut req, &endpoint, "SslCheckAndRenew", &pid)?;
         let r = client
             .ssl_check_and_renew(req)
             .await

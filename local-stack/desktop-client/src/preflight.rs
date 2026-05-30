@@ -1,8 +1,11 @@
 //! Structured preflight checks for the Projects / deploy flow (desktop UI).
 
 use crate::connection::{load_endpoint, load_signing_key_for_endpoint};
-use crate::host_services_compat::{summarize_host_services_for_manifest, HostServicesCompatSummary};
+use crate::host_services_compat::{
+    summarize_host_services_for_manifest, HostServicesCompatSummary,
+};
 use deploy_client::validate_version_label;
+use deploy_core::manifest_diagnose::{diagnose_manifest, network_access_summary};
 use deploy_core::pirate_project::PirateManifest;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -16,6 +19,12 @@ pub struct PreflightItem {
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +67,55 @@ fn suggest_control_api_from_grpc(endpoint: &str) -> Option<String> {
     Some(out)
 }
 
+fn push_network_checks(checks: &mut Vec<PreflightItem>, manifest: &PirateManifest) {
+    let issues = diagnose_manifest(manifest);
+    let blocking: Vec<_> = issues.iter().filter(|i| i.blocking).collect();
+    let fixable: Vec<_> = issues
+        .iter()
+        .filter(|i| i.auto_fixable && !i.blocking)
+        .collect();
+
+    if blocking.is_empty() && fixable.is_empty() {
+        checks.push(PreflightItem {
+            id: "network_access",
+            ok: true,
+            title: "Network & Access".to_string(),
+            detail: network_access_summary(manifest),
+            hint: None,
+            field: None,
+            fix_id: None,
+            fix_label: None,
+        });
+        return;
+    }
+
+    for issue in blocking {
+        checks.push(PreflightItem {
+            id: "network_access",
+            ok: false,
+            title: "Network & Access".to_string(),
+            detail: issue.message.clone(),
+            hint: Some(issue.hint.clone()),
+            field: Some(issue.field.clone()),
+            fix_id: None,
+            fix_label: None,
+        });
+    }
+
+    for issue in fixable {
+        checks.push(PreflightItem {
+            id: "network_access",
+            ok: false,
+            title: "Network & Access".to_string(),
+            detail: issue.message.clone(),
+            hint: Some(issue.hint.clone()),
+            field: Some(issue.field.clone()),
+            fix_id: Some(issue.id.to_string()),
+            fix_label: Some(issue.fix_label.clone()),
+        });
+    }
+}
+
 /// Run checks before deploy / pipeline (no network except optional gRPC verify is skipped here).
 pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPreflightReport {
     let mut checks: Vec<PreflightItem> = Vec::new();
@@ -71,8 +129,12 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
             id: "connection",
             ok: false,
             title: "Соединение с deploy-server".to_string(),
-            detail: "Нет сохранённого gRPC endpoint. Откройте вкладку «Соединение» и подключитесь.".to_string(),
+            detail: "Нет сохранённого gRPC endpoint. Откройте вкладку «Соединение» и подключитесь."
+                .to_string(),
             hint: Some("Вставьте install JSON или URL в мастере подключения.".to_string()),
+            field: None,
+            fix_id: None,
+            fix_label: None,
         });
     } else {
         checks.push(PreflightItem {
@@ -81,6 +143,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
             title: "Соединение с deploy-server".to_string(),
             detail: format!("Endpoint: {ep_str}"),
             hint: None,
+            field: None,
+            fix_id: None,
+            fix_label: None,
         });
     }
 
@@ -96,6 +161,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                     title: "Ключ подписи (pairing)".to_string(),
                     detail: "Найден ключ для этого сервера.".to_string(),
                     hint: None,
+                    field: None,
+                    fix_id: None,
+                    fix_label: None,
                 });
             }
             Ok(None) => {
@@ -104,7 +172,13 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                     ok: false,
                     title: "Ключ подписи (pairing)".to_string(),
                     detail: "Нет ключа Ed25519 для подписи deploy.".to_string(),
-                    hint: Some("Выполните `pirate auth` с install JSON или подключитесь через мастер.".to_string()),
+                    hint: Some(
+                        "Выполните `pirate auth` с install JSON или подключитесь через мастер."
+                            .to_string(),
+                    ),
+                    field: None,
+                    fix_id: None,
+                    fix_label: None,
                 });
             }
             Err(err) => {
@@ -114,6 +188,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                     title: "Ключ подписи (pairing)".to_string(),
                     detail: err,
                     hint: None,
+                    field: None,
+                    fix_id: None,
+                    fix_label: None,
                 });
             }
         }
@@ -128,6 +205,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                 title: "Метка версии".to_string(),
                 detail: format!("`{version}` допустима."),
                 hint: None,
+                field: None,
+                fix_id: None,
+                fix_label: None,
             });
         }
         Err(e) => {
@@ -137,6 +217,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                 title: "Метка версии".to_string(),
                 detail: e.to_string(),
                 hint: Some("Используйте только [a-zA-Z0-9._-], без пустой строки.".to_string()),
+                field: None,
+                fix_id: None,
+                fix_label: None,
             });
         }
     }
@@ -161,29 +244,15 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                                     .to_string(),
                             )
                         },
+                        field: None,
+                        fix_id: None,
+                        fix_label: None,
                     });
                     if has_toml {
                         match PirateManifest::read_file(&pirate) {
                             Ok(manifest) => {
-                                match manifest.validate_network_proxy() {
-                                    Ok(()) => checks.push(PreflightItem {
-                                        id: "network_access",
-                                        ok: true,
-                                        title: "Network & Access".to_string(),
-                                        detail: "Сетевая конфигурация валидна.".to_string(),
-                                        hint: None,
-                                    }),
-                                    Err(e) => checks.push(PreflightItem {
-                                        id: "network_access",
-                                        ok: false,
-                                        title: "Network & Access".to_string(),
-                                        detail: e,
-                                        hint: Some(
-                                            "Исправьте секции [network], [network.access], [proxy], [services]."
-                                                .to_string(),
-                                        ),
-                                    }),
-                                }
+                                push_network_checks(&mut checks, &manifest);
+
                                 let outputs = manifest.release_output_paths();
                                 if outputs.is_empty() {
                                     checks.push(PreflightItem {
@@ -196,6 +265,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                                             "Добавьте [build].output_path (или output_paths) чтобы в релиз попадал только build-артефакт."
                                                 .to_string(),
                                         ),
+                                        field: None,
+                                        fix_id: None,
+                                        fix_label: None,
                                     });
                                 } else {
                                     let mut missing = Vec::<String>::new();
@@ -221,6 +293,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                                                 outputs.join(", ")
                                             ),
                                             hint: None,
+                                            field: None,
+                                            fix_id: None,
+                                            fix_label: None,
                                         });
                                     } else {
                                         checks.push(PreflightItem {
@@ -235,6 +310,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                                                 "Проверьте [build].output_path(s) и выполните build перед deploy."
                                                     .to_string(),
                                             ),
+                                            field: None,
+                                            fix_id: None,
+                                            fix_label: None,
                                         });
                                     }
                                 }
@@ -305,6 +383,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                                     title: "Хост-сервисы".to_string(),
                                     detail: hs_detail,
                                     hint: hs_hint,
+                                    field: None,
+                                    fix_id: None,
+                                    fix_label: None,
                                 });
                                 host_services_compat = Some(hs);
                             }
@@ -314,6 +395,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                                 title: "Build output paths".to_string(),
                                 detail: format!("Не удалось прочитать pirate.toml: {e}"),
                                 hint: None,
+                                field: None,
+                                fix_id: None,
+                                fix_label: None,
                             }),
                         }
                     }
@@ -324,6 +408,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                         title: "Папка проекта".to_string(),
                         detail: "Путь не является каталогом.".to_string(),
                         hint: None,
+                        field: None,
+                        fix_id: None,
+                        fix_label: None,
                     });
                 }
             }
@@ -334,6 +421,9 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
                     title: "Папка проекта".to_string(),
                     detail: format!("Не удалось открыть папку: {e}"),
                     hint: Some("Выберите существующий каталог с проектом.".to_string()),
+                    field: None,
+                    fix_id: None,
+                    fix_label: None,
                 });
             }
         }
@@ -344,13 +434,21 @@ pub fn run_projects_preflight(project_dir: PathBuf, version: &str) -> ProjectsPr
             title: "Папка проекта".to_string(),
             detail: "Папка не выбрана.".to_string(),
             hint: Some("Нажмите «Выбрать папку…».".to_string()),
+            field: None,
+            fix_id: None,
+            fix_label: None,
         });
     }
 
     let ready = checks
         .iter()
         .filter(|c| c.id != "host_services")
-        .all(|c| c.ok);
+        .all(|c| {
+            if !c.ok && c.id == "network_access" && c.fix_id.is_some() {
+                return true;
+            }
+            c.ok
+        });
     ProjectsPreflightReport {
         ready,
         checks,

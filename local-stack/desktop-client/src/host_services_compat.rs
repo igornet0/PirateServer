@@ -62,7 +62,9 @@ pub fn host_services_gap(
 }
 
 /// Full summary for UI / preflight (control-api optional).
-pub fn summarize_host_services_for_manifest(manifest: &PirateManifest) -> HostServicesCompatSummary {
+pub fn summarize_host_services_for_manifest(
+    manifest: &PirateManifest,
+) -> HostServicesCompatSummary {
     let required = required_host_service_ids(manifest);
     if required.is_empty() {
         return HostServicesCompatSummary {
@@ -75,15 +77,14 @@ pub fn summarize_host_services_for_manifest(manifest: &PirateManifest) -> HostSe
         };
     }
 
-    let skipped_template =
-        |reason: &'static str| HostServicesCompatSummary {
-            status: "skipped".into(),
-            skip_reason: Some(reason.into()),
-            required_host_service_ids: required.clone(),
-            missing_host_service_ids: vec![],
-            satisfied_host_service_ids: vec![],
-            dispatch_script_present: None,
-        };
+    let skipped_template = |reason: &'static str| HostServicesCompatSummary {
+        status: "skipped".into(),
+        skip_reason: Some(reason.into()),
+        required_host_service_ids: required.clone(),
+        missing_host_service_ids: vec![],
+        satisfied_host_service_ids: vec![],
+        dispatch_script_present: None,
+    };
 
     let base = load_control_api_base();
     if base.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {

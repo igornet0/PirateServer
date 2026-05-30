@@ -28,28 +28,30 @@ pub fn run_server_stack_update_with_progress<F>(
 where
     F: FnMut(u64, u64) + Send + 'static,
 {
-    let endpoint = load_endpoint().ok_or_else(|| "no saved connection; connect first".to_string())?;
+    let endpoint =
+        load_endpoint().ok_or_else(|| "no saved connection; connect first".to_string())?;
     validate_version_label(&version).map_err(|e| e.to_string())?;
     let sk = load_signing_key_for_endpoint(&endpoint)?;
     let artifact = read_or_pack_bundle(&path).map_err(|e| e.to_string())?;
     let rt = runtime()?;
-    let resp = rt.block_on(upload_server_stack_artifact_with_progress(
-        &endpoint,
-        &artifact,
-        &version,
-        chunk_size,
-        sk.as_ref(),
-        None,
-        on_progress,
-    ))
-    .map_err(|s| {
-        let m = s.message();
-        if m.is_empty() {
-            format!("{s:?}")
-        } else {
-            m.to_string()
-        }
-    })?;
+    let resp = rt
+        .block_on(upload_server_stack_artifact_with_progress(
+            &endpoint,
+            &artifact,
+            &version,
+            chunk_size,
+            sk.as_ref(),
+            None,
+            on_progress,
+        ))
+        .map_err(|s| {
+            let m = s.message();
+            if m.is_empty() {
+                format!("{s:?}")
+            } else {
+                m.to_string()
+            }
+        })?;
     Ok(ServerStackOutcome {
         status: resp.status,
         applied_version: resp.applied_version,
@@ -59,17 +61,20 @@ where
 }
 
 pub fn fetch_server_stack_info_json() -> Result<String, String> {
-    let endpoint = load_endpoint().ok_or_else(|| "no saved connection; connect first".to_string())?;
+    let endpoint =
+        load_endpoint().ok_or_else(|| "no saved connection; connect first".to_string())?;
     let sk = load_signing_key_for_endpoint(&endpoint)?;
     let rt = runtime()?;
-    let info = rt.block_on(fetch_server_stack_info(&endpoint, sk.as_ref())).map_err(|s| {
-        let m = s.message();
-        if m.is_empty() {
-            format!("{s:?}")
-        } else {
-            m.to_string()
-        }
-    })?;
+    let info = rt
+        .block_on(fetch_server_stack_info(&endpoint, sk.as_ref()))
+        .map_err(|s| {
+            let m = s.message();
+            if m.is_empty() {
+                format!("{s:?}")
+            } else {
+                m.to_string()
+            }
+        })?;
     Ok(serde_json::json!({
         "bundleVersion": info.bundle_version,
         "manifestJson": info.manifest_json,

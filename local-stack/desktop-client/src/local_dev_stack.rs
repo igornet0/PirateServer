@@ -2,10 +2,12 @@
 
 use crate::env_paths::path_for_dev_shell;
 use deploy_client::apply_generated_files;
+use deploy_core::cmd_template::resolve_cmd_template;
 use deploy_core::pirate_project::PirateManifest;
 use deploy_core::process_manager;
 use parking_lot::Mutex;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -104,10 +106,7 @@ fn spawn_line_reader<R: Read + Send + 'static>(
 }
 
 fn vec_tail_join(v: &[String]) -> String {
-    v.iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("\n")
+    v.iter().map(String::as_str).collect::<Vec<_>>().join("\n")
 }
 
 struct State {
@@ -161,13 +160,7 @@ fn apply_manifest_env(cmd: &mut Command, project_root: &Path, manifest: &PirateM
 
 fn docker_compose_up(project_root: &PathBuf) -> Result<(), String> {
     let out = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            "docker-compose.pirate.yml",
-            "up",
-            "-d",
-        ])
+        .args(["compose", "-f", "docker-compose.pirate.yml", "up", "-d"])
         .current_dir(project_root)
         .output()
         .map_err(|e| format!("docker compose up: {e}"))?;
@@ -275,6 +268,7 @@ fn kill_child_tree(child: &mut Child) {
 pub fn start_local_dev_stack(
     project_root: PathBuf,
     on_log: Option<Arc<dyn Fn(LocalDevLogLine) + Send + Sync>>,
+    cmd_vars: Option<BTreeMap<String, String>>,
 ) -> Result<(), String> {
     let p = project_root
         .canonicalize()
@@ -288,9 +282,7 @@ pub fn start_local_dev_stack(
         if let Some(mut st) = g.take() {
             if st.child.try_wait().ok().flatten().is_none() {
                 *g = Some(st);
-                return Err(
-                    "локальный запуск уже активен — сначала нажмите «Остановить»".into(),
-                );
+                return Err("локальный запуск уже активен — сначала нажмите «Остановить»".into());
             }
             if st.compose_started {
                 docker_compose_down(&st.project_root);
@@ -304,7 +296,19 @@ pub fn start_local_dev_stack(
 
     let m = PirateManifest::read_file(&p.join("pirate.toml"))
         .map_err(|e| format!("pirate.toml: {e}"))?;
-    let start_cmd = m.start.cmd.trim();
+    if m.start.cmd.trim().is_empty() {
+        let compose_path = p.join("docker-compose.pirate.yml");
+        let compose_has_services = compose_path.is_file()
+            && std::fs::metadata(&compose_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+        if !compose_has_services {
+            return Err(
+                "нет docker-compose.pirate.yml с сервисами и пустой [start].cmd — укажите команду запуска или включите сервисы в [services] и выполните Apply gen".into(),
+            );
+        }
+    }
+    let start_cmd = resolve_cmd_template(m.start.cmd.trim(), cmd_vars.as_ref())?;
     let compose_path = p.join("docker-compose.pirate.yml");
     let mut compose_started = false;
 
@@ -330,7 +334,7 @@ pub fn start_local_dev_stack(
 
     assert_port_free(manifest_listen_port(&m))?;
 
-    let mut child = spawn_start_command(start_cmd, &p, &m)?;
+    let mut child = spawn_start_command(&start_cmd, &p, &m)?;
 
     let emit: LogFn = on_log.unwrap_or_else(|| Arc::new(|_: LocalDevLogLine| {}));
 
