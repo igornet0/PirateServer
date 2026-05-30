@@ -64,4 +64,4 @@ if [[ "${PIRATE_DOCKER_CROSS_FALLBACK:-0}" == "1" ]]; then
   esac
 fi
 exec cargo build --release --target "$TARGET_TRIPLE" \
-  -p deploy-server -p control-api -p deploy-client -p pirate-host-agent
+  -p deploy-server -p control-api -p deploy-client -p pirate-host-agent -p stack-tun-api

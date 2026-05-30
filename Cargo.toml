@@ -11,6 +11,7 @@ members = [
     "server-stack/deploy-db",
     "server-stack/deploy-core",
     "server-stack/deploy-auth",
+    "server-stack/stack-tun-api",
     "server-stack/tunnel-gateway",
     "server-stack/host-agent",
     "local-stack/client",
@@ -19,3 +20,53 @@ members = [
     "local-stack/desktop-ui/src-tauri",
     "server-stack/desktop-ui/src-tauri",
 ]
+
+# --- Build profiles ---------------------------------------------------------
+# Release: optimize for runtime speed + small binaries. The `pirate` CLI is
+# bundled into the Tauri app as a resource, so binary size is user-facing.
+# NOTE: `panic` is intentionally left as the default ("unwind"). This workspace
+# contains a long-running server (`deploy-server`); with `panic = "abort"` a
+# single panicking request task would abort the whole process instead of being
+# isolated by Tokio. The size win is not worth that availability regression.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Dev: keep first-party crates fast to recompile, but build third-party
+# dependencies optimized so the running app/CLI is not painfully slow in dev.
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+codegen-units = 16
+
+# --- Shared dependency versions --------------------------------------------
+# Single source of truth for crates used by 3+ workspace members. Members
+# reference these with `dep = { workspace = true }` so a version bump happens
+# in one place and the graph cannot silently drift. Only deps whose version
+# AND feature set are identical across every consumer are centralized here;
+# feature-divergent crates (tokio, tonic, clap, reqwest, sqlx, chrono, uuid,
+# axum, redis, ed25519-dalek) are intentionally left per-crate for now.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+tracing = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+futures-util = "0.3"
+base64 = "0.22"
+parking_lot = "0.12"
+tar = "0.4"
+flate2 = "1"
+dirs = "5"
+sysinfo = "0.32"
+libc = "0.2"
+async-stream = "0.3"
+thiserror = "1"
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }

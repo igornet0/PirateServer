@@ -106,14 +106,14 @@ if [[ "$HOST_OS" == "Darwin" && "$LINUX_BUNDLE_HOST_BUILD" != "1" ]]; then
   REPO_ROOT="$REPO_ROOT" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     "$REPO_ROOT/scripts/linux-bundle-build-rust-in-docker.sh" "$TARGET_TRIPLE"
 elif command -v cargo-zigbuild >/dev/null 2>&1; then
-  cargo zigbuild --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client -p pirate-host-agent
+  cargo zigbuild --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client -p pirate-host-agent -p stack-tun-api
 else
   echo "cargo-zigbuild not found; using cargo (install zig+cargo-zigbuild or cross for $TARGET_TRIPLE)"
-  cargo build --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client -p pirate-host-agent
+  cargo build --release --target "$TARGET_TRIPLE" -p deploy-server -p control-api -p deploy-client -p pirate-host-agent -p stack-tun-api
 fi
 
 BIN_DIR="$CARGO_TARGET_DIR/$TARGET_TRIPLE/release"
-for b in deploy-server control-api client pirate pirate-host-agent; do
+for b in deploy-server control-api client pirate pirate-host-agent stack-tun-api; do
   if [[ ! -f "$BIN_DIR/$b" ]]; then
     echo "missing: $BIN_DIR/$b"
     exit 1
@@ -123,7 +123,7 @@ done
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/systemd" "$STAGE/nginx" "$STAGE/lib/pirate"
 
-cp -a "$BIN_DIR/deploy-server" "$BIN_DIR/control-api" "$BIN_DIR/client" "$BIN_DIR/pirate" "$BIN_DIR/pirate-host-agent" "$STAGE/bin/"
+cp -a "$BIN_DIR/deploy-server" "$BIN_DIR/control-api" "$BIN_DIR/client" "$BIN_DIR/pirate" "$BIN_DIR/pirate-host-agent" "$BIN_DIR/stack-tun-api" "$STAGE/bin/"
 chmod +x "$STAGE/bin/"*
 if [[ "$UI_BUILD" == "1" ]]; then
   mkdir -p "$STAGE/share/ui/dist"
@@ -135,6 +135,8 @@ fi
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/deploy-server.service" "$STAGE/systemd/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/control-api.service" "$STAGE/systemd/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/pirate-host-agent.service" "$STAGE/systemd/"
+cp "$REPO_ROOT/server-stack/deploy/ubuntu/pirate-stack-tun-api.service" "$STAGE/systemd/"
+cp "$REPO_ROOT/server-stack/deploy/ubuntu/pirate-stack-tun-api.env.example" "$STAGE/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/nginx-pirate-site.conf" "$STAGE/nginx/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/nginx-pirate-site-domain.conf.in" "$STAGE/nginx/"
 cp "$REPO_ROOT/server-stack/deploy/ubuntu/nginx-pirate-api-only.conf" "$STAGE/nginx/"
