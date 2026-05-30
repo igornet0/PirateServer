@@ -103,9 +103,21 @@ message DeployChunk {
   string artifact_kind = 7;
 }
 
+message DeployNginxApply {
+  bool ok = 1;
+  string path = 2;
+  string message = 3;
+  // updated | unchanged | skipped
+  string action = 4;
+  bool template_changed = 5;
+  string content_sha256 = 6;
+  string test_output = 7;
+}
+
 message DeployResponse {
   string status = 1;
   string deployed_version = 2;
+  DeployNginxApply nginx_apply = 3;
 }
 
 message StatusRequest {
@@ -146,12 +158,23 @@ message RollbackResponse {
 message ValidateDeployRequest {
   string project_id = 1;
   string manifest_toml = 2;
+  // SHA-256 hex of local nginx template (optional; server compares with persisted state).
+  string client_nginx_template_sha256 = 3;
+}
+
+message NginxDeployState {
+  string server_template_sha256 = 1;
+  string applied_content_sha256 = 2;
+  string applied_site_path = 3;
+  int64 last_applied_at_ms = 4;
+  bool needs_update = 5;
 }
 
 message ValidateDeployResponse {
   bool allow = 1;
   repeated string blockers = 2;
   repeated string warnings = 3;
+  NginxDeployState nginx_state = 4;
 }
 
 message RemoveProjectRequest {

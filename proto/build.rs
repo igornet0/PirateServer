@@ -4,6 +4,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&["deploy.proto"], &["."])?;
+        .compile_protos(&["deploy.proto", "stack_tun.proto"], &["."])?;
     Ok(())
 }

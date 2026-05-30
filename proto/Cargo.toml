@@ -1,11 +1,11 @@
 [package]
 name = "deploy-proto"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Generated gRPC types for deploy service"
 
 [dependencies]
-prost = "0.13"
+prost = { workspace = true }
 tonic = { version = "0.12", features = ["transport"] }
 
 [build-dependencies]

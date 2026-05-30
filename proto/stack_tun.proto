@@ -1,0 +1,161 @@
+syntax = "proto3";
+
+package stack_tun;
+
+// Multiplexed relay over one bidirectional TunnelStream session.
+service StackTunService {
+  // Connector opens ONE long-lived RPC, sends Pull repeatedly; each Assign starts a relay sub-session.
+  rpc TunnelStream(stream TunClientMsg) returns (stream TunServerMsg);
+  // Structured request/response envelope bus (routing + journal on server).
+  rpc RequestBusStream(stream BusClientMsg) returns (stream BusServerMsg);
+  // Async task queue: worker claims queued HTTP envelopes via pull; completes async (listener profile id in metadata).
+  rpc TaskQueueStream(stream TaskClientMsg) returns (stream TaskServerMsg);
+}
+
+message TunPull {
+  uint64 wait_ms = 1;
+}
+
+message TunFromConnector {
+  bytes chunk = 1;
+}
+
+message TunCliFin {}
+
+message TunClientMsg {
+  oneof msg {
+    TunPull pull = 1;
+    TunFromConnector from_connector = 2;
+    TunCliFin cli_fin = 3;
+  }
+}
+
+message TunAssigned {}
+
+message TunFromListener {
+  bytes chunk = 1;
+}
+
+message TunSrvFin {}
+
+message TunServerMsg {
+  oneof msg {
+    TunAssigned assigned = 1;
+    TunFromListener from_listener = 2;
+    TunSrvFin srv_fin = 3;
+    string error = 4;
+    // Initial ack — stream may stay open across many Pull assignments.
+    bool ready = 5;
+  }
+}
+
+// ---------- Request Bus ----------
+
+message BusKv {
+  string key = 1;
+  string value = 2;
+}
+
+message BusRequestEnvelope {
+  string request_id = 1;
+  string trace_id = 2;
+  uint32 hop_id = 3;
+  string source_node_id = 4;
+  string target_node_id = 5;
+  string method = 6;
+  string scheme = 7;
+  string host = 8;
+  string path = 9;
+  repeated BusKv headers = 10;
+  bytes body_chunk = 11;
+  bool body_finished = 12;
+  int64 created_at_ms = 13;
+}
+
+message BusClientMsg {
+  oneof msg {
+    BusRequestEnvelope request_part = 1;
+  }
+}
+
+message BusRouteDecision {
+  string request_id = 1;
+  string decision = 2;
+  string detail = 3;
+}
+
+message BusResponseEnvelope {
+  string request_id = 1;
+  uint32 status = 2;
+  repeated BusKv headers = 3;
+  bytes body_chunk = 4;
+  bool finished = 5;
+  string error = 6;
+}
+
+message BusServerMsg {
+  oneof msg {
+    bool ready = 1;
+    BusRouteDecision route_decision = 2;
+    BusResponseEnvelope response_part = 3;
+    string fatal_error = 4;
+  }
+}
+
+// ---------- Task queue ----------
+
+enum TaskPhase {
+  TASK_PHASE_UNSPECIFIED = 0;
+  TASK_PHASE_QUEUED = 1;
+  TASK_PHASE_CLAIMED = 2;
+  TASK_PHASE_RUNNING = 3;
+  TASK_PHASE_COMPLETED = 4;
+  TASK_PHASE_FAILED = 5;
+  TASK_PHASE_EXPIRED = 6;
+}
+
+message TaskClaimPull {
+  uint64 wait_ms = 1;
+}
+
+message TaskStatusUpdate {
+  string request_id = 1;
+  TaskPhase phase = 2;
+  string detail = 3;
+  uint32 progress_pct = 4;
+}
+
+message TaskComplete {
+  string request_id = 1;
+  uint32 status = 2;
+  repeated BusKv headers = 3;
+  bytes body_chunk = 4;
+  bool finished = 5;
+  string error = 6;
+}
+
+message TaskClientMsg {
+  oneof msg {
+    TaskClaimPull claim_pull = 1;
+    TaskStatusUpdate status_update = 2;
+    TaskComplete complete_part = 3;
+  }
+}
+
+message TaskAssigned {
+  BusRequestEnvelope envelope = 1;
+}
+
+message TaskAck {
+  string request_id = 1;
+  string ack_kind = 2;
+}
+
+message TaskServerMsg {
+  oneof msg {
+    bool ready = 1;
+    TaskAssigned assigned = 2;
+    TaskAck ack = 3;
+    string error = 4;
+  }
+}
