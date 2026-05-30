@@ -1,0 +1,5 @@
+# Standalone nested workspace — build with:
+#   cargo build --manifest-path challenge-response-auth/Cargo.toml -p chal-auth-server
+[workspace]
+resolver = "2"
+members = ["shared", "server", "client"]
