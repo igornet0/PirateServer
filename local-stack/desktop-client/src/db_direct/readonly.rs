@@ -38,9 +38,29 @@ pub fn is_readonly_sql(sql: &str) -> Result<(), ReadonlySqlError> {
     }
     if matches!(
         first,
-        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "REPLACE" | "ALTER" | "DROP" | "CREATE"
-            | "TRUNCATE" | "GRANT" | "REVOKE" | "CALL" | "DO" | "SET" | "USE" | "START"
-            | "BEGIN" | "COMMIT" | "ROLLBACK" | "LOCK" | "UNLOCK" | "LOAD" | "COPY"
+        "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "MERGE"
+            | "REPLACE"
+            | "ALTER"
+            | "DROP"
+            | "CREATE"
+            | "TRUNCATE"
+            | "GRANT"
+            | "REVOKE"
+            | "CALL"
+            | "DO"
+            | "SET"
+            | "USE"
+            | "START"
+            | "BEGIN"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "LOCK"
+            | "UNLOCK"
+            | "LOAD"
+            | "COPY"
     ) {
         return Err(ReadonlySqlError(format!(
             "write / DDL / session control not allowed: {first}"

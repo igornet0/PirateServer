@@ -100,7 +100,10 @@ pub async fn mysql_list_tables(pool: &MySqlPool, schema: &str) -> Result<Vec<Str
         "SELECT table_name FROM information_schema.tables
          WHERE table_schema = '{schema}' AND table_type = 'BASE TABLE' ORDER BY table_name"
     );
-    let rows = sqlx::query(&q).fetch_all(pool).await.map_err(|e| e.to_string())?;
+    let rows = sqlx::query(&q)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
     rows.iter()
         .map(|r| r.try_get::<String, _>(0).map_err(|e| e.to_string()))
         .collect()

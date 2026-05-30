@@ -53,11 +53,10 @@ struct DirectPasswordRecord {
 fn is_no_such_keyring(e: &keyring::Error) -> bool {
     match e {
         keyring::Error::NoEntry => true,
-        _ => e
-            .to_string()
-            .to_lowercase()
-            .contains("not found")
-            || e.to_string().to_lowercase().contains("no such"),
+        _ => {
+            e.to_string().to_lowercase().contains("not found")
+                || e.to_string().to_lowercase().contains("no such")
+        }
     }
 }
 
@@ -190,10 +189,8 @@ pub fn set(profile_id: &str, password: &str) -> Result<(), String> {
             doc.profiles.remove(&id);
         } else {
             let enc = encrypt_password(&key_path(), password)?;
-            doc.profiles.insert(
-                id,
-                DirectPasswordRecord { enc: Some(enc) },
-            );
+            doc.profiles
+                .insert(id, DirectPasswordRecord { enc: Some(enc) });
         }
         atomic_write_file(doc)
     })?;

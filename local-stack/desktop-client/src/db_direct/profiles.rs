@@ -1,8 +1,8 @@
 //! SQLite metadata for direct DB connection profiles; passwords in local JSON (encrypted, no OS keychain).
 
-use crate::desktop_store::open as store_open;
-use crate::desktop_store::db_path;
 use crate::db_direct::direct_password_store;
+use crate::desktop_store::db_path;
+use crate::desktop_store::open as store_open;
 use rusqlite::params;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -210,8 +210,11 @@ pub struct DirectProfileRow {
 
 pub fn direct_profile_delete(id: &str) -> Result<(), String> {
     let c = store_open().map_err(|e| e.to_string())?;
-    c.execute("DELETE FROM db_direct_query_history WHERE connection_id = ?1", [id])
-        .map_err(|e| e.to_string())?;
+    c.execute(
+        "DELETE FROM db_direct_query_history WHERE connection_id = ?1",
+        [id],
+    )
+    .map_err(|e| e.to_string())?;
     c.execute("DELETE FROM db_direct_profile WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
     let _ = direct_password_set(id, "");
@@ -250,6 +253,34 @@ pub fn query_history_append(
             if ok { 1i64 } else { 0i64 },
             err,
         ],
+    )
+    .map_err(|e| e.to_string())?;
+    prune_query_history(&c, connection_id)?;
+    Ok(())
+}
+
+const QUERY_HISTORY_MAX_PER_CONNECTION: i64 = 500;
+
+fn prune_query_history(c: &rusqlite::Connection, connection_id: &str) -> Result<(), String> {
+    let count: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM db_direct_query_history WHERE connection_id = ?1",
+            params![connection_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if count <= QUERY_HISTORY_MAX_PER_CONNECTION {
+        return Ok(());
+    }
+    let excess = count - QUERY_HISTORY_MAX_PER_CONNECTION;
+    c.execute(
+        "DELETE FROM db_direct_query_history WHERE id IN (
+            SELECT id FROM db_direct_query_history
+            WHERE connection_id = ?1
+            ORDER BY ts_ms ASC
+            LIMIT ?2
+        )",
+        params![connection_id, excess],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

@@ -36,10 +36,7 @@ impl AlertConfig {
         }
         for m in &o.disk.mounts {
             if m.free_bytes < self.disk_low_free_bytes {
-                out.push(format!(
-                    "disk_low: {} free {} bytes",
-                    m.path, m.free_bytes
-                ));
+                out.push(format!("disk_low: {} free {} bytes", m.path, m.free_bytes));
             }
         }
         out

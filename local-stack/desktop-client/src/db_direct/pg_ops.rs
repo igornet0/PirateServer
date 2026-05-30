@@ -80,12 +80,11 @@ fn pg_row_to_json(row: &PgRow) -> serde_json::Value {
 }
 
 pub async fn pg_list_databases(pool: &PgPool) -> Result<Vec<String>, String> {
-    let rows = sqlx::query(
-        "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows =
+        sqlx::query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     rows.iter()
         .map(|r| r.try_get::<String, _>(0).map_err(|e| e.to_string()))
         .collect()
@@ -120,7 +119,10 @@ pub async fn pg_list_tables(pool: &PgPool, schema: &str) -> Result<Vec<String>, 
          WHERE table_schema = '{schema}' AND table_type = 'BASE TABLE'
          ORDER BY table_name"
     );
-    let rows = sqlx::query(&q).fetch_all(pool).await.map_err(|e| e.to_string())?;
+    let rows = sqlx::query(&q)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
     rows.iter()
         .map(|r| r.try_get::<String, _>(0).map_err(|e| e.to_string()))
         .collect()
@@ -138,9 +140,7 @@ pub async fn pg_table_preview(
     }
     let lim = limit.max(1).min(5000);
     let off = offset.min(1_000_000_000);
-    let sql = format!(
-        "SELECT * FROM \"{schema}\".\"{table}\" LIMIT {lim} OFFSET {off}"
-    );
+    let sql = format!("SELECT * FROM \"{schema}\".\"{table}\" LIMIT {lim} OFFSET {off}");
     is_readonly_sql(&sql).map_err(|e| e.to_string())?;
     let rows = sqlx::query(&sql)
         .fetch_all(pool)

@@ -49,7 +49,7 @@ pub fn monitoring_api_base() -> Option<String> {
 }
 
 pub struct MonitorShared {
-    pub overview: RwLock<Option<MonitoringOverview>>,
+    pub overview: RwLock<Option<Arc<MonitoringOverview>>>,
     net_prev: RwLock<Option<NetCounters>>,
     pub history: Mutex<HistoryBuffer>,
     pub alerts: AlertConfig,
@@ -96,7 +96,7 @@ fn parse_range_ms(s: &str) -> i64 {
 async fn get_overview(State(s): State<Arc<MonitorShared>>) -> impl IntoResponse {
     let g = s.overview.read();
     if let Some(ref o) = *g {
-        return Json(o.clone()).into_response();
+        return Json((**o).clone()).into_response();
     }
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -177,7 +177,8 @@ async fn get_export(State(s): State<Arc<MonitorShared>>) -> Json<ExportSnapshot>
     let o = s
         .overview
         .read()
-        .clone()
+        .as_ref()
+        .map(|a| (**a).clone())
         .unwrap_or_else(|| MonitoringOverview {
             ts_ms: chrono::Utc::now().timestamp_millis(),
             disk: DiskOverview { mounts: vec![] },
@@ -212,13 +213,16 @@ async fn get_export(State(s): State<Arc<MonitorShared>>) -> Json<ExportSnapshot>
 }
 
 async fn get_alerts(State(s): State<Arc<MonitorShared>>) -> Json<AlertsStatus> {
-    let economy = s.alerts.economy_mode.load(std::sync::atomic::Ordering::Relaxed);
+    let economy = s
+        .alerts
+        .economy_mode
+        .load(std::sync::atomic::Ordering::Relaxed);
     let enabled = s.alerts.enabled.load(std::sync::atomic::Ordering::Relaxed);
     let triggered = s
         .overview
         .read()
         .as_ref()
-        .map(|o| s.alerts.evaluate(o))
+        .map(|o| s.alerts.evaluate(o.as_ref()))
         .unwrap_or_default();
     Json(AlertsStatus {
         alerts_enabled: enabled,
@@ -227,7 +231,10 @@ async fn get_alerts(State(s): State<Arc<MonitorShared>>) -> Json<AlertsStatus> {
     })
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(s): State<Arc<MonitorShared>>) -> impl IntoResponse {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(s): State<Arc<MonitorShared>>,
+) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, s))
 }
 
@@ -241,7 +248,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<MonitorShared>) {
                     let msg = serde_json::json!({
                         "type": "tick",
                         "channel": "overview",
-                        "payload": o,
+                        "payload": o.as_ref(),
                     });
                     if socket.send(Message::Text(msg.to_string())).await.is_err() {
                         break;
@@ -273,7 +280,10 @@ fn build_router(state: Arc<MonitorShared>) -> Router {
         .route("/api/v1/monitoring/detail/memory", get(get_detail_memory))
         .route("/api/v1/monitoring/detail/disk", get(get_detail_disk))
         .route("/api/v1/monitoring/detail/network", get(get_detail_network))
-        .route("/api/v1/monitoring/detail/processes", get(get_detail_processes))
+        .route(
+            "/api/v1/monitoring/detail/processes",
+            get(get_detail_processes),
+        )
         .route("/api/v1/monitoring/detail/logs", get(get_detail_logs))
         .route("/api/v1/monitoring/series", get(get_series))
         .route("/api/v1/monitoring/export", get(get_export))
@@ -311,10 +321,11 @@ async fn tick_loop(shared: Arc<MonitorShared>) {
         let triggered = shared.alerts.evaluate(&overview);
         overview.warnings = triggered;
         *shared.net_prev.write() = Some(net);
-        *shared.overview.write() = Some(overview.clone());
-        shared.history.lock().record_overview(&overview);
+        let overview = Arc::new(overview);
+        shared.history.lock().record_overview(overview.as_ref());
+        *shared.overview.write() = Some(Arc::clone(&overview));
         {
-            let _ = super::sqlite_store::append_sample(&overview);
+            let _ = super::sqlite_store::append_sample(overview.as_ref());
         }
     }
 }
@@ -353,7 +364,6 @@ pub fn spawn_monitoring_server() -> std::io::Result<u16> {
             }
         });
     });
-    rx.recv().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::Other, "monitoring channel closed")
-    })
+    rx.recv()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "monitoring channel closed"))
 }

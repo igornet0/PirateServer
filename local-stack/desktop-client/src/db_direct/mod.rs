@@ -13,7 +13,9 @@ mod stats;
 mod structure;
 
 pub use adapter::{DirectEngine, MysqlEngine, PgEngine, RedisEngine};
-pub use engines::{clickhouse_not_implemented, is_direct_engine_implemented, mongo_not_implemented};
+pub use engines::{
+    clickhouse_not_implemented, is_direct_engine_implemented, mongo_not_implemented,
+};
 pub use engines::{ENGINE_CLICKHOUSE, ENGINE_MONGO, ENGINE_MYSQL, ENGINE_POSTGRES, ENGINE_REDIS};
 pub use profiles::{
     direct_password_has, direct_password_set, direct_profile_delete, direct_profile_get_row,
@@ -141,10 +143,7 @@ pub struct DirectOpenRequest {
     pub password: Option<String>,
 }
 
-fn resolve_password(
-    profile_id: &str,
-    password: Option<String>,
-) -> Result<String, String> {
+fn resolve_password(profile_id: &str, password: Option<String>) -> Result<String, String> {
     if let Some(p) = password {
         if !p.is_empty() {
             return Ok(p);
@@ -211,7 +210,7 @@ pub async fn direct_open(req: DirectOpenRequest) -> Result<serde_json::Value, St
 }
 
 pub fn direct_close(session_id: String) -> Result<serde_json::Value, String> {
-    sessions::session_close(&session_id)?;
+    crate::tokio_runtime::block_on(sessions::session_close(&session_id))?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -230,8 +229,7 @@ pub async fn direct_list_databases(session_id: &str) -> Result<String, String> {
             .query_async(&mut con)
             .await
             .map_err(|e| e.to_string())?;
-        return serde_json::to_string(&vec!["(default)"])
-            .map_err(|e| e.to_string());
+        return serde_json::to_string(&vec!["(default)"]).map_err(|e| e.to_string());
     }
     Err("session not found".into())
 }
@@ -342,9 +340,13 @@ pub async fn direct_query(req: DirectQueryRequest) -> Result<String, String> {
                 });
             }
             if sql.to_ascii_lowercase().starts_with("keys ") {
-                return Err("KEYS is not allowed; use KEY_SAMPLE or SCAN in this explorer build".into());
+                return Err(
+                    "KEYS is not allowed; use KEY_SAMPLE or SCAN in this explorer build".into(),
+                );
             }
-            return Err("For Redis, use: PING, INFO [section], or dedicated key browser (use tree)".into());
+            return Err(
+                "For Redis, use: PING, INFO [section], or dedicated key browser (use tree)".into(),
+            );
         }
         Err("session not found".into())
     }
@@ -352,23 +354,11 @@ pub async fn direct_query(req: DirectQueryRequest) -> Result<String, String> {
     let dur = t0.elapsed().as_millis() as u64;
     match res {
         Ok(v) => {
-            let _ = query_history_append(
-                &req.session_id,
-                &req.sql,
-                Some(dur),
-                true,
-                None,
-            );
+            let _ = query_history_append(&req.session_id, &req.sql, Some(dur), true, None);
             serde_json::to_string(&v).map_err(|e| e.to_string())
         }
         Err(e) => {
-            let _ = query_history_append(
-                &req.session_id,
-                &req.sql,
-                Some(dur),
-                false,
-                Some(&e),
-            );
+            let _ = query_history_append(&req.session_id, &req.sql, Some(dur), false, Some(&e));
             Err(e)
         }
     }
@@ -381,7 +371,10 @@ pub async fn direct_heartbeat(session_id: &str) -> Result<String, String> {
     }
     if let Ok(p) = sessions::mysql_pool_for(session_id).await {
         let t0 = Instant::now();
-        let _ = sqlx::query("SELECT 1").fetch_one(&p).await.map_err(|e| e.to_string())?;
+        let _ = sqlx::query("SELECT 1")
+            .fetch_one(&p)
+            .await
+            .map_err(|e| e.to_string())?;
         let ms = t0.elapsed().as_millis() as u64;
         return Ok(serde_json::json!({ "ok": true, "rttMs": ms }).to_string());
     }

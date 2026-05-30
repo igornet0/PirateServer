@@ -4,8 +4,8 @@ use serde::Serialize;
 use sqlx::PgPool;
 use std::time::Instant;
 
-use super::QueryResultView;
 use super::pg_ops::pg_run_readonly_sql;
+use super::QueryResultView;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,7 +39,8 @@ pub async fn pg_stats_bundle(pool: &PgPool) -> PgStatsBundle {
       WHERE d.datistemplate = false
       ORDER BY size_bytes DESC NULLS LAST LIMIT 20";
     let database_sizes = pg_run_readonly_sql(pool, q_fin, 50).await.ok();
-    let q_conn = "SELECT state, count(*)::bigint AS n FROM pg_stat_activity GROUP BY state ORDER BY n DESC";
+    let q_conn =
+        "SELECT state, count(*)::bigint AS n FROM pg_stat_activity GROUP BY state ORDER BY n DESC";
     let connection_summary = pg_run_readonly_sql(pool, q_conn, 20).await.ok();
     let q_act = "SELECT pid, usename::text, application_name, client_addr::text, state, query_start, left(query, 200) AS query_snippet
         FROM pg_stat_activity

@@ -10,9 +10,8 @@ pub const ENGINE_MONGO: &str = "mongo";
 pub fn is_direct_engine_implemented(engine: &str) -> bool {
     matches!(
         engine,
-        ENGINE_POSTGRES | ENGINE_MYSQL | ENGINE_REDIS
-            // ClickHouse and Mongo: UI may show a clear “not available locally yet”
-            // without failing profile storage.
+        ENGINE_POSTGRES | ENGINE_MYSQL | ENGINE_REDIS // ClickHouse and Mongo: UI may show a clear “not available locally yet”
+                                                      // without failing profile storage.
     )
 }
 

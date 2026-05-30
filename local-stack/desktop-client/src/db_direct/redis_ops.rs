@@ -15,11 +15,7 @@ pub fn redis_url(host: &str, port: u16, password: &str) -> String {
     }
 }
 
-pub async fn redis_test_latency(
-    host: &str,
-    port: u16,
-    password: &str,
-) -> Result<u64, String> {
+pub async fn redis_test_latency(host: &str, port: u16, password: &str) -> Result<u64, String> {
     let u = redis_url(host, port, password);
     let client = redis::Client::open(u.as_str()).map_err(|e| e.to_string())?;
     let t0 = Instant::now();

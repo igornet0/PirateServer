@@ -10,4 +10,5 @@ mod sqlite_store;
 mod types;
 
 pub use server::{monitoring_api_base, monitoring_set_economy_mode, spawn_monitoring_server};
+pub use sqlite_store::sample_row_count;
 pub use types::MonitoringOverview;

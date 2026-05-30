@@ -49,11 +49,6 @@ impl DirectEngine for RedisEngine {
     }
 
     async fn test_latency(&self, params: &DirectConnectParams) -> Result<u64, String> {
-        super::redis_ops::redis_test_latency(
-            &params.host,
-            params.port,
-            &params.password,
-        )
-        .await
+        super::redis_ops::redis_test_latency(&params.host, params.port, &params.password).await
     }
 }

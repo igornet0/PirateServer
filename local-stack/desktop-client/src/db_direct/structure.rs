@@ -3,8 +3,8 @@
 use serde::Serialize;
 use sqlx::PgPool;
 
-use super::QueryResultView;
 use super::pg_ops::pg_run_readonly_sql;
+use super::QueryResultView;
 
 fn ident_ok(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')

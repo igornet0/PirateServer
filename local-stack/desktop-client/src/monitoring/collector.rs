@@ -84,7 +84,11 @@ fn linux_cpu_times_jiff() -> Option<(u64, u64, u64)> {
     let idle: u64 = it.next()?.parse().ok()?;
     let user_total = user.saturating_add(nice);
     // Values are jiffies; ~100 Hz → ms ≈ jiffies * 10
-    Some((user_total.saturating_mul(10), system.saturating_mul(10), idle.saturating_mul(10)))
+    Some((
+        user_total.saturating_mul(10),
+        system.saturating_mul(10),
+        idle.saturating_mul(10),
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -310,11 +314,7 @@ pub fn collect_cpu_detail(top_n: usize) -> CpuDetail {
         times,
         top_processes,
         series_hint: SeriesHint {
-            available_ranges: vec![
-                "15m".to_string(),
-                "1h".to_string(),
-                "24h".to_string(),
-            ],
+            available_ranges: vec!["15m".to_string(), "1h".to_string(), "24h".to_string()],
         },
     }
 }
@@ -447,7 +447,8 @@ pub fn collect_network_detail(_prev: Option<&NetCounters>) -> NetworkDetail {
     NetworkDetail {
         ts_ms: chrono::Utc::now().timestamp_millis(),
         interfaces,
-        connections_note: "Active connection listing is not implemented (expensive); use OS tools if needed.",
+        connections_note:
+            "Active connection listing is not implemented (expensive); use OS tools if needed.",
     }
 }
 
@@ -483,7 +484,11 @@ pub fn collect_processes_list(query: &str, limit: usize) -> ProcessesDetail {
             memory_bytes: p.memory(),
         })
         .collect();
-    rows.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.cpu_percent
+            .partial_cmp(&a.cpu_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let total = rows.len();
     rows.truncate(limit);
 

@@ -24,7 +24,10 @@ impl HistoryBuffer {
     }
 
     fn push_metric(&mut self, key: &str, ts_ms: i64, value: f64) {
-        let dq = self.series.entry(key.to_string()).or_insert_with(|| VecDeque::with_capacity(self.cap));
+        let dq = self
+            .series
+            .entry(key.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(self.cap));
         dq.push_back((ts_ms, value));
         while dq.len() > self.cap {
             dq.pop_front();
@@ -35,18 +38,8 @@ impl HistoryBuffer {
         let ts = o.ts_ms;
         self.push_metric("cpu", ts, o.cpu.usage_percent as f64);
         self.push_metric("memory_used", ts, o.memory.used_bytes as f64);
-        let net_rx: f64 = o
-            .network
-            .interfaces
-            .iter()
-            .map(|i| i.rx_bytes_per_s)
-            .sum();
-        let net_tx: f64 = o
-            .network
-            .interfaces
-            .iter()
-            .map(|i| i.tx_bytes_per_s)
-            .sum();
+        let net_rx: f64 = o.network.interfaces.iter().map(|i| i.rx_bytes_per_s).sum();
+        let net_tx: f64 = o.network.interfaces.iter().map(|i| i.tx_bytes_per_s).sum();
         self.push_metric("net_rx", ts, net_rx);
         self.push_metric("net_tx", ts, net_tx);
     }
