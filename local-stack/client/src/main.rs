@@ -1,6 +1,7 @@
 //! CLI: pack `build/` as tar.gz, stream over gRPC (IPv6 endpoint); optional Ed25519 pairing.
 
 mod board_probe;
+mod tunnel;
 mod display_stream;
 mod stack_update_prompt;
 mod version_info;
@@ -167,6 +168,8 @@ enum Commands {
         #[arg(long)]
         settings: Option<PathBuf>,
     },
+    /// stack-tun-api asynchronous task-queue worker (`TaskQueueStream`).
+    Tunnel(tunnel::TunnelArgs),
     /// Test local HTTP CONNECT proxy: smoke GET, speed through proxy, and empirical max parallel requests (`pirate board` must be listening).
     ///
     /// Does not use gRPC `ConnectionProbe` (that measures gRPC bandwidth, not HTTP CONNECT to an upstream URL).
@@ -1282,6 +1285,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
+        Commands::Tunnel(ref args) => {
+            if let Err(e) = tunnel::run(args.clone()).await {
+                eprintln!("tunnel: {e}");
+                std::process::exit(2);
+            }
+            return Ok(());
+        }
         Commands::Ping {
             http_url,
             bytes,
@@ -1636,7 +1646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Commands::ProjectBuild { path } => {
-            let r = deploy_client::run_build(path.as_path())?;
+            let r = deploy_client::run_build(path.as_path(), None)?;
             println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
             if !r.ok {
                 std::process::exit(1);
@@ -1644,7 +1654,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Commands::ProjectTest { path } => {
-            let r = deploy_client::run_test(path.as_path())?;
+            let r = deploy_client::run_test(path.as_path(), None)?;
             println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
             if !r.ok {
                 std::process::exit(1);
@@ -1668,14 +1678,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = deploy_client::resolve_path(name)?;
             match cmd {
                 ProjectCmd::Build => {
-                    let r = deploy_client::run_build(root.as_path())?;
+                    let r = deploy_client::run_build(root.as_path(), None)?;
                     println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
                     if !r.ok {
                         std::process::exit(1);
                     }
                 }
                 ProjectCmd::Test => {
-                    let r = deploy_client::run_test(root.as_path())?;
+                    let r = deploy_client::run_test(root.as_path(), None)?;
                     println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
                     if !r.ok {
                         std::process::exit(1);

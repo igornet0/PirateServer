@@ -115,6 +115,103 @@ fn pack_release_sources_blocks_path_escape() {
 }
 
 #[test]
+fn pack_release_sources_includes_nginx_template_when_configured() {
+    use deploy_core::pirate_project::PirateManifest;
+    use deploy_client::pack_release_sources_to_path;
+
+    let pid = std::process::id();
+    let root = std::env::temp_dir().join(format!("deploy-client-nginx-pack-{pid}"));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("dist")).unwrap();
+    fs::write(root.join("dist/app.js"), b"ok").unwrap();
+    fs::write(
+        root.join("pirate.toml"),
+        r#"
+[project]
+name = "x"
+version = "1"
+
+[build]
+output_path = "dist"
+
+[proxy]
+nginx_conf_path = "./pirate-nginx-snippet.conf"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("pirate-nginx-snippet.conf"),
+        "root <PATH_PROJECT>/releases/<VERSION>/dist;",
+    )
+    .unwrap();
+    let manifest = PirateManifest::read_file(&root.join("pirate.toml")).unwrap();
+
+    let out = std::env::temp_dir().join(format!("deploy-client-nginx-pack-{pid}.tar.gz"));
+    let _ = fs::remove_file(&out);
+    pack_release_sources_to_path(&root, &["dist".to_string()], None, &out, Some(&manifest))
+        .unwrap();
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&out).unwrap()));
+    let mut names = Vec::<String>::new();
+    for e in ar.entries().unwrap() {
+        let e = e.unwrap();
+        names.push(e.path().unwrap().to_string_lossy().to_string());
+    }
+    assert!(names.iter().any(|n| n == "dist/app.js"));
+    assert!(names.iter().any(|n| n == "pirate-nginx-snippet.conf"));
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pack_release_sources_force_includes_nginx_template_over_pirateignore() {
+    use deploy_core::pirate_project::PirateManifest;
+    use deploy_client::pack_release_sources_to_path;
+
+    let pid = std::process::id();
+    let root = std::env::temp_dir().join(format!("deploy-client-nginx-ignore-{pid}"));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("dist")).unwrap();
+    fs::write(root.join("dist/app.js"), b"ok").unwrap();
+    fs::write(root.join("pirate-nginx-snippet.conf"), b"server {}").unwrap();
+    fs::write(root.join(".pirateignore"), "pirate-nginx-snippet.conf\n").unwrap();
+    fs::write(
+        root.join("pirate.toml"),
+        r#"
+[project]
+name = "x"
+version = "1"
+
+[build]
+output_path = "dist"
+
+[proxy]
+nginx_conf_path = "./pirate-nginx-snippet.conf"
+"#,
+    )
+    .unwrap();
+    let manifest = PirateManifest::read_file(&root.join("pirate.toml")).unwrap();
+    let out = std::env::temp_dir().join(format!("deploy-client-nginx-ignore-{pid}.tar.gz"));
+    let _ = fs::remove_file(&out);
+    pack_release_sources_to_path(
+        &root,
+        &["dist".to_string()],
+        Some(&root.join(".pirateignore")),
+        &out,
+        Some(&manifest),
+    )
+    .unwrap();
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&out).unwrap()));
+    let mut names = Vec::<String>::new();
+    for e in ar.entries().unwrap() {
+        let e = e.unwrap();
+        names.push(e.path().unwrap().to_string_lossy().to_string());
+    }
+    assert!(names.iter().any(|n| n == "pirate-nginx-snippet.conf"));
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn pack_directory_applies_pirateignore() {
     let pid = std::process::id();
     let root = std::env::temp_dir().join(format!("deploy-client-release-ignore-{pid}"));

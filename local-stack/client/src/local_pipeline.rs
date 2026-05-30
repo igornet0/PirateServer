@@ -1,7 +1,9 @@
 //! Local build / test / docker / smoke (`pirate build`, `pirate test`, `pirate test-local`).
 
+use deploy_core::cmd_template::resolve_cmd_template;
 use deploy_core::pirate_project::PirateManifest;
 use deploy_core::process_manager;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -42,9 +44,13 @@ fn tail(s: &[u8], max: usize) -> String {
 }
 
 /// Run `[build].cmd` from `pirate.toml`.
-pub fn run_build(project_root: &Path) -> Result<StepResult, String> {
+pub fn run_build(
+    project_root: &Path,
+    cmd_vars: Option<&BTreeMap<String, String>>,
+) -> Result<StepResult, String> {
     let m = load_manifest(project_root)?;
-    let out = run_shell_cwd(&m.build.cmd, project_root)?;
+    let cmd = resolve_cmd_template(&m.build.cmd, cmd_vars)?;
+    let out = run_shell_cwd(&cmd, project_root)?;
     let ok = out.status.success();
     Ok(StepResult {
         step: "build".to_string(),
@@ -55,9 +61,13 @@ pub fn run_build(project_root: &Path) -> Result<StepResult, String> {
 }
 
 /// Run `[test].cmd`.
-pub fn run_test(project_root: &Path) -> Result<StepResult, String> {
+pub fn run_test(
+    project_root: &Path,
+    cmd_vars: Option<&BTreeMap<String, String>>,
+) -> Result<StepResult, String> {
     let m = load_manifest(project_root)?;
-    let out = run_shell_cwd(&m.test.cmd, project_root)?;
+    let cmd = resolve_cmd_template(&m.test.cmd, cmd_vars)?;
+    let out = run_shell_cwd(&cmd, project_root)?;
     let ok = out.status.success();
     Ok(StepResult {
         step: "test".to_string(),
@@ -219,5 +229,7 @@ pub fn test_local_docker(project_root: &Path, image_tag: &str) -> Result<StepRes
 pub fn apply_generated_files(project_root: &Path) -> Result<(), String> {
     let m = load_manifest(project_root)?;
     let release_dir = project_root.to_path_buf();
-    process_manager::apply_sidecar_manifest(&release_dir, &m).map_err(|e| e.to_string())
+    process_manager::apply_sidecar_manifest(&release_dir, &m)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }

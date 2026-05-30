@@ -24,10 +24,22 @@ pub struct ServiceDetectionReport {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct NginxDeployStateView {
+    pub server_template_sha256: String,
+    pub applied_content_sha256: String,
+    pub applied_site_path: String,
+    pub last_applied_at_ms: i64,
+    pub needs_update: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct DeployValidationReport {
     pub allow: bool,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nginx_state: Option<NginxDeployStateView>,
 }
 
 fn infer_service_name(port: u16) -> &'static str {
@@ -256,7 +268,7 @@ pub fn resolve_proxy_route_upstream(target: &str) -> Result<String, String> {
     Ok(format!("{upstream_host}:{port}"))
 }
 
-pub fn generate_proxy_config(manifest: &PirateManifest, server_name: &str) -> Result<String, String> {
+pub fn generate_proxy_config(manifest: &PirateManifest, server_name: Option<&str>) -> Result<String, String> {
     let mut routes = manifest.proxy.routes.clone();
     if routes.is_empty() {
         if let Some(ref web) = manifest.services.web {
@@ -273,30 +285,24 @@ pub fn generate_proxy_config(manifest: &PirateManifest, server_name: &str) -> Re
     if routes.is_empty() {
         return Err("no proxy routes found (set [proxy].routes or detect services first)".to_string());
     }
+    let server_name = server_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| deploy_core::nginx_snippet::nginx_server_name_line(manifest));
     let mut blocks = String::new();
     for (path, target) in routes {
         let upstream = resolve_proxy_route_upstream(&target)?;
-        blocks.push_str(&format!(
-            r#"
-    location {} {{
-        proxy_pass http://{};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }}
-"#,
-            path, upstream
+        let ws = deploy_core::nginx_snippet::nginx_route_websocket(manifest, &path);
+        blocks.push_str(&deploy_core::nginx_snippet::nginx_proxy_location_block(
+            &path, &upstream, ws, "",
         ));
     }
     Ok(format!(
         r#"server {{
     listen 80;
-    server_name {};
-{}
-}}
+    server_name {server_name};
+{blocks}}}
 "#,
-        server_name.trim(),
-        blocks
     ))
 }
 
@@ -350,6 +356,7 @@ pub fn validate_deploy(manifest: &PirateManifest, occupied_ports: &[u16]) -> Dep
         allow: blockers.is_empty(),
         blockers,
         warnings,
+        nginx_state: None,
     }
 }
 

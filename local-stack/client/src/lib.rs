@@ -62,12 +62,13 @@ pub use project_control::{init_project, scan_project, ScanReport};
 pub use network_access::{
     apply_detected_services_to_manifest, detect_services, generate_proxy_config,
     resolve_proxy_route_upstream, validate_deploy, DeployValidationReport, DetectedService,
-    ServiceDetectionReport,
+    NginxDeployStateView, ServiceDetectionReport,
 };
 pub use local_pipeline::{
     apply_generated_files, ensure_dockerfile, run_build, run_test, test_local_docker, StepResult,
 };
 pub use project_registry::{
-    list_projects, register, register_from_pirate_toml_dir, remove as remove_project_registry,
-    resolve_path,
+    list_project_registry_entries, list_projects, record_deploy_for_project_root, register,
+    register_from_pirate_toml_dir, remove as remove_project_registry, resolve_path,
+    ProjectRegistryEntry,
 };

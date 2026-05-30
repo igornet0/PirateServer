@@ -180,8 +180,41 @@ pub fn pack_release_sources_to_path(
                 }
             }
         }
+        if m.proxy.has_custom_nginx_template() {
+            if let Ok(nginx_joined) =
+                deploy_core::pirate_project::resolve_nginx_conf_join(&project_root, m)
+            {
+                if nginx_joined.is_file() {
+                    let nginx_can = nginx_joined.canonicalize()?;
+                    if !files.iter().any(|p| {
+                        p.canonicalize()
+                            .map(|c| c == nginx_can)
+                            .unwrap_or(false)
+                    }) {
+                        files.push(nginx_can);
+                    }
+                }
+            }
+        }
     }
     let mut uniq = BTreeSet::<String>::new();
+    let mut force_include: BTreeSet<String> = BTreeSet::new();
+    if let Some(m) = manifest {
+        if m.proxy.has_custom_nginx_template() {
+            if let Ok(nginx_joined) =
+                deploy_core::pirate_project::resolve_nginx_conf_join(&project_root, m)
+            {
+                if nginx_joined.is_file() {
+                    if let Ok(rel) = nginx_joined.strip_prefix(&project_root) {
+                        let rel_unix = path_to_unix_rel(rel);
+                        if !rel_unix.is_empty() {
+                            force_include.insert(rel_unix);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let raw = fs::File::create(out_path)?;
     let enc = GzEncoder::new(raw, Compression::default());
     let mut builder = Builder::new(enc);
@@ -193,8 +226,9 @@ pub fn pack_release_sources_to_path(
         if rel_unix.is_empty() || rel_unix == "." {
             continue;
         }
+        let force = force_include.contains(rel_unix.as_str());
         if let Some(ref set) = ignore {
-            if set.is_match(rel_unix.as_str()) {
+            if !force && set.is_match(rel_unix.as_str()) {
                 continue;
             }
         }
