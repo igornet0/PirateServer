@@ -82,6 +82,11 @@ type ProjectNginxSnippet = {
   reason_code?: string | null;
   hint?: string | null;
   content?: string | null;
+  template_sha256?: string | null;
+  applied_content_sha256?: string | null;
+  needs_update?: boolean | null;
+  last_applied_at_ms?: number | null;
+  applied_site_path?: string | null;
 };
 
 function localizedNginxAbsentHint(
@@ -674,10 +679,23 @@ export function ServerProjectsOverview({
                 </summary>
                 <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
                   {tr(
-                    "Файл: releases/<version>/pirate-nginx-snippet.conf — генерируется при деплое, когда манифест задаёт nginx edge и есть upstream (маршруты, services.web/api или порт proxy/health).",
-                    "File: releases/<version>/pirate-nginx-snippet.conf — generated on deploy when the manifest targets nginx as the edge proxy and upstreams exist (routes, services.web/api, or proxy/health port).",
+                    "Файл: releases/<version>/pirate-nginx-snippet.conf — из шаблона ([proxy].nginx_conf_path) с подстановкой <PATH_PROJECT> и <VERSION>, или автогенерация для nginx reverse-proxy. При nginx_auto_apply vhost применяется на сервере после деплоя.",
+                    "File: releases/<version>/pirate-nginx-snippet.conf — from a template ([proxy].nginx_conf_path) with <PATH_PROJECT> and <VERSION> substitution, or auto-generated for nginx reverse-proxy. With nginx_auto_apply the vhost is applied on the server after deploy.",
                   )}
                 </p>
+                {projectMetrics?.project_nginx?.applied_site_path ? (
+                  <p className="mt-2 font-mono text-[11px] text-slate-500">
+                    sites-available: {projectMetrics.project_nginx.applied_site_path}
+                  </p>
+                ) : null}
+                {projectMetrics?.project_nginx?.needs_update ? (
+                  <p className="mt-2 rounded border border-amber-900/40 bg-amber-950/25 px-2 py-1 text-[11px] text-amber-100">
+                    {tr(
+                      "Шаблон nginx изменился — обновите vhost деплоем",
+                      "Nginx template changed — redeploy to refresh vhost",
+                    )}
+                  </p>
+                ) : null}
                 {projectMetrics?.project_nginx?.configured && projectMetrics.project_nginx.content ? (
                   <>
                     <p className="mb-2 font-mono text-[11px] text-slate-500">{projectMetrics.project_nginx.path}</p>

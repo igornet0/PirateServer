@@ -4,6 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Copy, Loader2, MonitorPlay } from "lucide-react";
 import React, { useCallback, useEffect, useState } from "react";
+import { useIntervalWhenVisible } from "./hooks/useIntervalWhenVisible";
 import { useI18n } from "./i18n";
 
 const btnBase =
@@ -68,11 +69,7 @@ export function DisplayStreamPanel() {
     }
   };
 
-  useEffect(() => {
-    if (!base) return;
-    const id = window.setInterval(() => refreshPreview(), 200);
-    return () => window.clearInterval(id);
-  }, [base, refreshPreview]);
+  useIntervalWhenVisible(() => refreshPreview(), 500, Boolean(base));
 
   const lastSrc =
     base && tick >= 0 ? `${base}/last.jpg?t=${tick}` : undefined;

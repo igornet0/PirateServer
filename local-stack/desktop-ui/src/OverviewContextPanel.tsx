@@ -24,7 +24,7 @@ export function OverviewContextPanel({
   deployedLabel: string | null;
   deployedValue: string;
   projectVersion: string | null;
-  tab: "overview" | "connection" | "internet" | "storage";
+  tab: "overview" | "connection" | "connections" | "internet" | "storage" | "tunnels";
   onOpenConnection: () => void;
   onOpenStorage: () => void;
 }) {
@@ -100,11 +100,15 @@ export function OverviewContextPanel({
           </p>
         ) : tab === "connection" ? (
           <p>{t("context.connectionTip")}</p>
+        ) : tab === "connections" ? (
+          <p>{t("context.connectionsTip")}</p>
         ) : tab === "storage" ? (
           <p>
             {t("context.storageTip")}{" "}
             {t("context.dbExplorerInStorageNote")}
           </p>
+        ) : tab === "tunnels" ? (
+          <p>{t("context.tunnelsTip")}</p>
         ) : (
           <p>{t("context.internetTip")}</p>
         )}

@@ -105,6 +105,70 @@ function parseStorageHttpError(msg: string): ParsedHttpErr | null {
   }
 }
 
+/**
+ * One file/folder row. Memoized so it only re-renders when its own `entry`
+ * or `selected` flag changes — not on every unrelated StoragePanel state
+ * update (rename input, modals, uploads, …). All callbacks passed in are
+ * stable (`useCallback`), which is what makes the `React.memo` effective.
+ */
+const StorageRow = React.memo(function StorageRow({
+  entry,
+  selected,
+  onRange,
+  onToggle,
+  onSingle,
+  onOpen,
+}: {
+  entry: StorageEntry;
+  selected: boolean;
+  onRange: (e: StorageEntry) => void;
+  onToggle: (e: StorageEntry) => void;
+  onSingle: (e: StorageEntry) => void;
+  onOpen: (e: StorageEntry) => void;
+}) {
+  return (
+    <tr
+      className={`cursor-pointer border-b border-border-subtle/50 hover:bg-white/5 ${
+        selected ? "bg-red-950/20" : ""
+      }`}
+      onClick={(ev) => {
+        if (ev.shiftKey) {
+          onRange(entry);
+        } else if (ev.metaKey || ev.ctrlKey) {
+          onToggle(entry);
+        } else {
+          onSingle(entry);
+        }
+      }}
+      onDoubleClick={() => onOpen(entry)}
+    >
+      <td className="px-3 py-1.5">
+        <input
+          type="checkbox"
+          className="rounded border border-white/20"
+          checked={selected}
+          onChange={() => onToggle(entry)}
+          onClick={(ev) => ev.stopPropagation()}
+        />
+      </td>
+      <td className="px-3 py-1.5 font-mono text-slate-200">
+        <span className="inline-flex items-center gap-1.5">
+          {entry.kind === "dir" ? (
+            <Folder className="h-3.5 w-3.5 text-amber-500/80" />
+          ) : (
+            <FileIcon className="h-3.5 w-3.5 text-slate-500" />
+          )}
+          {entry.name}
+        </span>
+      </td>
+      <td className="px-3 py-1.5 text-slate-500">{entry.kind}</td>
+      <td className="px-3 py-1.5 font-mono text-slate-500">
+        {entry.kind === "file" ? formatBytes(entry.size) : "—"}
+      </td>
+    </tr>
+  );
+});
+
 export function StoragePanel() {
   const { t, language } = useI18n();
   const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
@@ -219,14 +283,15 @@ export function StoragePanel() {
     return parts.join("/");
   };
 
-  const enter = (e: StorageEntry) => {
+  // Stable (only state setters in body) so memoized rows are not invalidated.
+  const enter = useCallback((e: StorageEntry) => {
     if (e.kind === "dir") {
       setPath(e.path);
       setSelected(null);
       setSelectedPaths(new Set());
       setLastClickedPath(null);
     }
-  };
+  }, []);
 
   const selectedEntries = useMemo(() => {
     if (!list) return [];
@@ -1313,51 +1378,17 @@ export function StoragePanel() {
               </tr>
             </thead>
             <tbody>
-              {list.entries.map((e) => {
-                const isSel = selectedPaths.has(e.path);
-                return (
-                  <tr
-                    key={e.path + e.name}
-                    className={`cursor-pointer border-b border-border-subtle/50 hover:bg-white/5 ${
-                      isSel ? "bg-red-950/20" : ""
-                    }`}
-                    onClick={(ev) => {
-                      if (ev.shiftKey) {
-                        selectRange(e);
-                      } else if (ev.metaKey || ev.ctrlKey) {
-                        toggleSelection(e);
-                      } else {
-                        setSingleSelection(e);
-                      }
-                    }}
-                    onDoubleClick={() => enter(e)}
-                  >
-                    <td className="px-3 py-1.5">
-                      <input
-                        type="checkbox"
-                        className="rounded border border-white/20"
-                        checked={isSel}
-                        onChange={() => toggleSelection(e)}
-                        onClick={(ev) => ev.stopPropagation()}
-                      />
-                    </td>
-                    <td className="px-3 py-1.5 font-mono text-slate-200">
-                      <span className="inline-flex items-center gap-1.5">
-                        {e.kind === "dir" ? (
-                          <Folder className="h-3.5 w-3.5 text-amber-500/80" />
-                        ) : (
-                          <FileIcon className="h-3.5 w-3.5 text-slate-500" />
-                        )}
-                        {e.name}
-                      </span>
-                    </td>
-                    <td className="px-3 py-1.5 text-slate-500">{e.kind}</td>
-                    <td className="px-3 py-1.5 font-mono text-slate-500">
-                      {e.kind === "file" ? formatBytes(e.size) : "—"}
-                    </td>
-                  </tr>
-                );
-              })}
+              {list.entries.map((e) => (
+                <StorageRow
+                  key={e.path + e.name}
+                  entry={e}
+                  selected={selectedPaths.has(e.path)}
+                  onRange={selectRange}
+                  onToggle={toggleSelection}
+                  onSingle={setSingleSelection}
+                  onOpen={enter}
+                />
+              ))}
             </tbody>
           </table>
         ) : null}

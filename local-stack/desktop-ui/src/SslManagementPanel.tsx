@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { AlertCircle, CheckCircle, Loader2, RefreshCw, Shield, XCircle } from "lucide-react";
 import React, { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
+import { useControlApiSession } from "./session/ControlApiSession";
 import { CopyablePre } from "./ui/CopyablePre";
 import { ModalDialog } from "./ui/ModalDialog";
 
@@ -218,6 +219,7 @@ export function SslManagementPanel({
   onHostRestartHint,
   onRestartPending,
 }: Props) {
+  const { ensureControlApiBase } = useControlApiSession();
   const [certs, setCerts] = useState<SslCertRow[]>([]);
   const [thresholdDays, setThresholdDays] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
@@ -268,7 +270,7 @@ export function SslManagementPanel({
     setSchedBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_fetch_host_deploy_env_json");
       const parsed = JSON.parse(raw) as { content?: string };
       const c = typeof parsed.content === "string" ? parsed.content : "";
@@ -295,7 +297,7 @@ export function SslManagementPanel({
     setErr(null);
     onHostRestartHint?.(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       let c = schedEnvDraft;
       c = upsertEnvKey(c, "SSL_CHECK_INTERVAL", schedInterval.trim() || "86400");
       c = upsertEnvKey(c, "SSL_ENABLE_SCHEDULER", schedEnable.trim() || "0");

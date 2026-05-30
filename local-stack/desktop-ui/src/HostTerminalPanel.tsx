@@ -3,6 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useControlApiSession } from "./session/ControlApiSession";
 
 function httpToWs(base: string): string {
   const u = base.trim();
@@ -18,6 +19,7 @@ type Props = {
 };
 
 export function HostTerminalPanel({ controlBase, tr, restartPending = false }: Props) {
+  const { ensureControlApiBase } = useControlApiSession();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -50,7 +52,7 @@ export function HostTerminalPanel({ controlBase, tr, restartPending = false }: P
     disconnect();
     setStatus("connecting");
     try {
-      await invoke("set_control_api_base", { url: base });
+      await ensureControlApiBase(base.trim());
       const token = await invoke<string>("control_api_bearer_token");
       const url = `${httpToWs(base)}/api/v1/host-terminal/ws?access_token=${encodeURIComponent(token)}`;
       const ws = new WebSocket(url);

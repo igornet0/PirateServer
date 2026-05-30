@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Globe, Loader2, Power, ScrollText, X } from "lucide-react";
 import React, { useCallback, useEffect, useState } from "react";
+import { useIntervalWhenVisible } from "./hooks/useIntervalWhenVisible";
 import { useI18n } from "./i18n";
 
 type InternetProxyStatus = {
@@ -153,16 +154,11 @@ export function InternetTrafficPanel() {
     void loadSettings();
     void loadRulesForm();
     void loadBoardForm();
-    const id = window.setInterval(() => void refreshStatus(), 4000);
-    return () => window.clearInterval(id);
   }, [refreshStatus, loadSettings, loadRulesForm, loadBoardForm]);
 
-  useEffect(() => {
-    if (!logsOpen) return;
-    void refreshProxyLogs();
-    const id = window.setInterval(() => void refreshProxyLogs(), 1000);
-    return () => window.clearInterval(id);
-  }, [logsOpen, refreshProxyLogs]);
+  useIntervalWhenVisible(() => void refreshStatus(), 4000, true);
+
+  useIntervalWhenVisible(() => void refreshProxyLogs(), 2000, logsOpen);
 
   const patchBundle = useCallback(
     (which: RulesTab, patch: Partial<Pick<RuleBundleEdit, "domains" | "domainPatterns" | "ips">>) => {

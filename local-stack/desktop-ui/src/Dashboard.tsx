@@ -26,7 +26,7 @@
  * // await invoke("deploy_artifact", { ... });
  * // await invoke("change_endpoint", { url });
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertCircle,
@@ -47,18 +47,45 @@ import {
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Toaster } from "sonner";
+import { useDashboardTabs } from "./dashboard/useDashboardTabs";
 import { AppShell } from "./AppShell";
-import { DisplayStreamPanel } from "./DisplayStreamPanel";
-import { InternetTrafficPanel } from "./InternetTrafficPanel";
-import { HostMetricsPanel } from "./HostMetricsPanel";
+import { ControlApiSessionProvider } from "./session/ControlApiSession";
 import { OverviewContextPanel } from "./OverviewContextPanel";
-import { StoragePanel } from "./StoragePanel";
 import { ProjectSwitcher } from "./ProjectSwitcher";
-import { ProjectsPanel } from "./ProjectsPanel";
-import { ServerProjectsOverview } from "./ServerProjectsOverview";
-import { ServerBookmarkSettingsModal } from "./ServerBookmarkSettingsModal";
 import { SidebarNav, type MainTab } from "./SidebarNav";
+
+// Heavy leaf panels are code-split: their chunk (and the editor/chart vendor
+// chunks they pull in) is only fetched the first time the panel is shown.
+const DisplayStreamPanel = React.lazy(() =>
+  import("./DisplayStreamPanel").then((m) => ({ default: m.DisplayStreamPanel })),
+);
+const InternetTrafficPanel = React.lazy(() =>
+  import("./InternetTrafficPanel").then((m) => ({ default: m.InternetTrafficPanel })),
+);
+const HostMetricsPanel = React.lazy(() =>
+  import("./HostMetricsPanel").then((m) => ({ default: m.HostMetricsPanel })),
+);
+const StoragePanel = React.lazy(() =>
+  import("./StoragePanel").then((m) => ({ default: m.StoragePanel })),
+);
+const StackTunnelsPanel = React.lazy(() =>
+  import("./StackTunnelsPanel").then((m) => ({ default: m.StackTunnelsPanel })),
+);
+const ProjectsPanel = React.lazy(() =>
+  import("./ProjectsPanel").then((m) => ({ default: m.ProjectsPanel })),
+);
+const ServerProjectsOverview = React.lazy(() =>
+  import("./ServerProjectsOverview").then((m) => ({ default: m.ServerProjectsOverview })),
+);
+const ServerBookmarkSettingsModal = React.lazy(() =>
+  import("./ServerBookmarkSettingsModal").then((m) => ({
+    default: m.ServerBookmarkSettingsModal,
+  })),
+);
 import pirateAppIcon from "../src-tauri/icons/icon.png";
+
+/** Initial gRPC handshake should not block first paint (`verify_grpc` can stall on dead hosts). */
+const GRPC_STATUS_INIT_TIMEOUT_MS = 8000;
 import { useI18n } from "./i18n";
 import type { HostServicesCompatSummary } from "./projects-preflight-types";
 import type { ToolchainReport } from "./toolchain-types";
@@ -70,6 +97,7 @@ import {
 import { suggestControlApiFromGrpcUrl } from "./controlApiUrl";
 import { looksLikeInstallBundle } from "./installBundle";
 import { ModalDialog } from "./ui/ModalDialog";
+import { useCmdVarsPrompt } from "./useCmdVarsPrompt";
 
 // -----------------------------------------------------------------------------
 // Types & mock data (used when Tauri is unavailable or for Storybook-style preview)
@@ -148,6 +176,15 @@ type DeployOutcome = {
   chunkCount: number;
   /** `grpc` | `http_chunked` | `http_multipart` when the desktop chose a transport */
   uploadChannel?: string;
+  nginxApply?: {
+    ok: boolean;
+    path: string;
+    message: string;
+    action: string;
+    templateChanged: boolean;
+    contentSha256: string;
+    testOutput?: string | null;
+  } | null;
 };
 
 function formatArtifactSize(bytes: number): string {
@@ -322,7 +359,7 @@ const btnBase =
 export function Dashboard() {
   const { language, setLanguage, t } = useI18n();
   const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
-    const [mainTab, setMainTab] = useState<MainTab>("projects");
+    const { mainTab, setMainTab } = useDashboardTabs("projects");
 
   const [endpoint, setEndpoint] = useState<string | null>(null);
   const [grpcLive, setGrpcLive] = useState<GrpcConnectResult | null>(null);
@@ -351,6 +388,7 @@ export function Dashboard() {
   }, [deploying]);
 
   useEffect(() => {
+    if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     void listen<DeployProgressPayload>("deploy-progress", (event) => {
@@ -379,7 +417,7 @@ export function Dashboard() {
   }, []);
 
   const [toolchainReport, setToolchainReport] = useState<ToolchainReport | null>(null);
-  const [toolchainLoading, setToolchainLoading] = useState(true);
+  const [toolchainLoading, setToolchainLoading] = useState(false);
   const [toolchainErr, setToolchainErr] = useState<string | null>(null);
 
   const refreshToolchain = useCallback(async () => {
@@ -539,14 +577,29 @@ export function Dashboard() {
         setControlApiInput("");
       }
       if (ep) {
-        try {
-          const r = await invoke<GrpcConnectResult>("refresh_grpc_status");
-          commitGrpcLive(r);
-          setGrpcErr(null);
-        } catch (e) {
-          setGrpcLive(null);
-          setGrpcErr(String(e));
-        }
+        void (async () => {
+          try {
+            const preferRu =
+              typeof navigator !== "undefined" &&
+              !!navigator.languages?.some((l) => l.toLowerCase().startsWith("ru"));
+            const timeoutMsg = preferRu
+              ? "Проверка gRPC: превышено время ожидания"
+              : "gRPC status check timed out";
+            const r = await Promise.race([
+              invoke<GrpcConnectResult>("refresh_grpc_status"),
+              new Promise<never>((_, reject) => {
+                window.setTimeout(() => {
+                  reject(new Error(timeoutMsg));
+                }, GRPC_STATUS_INIT_TIMEOUT_MS);
+              }),
+            ]);
+            commitGrpcLive(r);
+            setGrpcErr(null);
+          } catch (e) {
+            setGrpcLive(null);
+            setGrpcErr(String(e));
+          }
+        })();
       }
     } catch {
       setEndpoint(null);
@@ -558,27 +611,6 @@ export function Dashboard() {
     void init();
   }, [init]);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      setToolchainLoading(true);
-      setToolchainErr(null);
-      try {
-        const r = await invoke<ToolchainReport>("probe_local_toolchain");
-        if (!cancelled) setToolchainReport(r);
-      } catch (e) {
-        if (!cancelled) {
-          setToolchainErr(String(e));
-          setToolchainReport(null);
-        }
-      } finally {
-        if (!cancelled) setToolchainLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   const runPirateCliInstall = useCallback(
     async (systemWide: boolean, info: PirateCliPathInfo | null) => {
@@ -673,6 +705,7 @@ export function Dashboard() {
   }, []);
 
   useEffect(() => {
+    if (!isTauri()) return;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listen<{ sent: number; total: number }>("server_stack_upload_progress", (ev) => {
@@ -752,12 +785,12 @@ export function Dashboard() {
         ),
         {
           description: tr(
-            "Вкладка «Соединение» → шестерёнка у сервера → войдите в control-api для графиков и REST.",
-            "Connection tab → gear next to the server → sign in to control-api for charts and REST.",
+            "Вкладка «Подключения» → шестерёнка у сохранённого сервера → войдите в control-api для графиков и REST.",
+            "Connections tab → gear on a bookmark → sign in to control-api for charts and REST.",
           ),
           action: {
-            label: tr("Открыть «Соединение»", "Open Connection"),
-            onClick: () => setMainTab("connection"),
+            label: tr("Открыть «Подключения»", "Open Connections"),
+            onClick: () => setMainTab("connections"),
           },
         },
       );
@@ -940,7 +973,11 @@ export function Dashboard() {
         });
       } else {
         setDeployMsg(
-          `OK: ${r.status} → ${r.deployedVersion} (${formatArtifactSize(r.artifactBytes)}, ${r.chunkCount} chunks${r.uploadChannel ? `, ${r.uploadChannel}` : ""})`,
+          `OK: ${r.status} → ${r.deployedVersion} (${formatArtifactSize(r.artifactBytes)}, ${r.chunkCount} chunks${r.uploadChannel ? `, ${r.uploadChannel}` : ""})${
+            r.nginxApply
+              ? `; nginx ${r.nginxApply.action}${r.nginxApply.path ? ` @ ${r.nginxApply.path}` : ""}`
+              : ""
+          }`,
         );
         toast.success(t("auto.Dashboard_tsx.4"), { description: r.deployedVersion });
       }
@@ -966,6 +1003,7 @@ export function Dashboard() {
   };
 
   const paasPath = deployDir;
+  const { promptCmdVars, cmdVarsModal } = useCmdVarsPrompt(deployDir, language);
   const runPaas = async (
     label: string,
     fn: () => Promise<string | void>,
@@ -1037,6 +1075,14 @@ export function Dashboard() {
     } catch {
       /* continue */
     }
+    const vars = await promptCmdVars(
+      ["build", "test"],
+      tr("Параметры pipeline (build / test)", "Pipeline parameters (build / test)"),
+    );
+    if (vars === null) {
+      setPaasMsg(tr("Pipeline отменён.", "Pipeline cancelled."));
+      return;
+    }
     await runPaas("Pipeline", async () => {
       const s = await invoke<string>("paas_pipeline", {
         path: deployDir,
@@ -1045,6 +1091,7 @@ export function Dashboard() {
         skipTestLocal: true,
         version: deployVersion.trim(),
         chunkSize: null,
+        cmdVars: vars,
       });
       try {
         const live = await invoke<GrpcConnectResult>("refresh_grpc_status");
@@ -1197,6 +1244,14 @@ export function Dashboard() {
 
   return (
     <>
+      <React.Suspense
+        fallback={
+          <div className="flex h-screen w-full items-center justify-center bg-app text-sm text-slate-400">
+            …
+          </div>
+        }
+      >
+      <ControlApiSessionProvider initialBase={controlApiInput} syncBase={controlApiInput}>
       <Toaster
         position="top-right"
         theme="dark"
@@ -1287,10 +1342,10 @@ export function Dashboard() {
                 </div>
                 <button
                   type="button"
-                  onClick={() => setMainTab("connection")}
+                  onClick={() => setMainTab("connections")}
                   className={`${btnBase} shrink-0 border border-red-900/40 bg-red-950/30 px-3 py-1.5 text-xs text-red-100 hover:bg-red-950/50 hover:shadow-glow`}
                 >
-                  {t("dashboard.connection")}
+                  {t("sidebar.connections")}
                 </button>
               </div>
             </header>
@@ -1335,10 +1390,8 @@ export function Dashboard() {
                   />
                 ) : (
                   <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 md:px-6">
-                    <div
-                      className={mainTab === "overview" ? "contents" : "hidden"}
-                      aria-hidden={mainTab !== "overview"}
-                    >
+                    {mainTab === "overview" ? (
+                    <>
                       <section
                         className="rounded-lg border border-border-subtle bg-panel p-4 shadow-card"
                         aria-labelledby="conn-summary-heading"
@@ -1418,7 +1471,7 @@ export function Dashboard() {
                           </div>
                           <button
                             type="button"
-                            onClick={() => setMainTab("connection")}
+                            onClick={() => setMainTab("connections")}
                             className={`${btnBase} shrink-0 border border-red-900/50 bg-red-950/40 text-orange-100 hover:bg-red-950/55`}
                           >
                             {t("auto.Dashboard_tsx.16")}
@@ -1431,13 +1484,9 @@ export function Dashboard() {
                         serverControlApiPublic={grpcLive?.controlApiHttpUrl?.trim() || null}
                         serverControlApiDirect={grpcLive?.controlApiHttpUrlDirect?.trim() || null}
                         modalPortalEl={workspacePortalEl}
-                        onOpenConnectionSettings={() => setMainTab("connection")}
+                        onOpenConnectionSettings={() => setMainTab("connections")}
                         onOpenProjectDeploy={() => setMainTab("projects")}
                       />
-                    </div>
-                    {mainTab === "internet" ? <InternetTrafficPanel /> : null}
-                    {mainTab === "storage" ? <StoragePanel /> : null}
-                    {mainTab === "overview" ? (
                       <div className="mt-6 flex flex-col gap-6">
                         <HostMetricsPanel
                           metrics={metrics}
@@ -1450,49 +1499,36 @@ export function Dashboard() {
                         />
                         <DisplayStreamPanel />
                       </div>
+                    </>
                     ) : null}
+                    {mainTab === "internet" ? <InternetTrafficPanel /> : null}
+                    {mainTab === "tunnels" ? <StackTunnelsPanel /> : null}
+                    {mainTab === "storage" ? <StoragePanel /> : null}
                     {mainTab === "connection" ? (
                       <section
                         className="rounded-lg border border-border-subtle bg-panel p-5 shadow-card transition"
                         aria-labelledby="server-heading"
                       >
-                        <h2 id="server-heading" className="sr-only">
-                          {tr("Соединение с сервером", "Server connection")}
+                        <h2 id="server-heading" className="text-base font-semibold text-slate-100">
+                          {tr("Текущая сессия", "Current session")}
                         </h2>
-                        {bookmarks.length > 0 ? (
-                          <div className="mb-4">
-                            <label
-                              htmlFor="saved-connection-select"
-                              className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-slate-500"
-                            >
-                              {t("auto.Dashboard_tsx.17")}
-                            </label>
-                            <select
-                              id="saved-connection-select"
-                              className="w-full rounded-lg border border-border-subtle bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35 disabled:opacity-60"
-                              value={selectedBookmarkUrl}
-                              onChange={(e) => onSavedConnectionSelect(e.target.value)}
-                              disabled={connectionSwitching}
-                              aria-label={t("auto.Dashboard_tsx.18")}
-                            >
-                              <option value="">
-                                {endpoint && !selectedBookmarkUrl
-                                  ? t("auto.Dashboard_tsx.19")
-                                  : t("auto.Dashboard_tsx.20")}
-                              </option>
-                              {bookmarks.map((b) => (
-                                <option key={b.id} value={b.url}>
-                                  {b.label}
-                                </option>
-                              ))}
-                            </select>
-                            {connectionSwitching ? (
-                              <p className="mt-1.5 text-xs text-slate-500">{t("auto.Dashboard_tsx.21")}</p>
-                            ) : null}
-                          </div>
-                        ) : null}
+                        <p className="mt-1 max-w-xl text-xs text-slate-500">
+                          {tr(
+                            "Статус gRPC с deploy-server. Другой сервер или мастер — вкладка «Подключения».",
+                            "Live gRPC session to deploy-server. Another host or the wizard lives on Connections.",
+                          )}
+                        </p>
                         {!endpoint ? (
-                          <p className="text-sm text-slate-400">{t("auto.Dashboard_tsx.22")}</p>
+                          <>
+                            <p className="mt-3 text-sm text-slate-400">{t("auto.Dashboard_tsx.22")}</p>
+                            <button
+                              type="button"
+                              onClick={() => setMainTab("connections")}
+                              className={`${btnBase} mt-3 border border-red-900/45 bg-red-950/35 px-4 py-2 text-sm text-orange-100 hover:bg-red-950/55`}
+                            >
+                              {t("sidebar.connections")}
+                            </button>
+                          </>
                         ) : (
                           <div className="space-y-4">
                             <div className="flex flex-wrap items-center gap-2">
@@ -1593,6 +1629,80 @@ export function Dashboard() {
                             </button>
                             <button
                               type="button"
+                              onClick={() => setMainTab("connections")}
+                              className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200 hover:bg-white/[0.06]`}
+                            >
+                              {t("session.gotoConnectionsManage")}
+                            </button>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!endpoint}
+                            onClick={() => void onDisconnect()}
+                            title={tr("Сбросить gRPC-сессию на этом компьютере", "Clear gRPC session on this machine")}
+                            className={`${btnBase} shrink-0 border border-rose-500/40 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20`}
+                          >
+                            {t("auto.Dashboard_tsx.30")}
+                          </button>
+                        </div>
+                        {grpcErr ? (
+                          <p className="mt-3 flex items-start gap-2 text-sm text-rose-300">
+                            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                            {grpcErr}
+                          </p>
+                        ) : null}
+                      </section>
+                    ) : null}
+                    {mainTab === "connections" ? (
+                      <>
+                        <section
+                          className="rounded-lg border border-border-subtle bg-panel p-5 shadow-card transition"
+                          aria-labelledby="connections-setup-heading"
+                        >
+                          <h2 id="connections-setup-heading" className="text-lg font-semibold text-slate-100">
+                            {t("sidebar.connections")}
+                          </h2>
+                          <p className="mt-1 max-w-xl text-xs text-slate-500">
+                            {tr(
+                              "Сохранённые адреса, быстрый выбор из списка и мастер из install JSON.",
+                              "Bookmarks, the quick picker, and install-JSON signup flow.",
+                            )}
+                          </p>
+                          {bookmarks.length > 0 ? (
+                            <div className="mt-4">
+                              <label
+                                htmlFor="saved-connection-select"
+                                className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-slate-500"
+                              >
+                                {t("auto.Dashboard_tsx.17")}
+                              </label>
+                              <select
+                                id="saved-connection-select"
+                                className="w-full rounded-lg border border-border-subtle bg-black/30 px-3 py-2 text-sm text-slate-100 focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/35 disabled:opacity-60"
+                                value={selectedBookmarkUrl}
+                                onChange={(e) => onSavedConnectionSelect(e.target.value)}
+                                disabled={connectionSwitching}
+                                aria-label={t("auto.Dashboard_tsx.18")}
+                              >
+                                <option value="">
+                                  {endpoint && !selectedBookmarkUrl
+                                    ? t("auto.Dashboard_tsx.19")
+                                    : t("auto.Dashboard_tsx.20")}
+                                </option>
+                                {bookmarks.map((b) => (
+                                  <option key={b.id} value={b.url}>
+                                    {b.label}
+                                  </option>
+                                ))}
+                              </select>
+                              {connectionSwitching ? (
+                                <p className="mt-1.5 text-xs text-slate-500">{t("auto.Dashboard_tsx.21")}</p>
+                              ) : null}
+                            </div>
+                          ) : null}
+                          <div className="mt-5 flex flex-wrap gap-2">
+                            <button
+                              type="button"
                               onClick={() => {
                                 setConnectionWizardMode(false);
                                 setModalConnectOpen(true);
@@ -1614,25 +1724,7 @@ export function Dashboard() {
                               {t("auto.Dashboard_tsx.29")}
                             </button>
                           </div>
-                          <button
-                            type="button"
-                            disabled={!endpoint}
-                            onClick={() => void onDisconnect()}
-                            title={tr("Сбросить gRPC-сессию на этом компьютере", "Clear gRPC session on this machine")}
-                            className={`${btnBase} shrink-0 border border-rose-500/40 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20`}
-                          >
-                            {t("auto.Dashboard_tsx.30")}
-                          </button>
-                        </div>
-                        {grpcErr ? (
-                          <p className="mt-3 flex items-start gap-2 text-sm text-rose-300">
-                            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                            {grpcErr}
-                          </p>
-                        ) : null}
-                      </section>
-                    ) : null}
-                    {mainTab === "connection" ? (
+                        </section>
                       <section
                         className="mt-6 rounded-lg border border-border-subtle bg-panel p-5 shadow-card"
                         aria-labelledby="bookmarks-heading"
@@ -1732,6 +1824,7 @@ export function Dashboard() {
                           {t("auto.Dashboard_tsx.38")}
                         </button>
                       </section>
+                      </>
                     ) : null}
                   </div>
                 )}
@@ -1753,11 +1846,15 @@ export function Dashboard() {
                       ? "overview"
                       : mainTab === "connection"
                         ? "connection"
-                        : mainTab === "storage"
-                          ? "storage"
-                          : "internet"
+                        : mainTab === "connections"
+                          ? "connections"
+                          : mainTab === "storage"
+                            ? "storage"
+                            : mainTab === "tunnels"
+                              ? "tunnels"
+                              : "internet"
                   }
-                  onOpenConnection={() => setMainTab("connection")}
+                  onOpenConnection={() => setMainTab("connections")}
                   onOpenStorage={() => setMainTab("storage")}
                 />
               ) : null}
@@ -2477,6 +2574,9 @@ export function Dashboard() {
           </div>
         </ModalDialog>
       ) : null}
+      {cmdVarsModal}
+      </ControlApiSessionProvider>
+      </React.Suspense>
     </>
   );
 }

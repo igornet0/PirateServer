@@ -17,6 +17,25 @@ function truncatePath(path: string, max = 56): string {
   return `${path.slice(0, head)}…${path.slice(-tail)}`;
 }
 
+/** Format millis from Rust `chrono`-style timestamps (milliseconds since UNIX epoch). */
+function formatDeployAtMs(ms: number | undefined | null, locale: string): string {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return "—";
+  try {
+    return new Date(ms).toLocaleString(locale, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  } catch {
+    return "—";
+  }
+}
+
+function truncateDeployHint(ms: number | undefined | null, locale: string, maxLen = 20): string {
+  const full = formatDeployAtMs(ms, locale);
+  if (full.length <= maxLen) return full;
+  return `${full.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
 export function RegisteredProjectsList({
   refreshKey,
   currentDeployDir,
@@ -33,7 +52,8 @@ export function RegisteredProjectsList({
 }) {
   const { language, t } = useI18n();
   const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
-    const compact = variant === "compact";
+  const dateLocale = language === "ru" ? "ru-RU" : "en-US";
+  const compact = variant === "compact";
   const [items, setItems] = useState<RegisteredProject[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -100,7 +120,8 @@ export function RegisteredProjectsList({
             )}{" "}
             <code className="text-orange-200/85">[project].deploy_project_id</code>{" "}
             {t("auto.RegisteredProjectsList_tsx.1")} <code className="text-orange-200/85">pirate.toml</code>
-            {t("auto.RegisteredProjectsList_tsx.2")}
+            {t("auto.RegisteredProjectsList_tsx.2")}{" "}
+            <span className="text-slate-500">{t("auto.RegisteredProjectsList_tsx.23")}</span>
           </p>
         ) : null}
         <div className={`flex flex-wrap gap-1.5 ${compact ? "w-full" : ""}`}>
@@ -193,6 +214,19 @@ export function RegisteredProjectsList({
                         <span title={t("auto.RegisteredProjectsList_tsx.15")}>
                           id: <code className="text-slate-400">{row.deployProjectId}</code>
                         </span>
+                        <span title={row.lastDeployedVersion ?? ""}>
+                          {t("auto.RegisteredProjectsList_tsx.22")}{" "}
+                          <code className="text-slate-300">
+                            {formatDeployAtMs(row.lastDeployAtMs ?? null, dateLocale)}
+                          </code>
+                          {row.lastDeployedVersion?.trim() ? (
+                            <>
+                              {" "}
+                              <span className="text-slate-600">·</span>{" "}
+                              <code className="text-slate-400">{row.lastDeployedVersion.trim()}</code>
+                            </>
+                          ) : null}
+                        </span>
                       </div>
                       {row.needsDeploy ? (
                         <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-orange-200/95">
@@ -218,6 +252,10 @@ export function RegisteredProjectsList({
                       {row.localVersion.trim() || "—"}
                       <span className="mx-1 text-slate-600">·</span>
                       {!row.connected ? "offline" : row.serverProjectVersion.trim() || "—"}
+                      <span className="mx-1 text-slate-700">/</span>
+                      <span title={t("auto.RegisteredProjectsList_tsx.22")}>
+                        Δ {truncateDeployHint(row.lastDeployAtMs ?? null, dateLocale, 22)}
+                      </span>
                     </p>
                   )}
                 </div>

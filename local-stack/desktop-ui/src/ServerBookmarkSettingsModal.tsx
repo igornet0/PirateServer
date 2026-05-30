@@ -8,13 +8,31 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { suggestControlApiFromGrpcUrl } from "./controlApiUrl";
 import { HostServerEnvPanel } from "./serverDeployEnv/HostServerEnvPanel";
 import { parseDotEnv } from "./serverDeployEnv/parseSerialize";
-import { AntiDdosPanel } from "./AntiDdosPanel";
 import { HostServicesPanel } from "./HostServicesPanel";
 import { useI18n } from "./i18n";
 import { CopyablePre } from "./ui/CopyablePre";
 import { ModalDialog } from "./ui/ModalDialog";
-import { HostTerminalPanel } from "./HostTerminalPanel";
-import { SslManagementPanel } from "./SslManagementPanel";
+import { useControlApiSession } from "./session/ControlApiSession";
+
+const AntiDdosPanel = React.lazy(() =>
+  import("./AntiDdosPanel").then((m) => ({ default: m.AntiDdosPanel })),
+);
+const HostTerminalPanel = React.lazy(() =>
+  import("./HostTerminalPanel").then((m) => ({ default: m.HostTerminalPanel })),
+);
+const ProcessListenersPanel = React.lazy(() =>
+  import("./ProcessListenersPanel").then((m) => ({ default: m.ProcessListenersPanel })),
+);
+const SslManagementPanel = React.lazy(() =>
+  import("./SslManagementPanel").then((m) => ({ default: m.SslManagementPanel })),
+);
+
+const tabPanelFallback = (
+  <div className="flex items-center gap-2 py-8 text-sm text-slate-400">
+    <Loader2 className="h-4 w-4 animate-spin" />
+    …
+  </div>
+);
 
 const btnBase =
   "inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050204] active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50";
@@ -36,6 +54,10 @@ type NginxSiteRow = {
   is_ui_stack: boolean;
   parse_warnings: string[];
 };
+
+type NginxMiniDialog =
+  | { kind: "domain"; path: string; draft: string }
+  | { kind: "ssl"; path: string; enable: boolean };
 
 type NginxSitesPayload = {
   ok: boolean;
@@ -173,6 +195,143 @@ type Props = {
   hostUiBundled?: boolean | null;
 };
 
+/**
+ * One nginx-inventory site row. Memoized so editing the nginx file `<textarea>`
+ * (or any of this modal's ~59 state hooks) does not re-render every site row —
+ * only the row whose `row`/`highlighted`/`busy` props actually change. All
+ * callbacks passed in are stable (`useCallback` / state setters).
+ */
+const NginxSiteTableRow = React.memo(function NginxSiteTableRow({
+  row,
+  highlighted,
+  busy,
+  onOpenFile,
+  onAction,
+  onMiniDialog,
+}: {
+  row: NginxSiteRow;
+  highlighted: boolean;
+  busy: boolean;
+  onOpenFile: (path: string) => void;
+  onAction: (body: Record<string, unknown>) => void;
+  onMiniDialog: (dialog: NginxMiniDialog) => void;
+}) {
+  const { language } = useI18n();
+  const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
+  const vhost = row.entry_kind === "vhost";
+  const activeLabel = vhost
+    ? row.active
+      ? tr("да (sites-enabled)", "yes (enabled)")
+      : tr("нет", "no")
+    : tr("вкл. в main", "via main");
+  return (
+    <tr
+      className={`border-b border-white/5 hover:bg-white/[0.03] ${
+        highlighted ? "bg-cyan-950/20 ring-1 ring-inset ring-cyan-700/30" : ""
+      }`}
+    >
+      <td className="px-2 py-1.5 align-top">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onOpenFile(row.path)}
+          title={tr("Открыть содержимое файла", "Open file contents")}
+          className="w-full max-w-[240px] rounded-lg border border-transparent px-1 py-0.5 text-left transition-colors hover:border-white/15 hover:bg-white/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-600/50 disabled:opacity-50"
+        >
+          <div className="font-mono text-[10px] text-amber-100/80 break-all">
+            {row.file_name}
+          </div>
+          <div className="mt-0.5 break-all text-[9px] text-slate-500">{row.path}</div>
+        </button>
+      </td>
+      <td className="px-2 py-1.5 align-top text-slate-400">{row.entry_kind}</td>
+      <td className="px-2 py-1.5 align-top text-slate-300">{activeLabel}</td>
+      <td className="px-2 py-1.5 align-top">
+        <span
+          className={
+            row.managed_by === "pirate"
+              ? "rounded border border-cyan-700/50 bg-cyan-950/40 px-1.5 py-0.5 text-cyan-200"
+              : "text-slate-500"
+          }
+        >
+          {row.managed_by}
+        </span>
+      </td>
+      <td className="px-2 py-1.5 align-top">
+        {row.ssl_enabled ? (
+          <span className="text-emerald-300">on</span>
+        ) : (
+          <span className="text-slate-500">off</span>
+        )}
+      </td>
+      <td className="px-2 py-1.5 align-top">
+        {row.is_ui_stack ? <span className="text-violet-300">UI</span> : "—"}
+      </td>
+      <td className="px-2 py-1.5 align-top break-all text-slate-400">
+        {row.domains.join(", ")}
+      </td>
+      <td className="px-2 py-1.5 align-top">
+        <div className="flex max-w-[280px] flex-wrap gap-1">
+          {vhost && !row.active ? (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                onAction({ action: "enable_site", available_path: row.path })
+              }
+              className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
+            >
+              {tr("Вкл.", "Enable")}
+            </button>
+          ) : null}
+          {vhost && row.active ? (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                const ep =
+                  row.enabled_path && row.enabled_path.length > 0
+                    ? row.enabled_path
+                    : `/etc/nginx/sites-enabled/${row.file_name}`;
+                onAction({ action: "disable_site", enabled_path: ep });
+              }}
+              className="rounded border border-rose-800/30 bg-rose-950/30 px-1.5 py-0.5 text-[10px] text-rose-100"
+            >
+              {tr("Выкл.", "Disable")}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              const initial =
+                row.domains[0] && row.domains[0] !== "_" ? row.domains[0] : "";
+              onMiniDialog({ kind: "domain", path: row.path, draft: initial });
+            }}
+            className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
+          >
+            {tr("Домен", "Domain")}
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              onMiniDialog({
+                kind: "ssl",
+                path: row.path,
+                enable: !row.ssl_enabled,
+              });
+            }}
+            className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
+          >
+            SSL {row.ssl_enabled ? tr("off", "off") : tr("on", "on")}
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+});
+
 export function ServerBookmarkSettingsModal({
   open,
   onClose,
@@ -183,6 +342,7 @@ export function ServerBookmarkSettingsModal({
   hostUiBundled = null,
 }: Props) {
   const { language, t } = useI18n();
+  const { ensureControlApiBase } = useControlApiSession();
   const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
     const [tab, setTab] = useState<TabId>("connect");
   const [listLabelDraft, setListLabelDraft] = useState("");
@@ -254,11 +414,9 @@ export function ServerBookmarkSettingsModal({
     { level: string; code: string; message: string }[]
   >([]);
   /** Tauri WebView often blocks `window.prompt` / `window.confirm`; use inline UI instead. */
-  const [nginxMiniDialog, setNginxMiniDialog] = useState<
-    | { kind: "domain"; path: string; draft: string }
-    | { kind: "ssl"; path: string; enable: boolean }
-    | null
-  >(null);
+  const [nginxMiniDialog, setNginxMiniDialog] = useState<NginxMiniDialog | null>(
+    null,
+  );
   const [nginxFileEditor, setNginxFileEditor] = useState<{
     path: string;
     content: string;
@@ -269,7 +427,14 @@ export function ServerBookmarkSettingsModal({
   } | null>(null);
 
   const [restartBusy, setRestartBusy] = useState(false);
+  const [stopBusy, setStopBusy] = useState(false);
   const [restartOut, setRestartOut] = useState<string | null>(null);
+  const [processStatus, setProcessStatus] = useState<{
+    current_version?: string;
+    state?: string;
+    source?: string;
+  } | null>(null);
+  const [processStatusBusy, setProcessStatusBusy] = useState(false);
 
   const [haBase, setHaBase] = useState("");
   const [haToken, setHaToken] = useState("");
@@ -493,7 +658,7 @@ export function ServerBookmarkSettingsModal({
     setProjectsLoading(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const overview = await invoke<{ projects: { id: string }[] }>("fetch_server_projects_overview");
       const ids = overview.projects.map((p) => p.id);
       if (ids.length && !ids.includes(projectId)) {
@@ -553,7 +718,7 @@ export function ServerBookmarkSettingsModal({
     setErr(null);
     setKeychainBanner(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const waitUntilReady = async () => {
         if (!restartPending) return;
         const base = controlBase.trim();
@@ -628,7 +793,7 @@ export function ServerBookmarkSettingsModal({
     setStatusBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_fetch_status_json", { projectId });
       setStatusJson(raw);
     } catch (e) {
@@ -643,7 +808,7 @@ export function ServerBookmarkSettingsModal({
     setEnvBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_fetch_app_env_json", { projectId });
       const parsed = JSON.parse(raw) as { path?: string; content?: string; exists?: boolean };
       setEnvPath(typeof parsed.path === "string" ? parsed.path : null);
@@ -664,7 +829,7 @@ export function ServerBookmarkSettingsModal({
     setErr(null);
     setHostRestartHint(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_fetch_host_deploy_env_json");
       const parsed = JSON.parse(raw) as { path?: string; content?: string; exists?: boolean };
       setHostEnvPath(typeof parsed.path === "string" ? parsed.path : null);
@@ -687,7 +852,7 @@ export function ServerBookmarkSettingsModal({
     setEnvBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       await invoke("control_api_put_app_env", { projectId, content: envText });
       setEnvDirty(false);
       await loadAppEnv();
@@ -703,7 +868,7 @@ export function ServerBookmarkSettingsModal({
     setErr(null);
     setHostRestartHint(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_put_host_deploy_env", {
         content: hostEnvText,
       });
@@ -753,7 +918,7 @@ export function ServerBookmarkSettingsModal({
     setHostEnvBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_fetch_host_deploy_env_template_json");
       const parsed = JSON.parse(raw) as { template?: string };
       if (typeof parsed.template === "string" && parsed.template.length > 0) {
@@ -773,14 +938,34 @@ export function ServerBookmarkSettingsModal({
     else void loadAppEnv();
   }, [open, tab, sessionOk, envSection, loadHostEnv, loadAppEnv]);
 
+  const loadProcessStatus = useCallback(async () => {
+    if (!sessionOk) return;
+    setProcessStatusBusy(true);
+    try {
+      await ensureControlApiBase(controlBase.trim());
+      const raw = await invoke<string>("control_api_fetch_status_json", { projectId });
+      const parsed = JSON.parse(raw) as {
+        current_version?: string;
+        state?: string;
+        source?: string;
+      };
+      setProcessStatus(parsed);
+    } catch {
+      setProcessStatus(null);
+    } finally {
+      setProcessStatusBusy(false);
+    }
+  }, [controlBase, projectId, sessionOk]);
+
   const restartProcess = async () => {
     setRestartBusy(true);
     setErr(null);
     setRestartOut(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_restart_process_json", { projectId });
       setRestartOut(raw);
+      await loadProcessStatus();
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -788,11 +973,27 @@ export function ServerBookmarkSettingsModal({
     }
   };
 
+  const stopProcess = async () => {
+    setStopBusy(true);
+    setErr(null);
+    setRestartOut(null);
+    try {
+      await ensureControlApiBase(controlBase.trim());
+      const raw = await invoke<string>("control_api_stop_process_json", { projectId });
+      setRestartOut(raw);
+      await loadProcessStatus();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setStopBusy(false);
+    }
+  };
+
   const loadNginxStatus = useCallback(async () => {
     setNginxSiteBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_fetch_nginx_status_json");
       const parsed = JSON.parse(raw) as typeof nginxStatus;
       setNginxStatus(parsed ?? null);
@@ -808,7 +1009,7 @@ export function ServerBookmarkSettingsModal({
     setNginxSiteBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_fetch_nginx_site_json");
       const parsed = JSON.parse(raw) as { path?: string; content?: string };
       setNginxSitePath(typeof parsed.path === "string" ? parsed.path : null);
@@ -827,7 +1028,7 @@ export function ServerBookmarkSettingsModal({
     setNginxSiteBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_fetch_nginx_sites_json");
       const parsed = normalizeNginxSitesPayload(JSON.parse(raw));
       setNginxSitesPayload(parsed);
@@ -843,7 +1044,7 @@ export function ServerBookmarkSettingsModal({
     setNginxSiteBusy(true);
     setErr(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_nginx_preflight_json", { body: "{}" });
       const parsed = normalizeNginxPreflightPayload(JSON.parse(raw));
       setNginxSitesPayload(parsed.inventory);
@@ -861,7 +1062,7 @@ export function ServerBookmarkSettingsModal({
       setErr(null);
       setNginxOut(null);
       try {
-        await invoke("set_control_api_base", { url: controlBase.trim() });
+        await ensureControlApiBase(controlBase.trim());
         const raw = await invoke<string>("control_api_nginx_action_json", { body: JSON.stringify(body) });
         setNginxOut(raw);
         try {
@@ -909,7 +1110,7 @@ export function ServerBookmarkSettingsModal({
     setErr(null);
     setNginxOut(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_put_nginx_site", { content: nginxSiteText });
       setNginxOut(raw);
       setNginxSiteDirty(false);
@@ -949,7 +1150,7 @@ export function ServerBookmarkSettingsModal({
       // Let React paint the overlay before invoking blocking host operation.
       await waitForNextFrame();
       await waitForNextFrame();
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_ensure_nginx", { mode });
       if (opId !== nginxOpSeq.current || nginxCancelRequested) {
         return;
@@ -1011,6 +1212,11 @@ export function ServerBookmarkSettingsModal({
     void loadNginxInventory();
   }, [open, tab, sessionOk, loadNginxStatus, loadNginxSite, loadNginxInventory]);
 
+  useEffect(() => {
+    if (!open || tab !== "process" || !sessionOk) return;
+    void loadProcessStatus();
+  }, [open, tab, sessionOk, loadProcessStatus]);
+
   const allowApiWithUiMode = hostUiBundled !== false;
   const hiddenHostEnvKeys = useMemo(() => {
     if (allowApiWithUiMode) return undefined;
@@ -1064,7 +1270,7 @@ export function ServerBookmarkSettingsModal({
       void (async () => {
         try {
           setErr(null);
-          await invoke("set_control_api_base", { url: controlBase.trim() });
+          await ensureControlApiBase(controlBase.trim());
           const raw = await invoke<string>("control_api_fetch_nginx_file_json", { path: filePath });
           const j = JSON.parse(raw) as { content?: string };
           setNginxFileEditor((prev) =>
@@ -1093,7 +1299,7 @@ export function ServerBookmarkSettingsModal({
     void (async () => {
       try {
         setErr(null);
-        await invoke("set_control_api_base", { url: controlBase.trim() });
+        await ensureControlApiBase(controlBase.trim());
         const raw = await invoke<string>("control_api_fetch_nginx_file_json", { path: p });
         const j = JSON.parse(raw) as { content?: string };
         setNginxFileEditor((prev) =>
@@ -1119,7 +1325,7 @@ export function ServerBookmarkSettingsModal({
     setErr(null);
     setNginxOut(null);
     try {
-      await invoke("set_control_api_base", { url: controlBase.trim() });
+      await ensureControlApiBase(controlBase.trim());
       const raw = await invoke<string>("control_api_put_nginx_file_json", {
         path: nginxFileEditor.path,
         content: nginxFileEditor.content,
@@ -1469,7 +1675,9 @@ export function ServerBookmarkSettingsModal({
           ) : null}
 
           {tab === "terminal" && sessionOk ? (
-            <HostTerminalPanel controlBase={controlBase} tr={tr} restartPending={restartPending} />
+            <React.Suspense fallback={tabPanelFallback}>
+              <HostTerminalPanel controlBase={controlBase} tr={tr} restartPending={restartPending} />
+            </React.Suspense>
           ) : null}
 
           {tab === "info" && sessionOk ? (
@@ -1683,7 +1891,9 @@ export function ServerBookmarkSettingsModal({
 
           {tab === "antiddos" && sessionOk ? (
             <div className="space-y-3">
-              <AntiDdosPanel sessionOk={sessionOk} />
+              <React.Suspense fallback={tabPanelFallback}>
+                <AntiDdosPanel sessionOk={sessionOk} />
+              </React.Suspense>
             </div>
           ) : null}
 
@@ -1695,47 +1905,109 @@ export function ServerBookmarkSettingsModal({
                   "Let’s Encrypt over gRPC: status, issue, renew. Requires the active gRPC to match this bookmark and a paired identity.",
                 )}
               </p>
-              <SslManagementPanel
-                grpcUrl={bookmark.url}
-                projectId={projectId}
-                controlBase={controlBase}
-                sessionOk={sessionOk}
-                sameServerAsActive={sameServerAsActive}
-                language={language === "ru" ? "ru" : "en"}
-                onHostRestartHint={setHostRestartHint}
-                onRestartPending={async () => {
-                  setRestartPendingUntil(Date.now() + 90_000);
-                  try {
-                    await invoke("mark_control_api_recent_restart", { seconds: 90 });
-                  } catch {
-                    /* ignore */
-                  }
-                }}
-              />
+              <React.Suspense fallback={tabPanelFallback}>
+                <SslManagementPanel
+                  grpcUrl={bookmark.url}
+                  projectId={projectId}
+                  controlBase={controlBase}
+                  sessionOk={sessionOk}
+                  sameServerAsActive={sameServerAsActive}
+                  language={language === "ru" ? "ru" : "en"}
+                  onHostRestartHint={setHostRestartHint}
+                  onRestartPending={async () => {
+                    setRestartPendingUntil(Date.now() + 90_000);
+                    try {
+                      await invoke("mark_control_api_recent_restart", { seconds: 90 });
+                    } catch {
+                      /* ignore */
+                    }
+                  }}
+                />
+              </React.Suspense>
             </div>
           ) : null}
 
           {tab === "process" && sessionOk ? (
             <div className="space-y-4">
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="min-w-[8rem] flex-1">
+                  <label className="mb-1 block text-xs text-slate-500">
+                    {t("auto.ServerBookmarkSettingsModal_tsx.21")}
+                  </label>
+                  <input
+                    value={projectId}
+                    onChange={(e) => setProjectId(e.target.value)}
+                    className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="button"
+                  disabled={projectsLoading}
+                  onClick={() => void loadProjectsHint()}
+                  className={`${btnBase} border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10`}
+                >
+                  {projectsLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {t("auto.ServerBookmarkSettingsModal_tsx.22")}
+                </button>
+                <button
+                  type="button"
+                  disabled={processStatusBusy}
+                  onClick={() => void loadProcessStatus()}
+                  className={`${btnBase} border border-red-800/40 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50`}
+                >
+                  {processStatusBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {t("auto.ServerBookmarkSettingsModal_tsx.23")}
+                </button>
+              </div>
+              {processStatus ? (
+                <p className="text-xs text-slate-400">
+                  {tr("Версия", "Version")}:{" "}
+                  <span className="font-mono text-amber-100/90">
+                    {processStatus.current_version?.trim() || "—"}
+                  </span>
+                  {" · "}
+                  {tr("Состояние", "State")}:{" "}
+                  <span className="font-mono text-slate-200">{processStatus.state ?? "—"}</span>
+                </p>
+              ) : null}
               <p className="text-sm text-slate-400">
                 <code className="text-orange-200/85">POST /api/v1/process/restart</code>{" "}
                 {t("auto.ServerBookmarkSettingsModal_tsx.49")}
               </p>
-              <button
-                type="button"
-                disabled={restartBusy}
-                onClick={() => void restartProcess()}
-                className={`${btnBase} bg-gradient-to-r from-red-700 to-red-900 text-white shadow-lg shadow-red-950/40 hover:brightness-110 disabled:opacity-40`}
-              >
-                {restartBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                {t("auto.ServerBookmarkSettingsModal_tsx.50")}
-              </button>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={restartBusy || stopBusy}
+                  onClick={() => void restartProcess()}
+                  className={`${btnBase} bg-gradient-to-r from-red-700 to-red-900 text-white shadow-lg shadow-red-950/40 hover:brightness-110 disabled:opacity-40`}
+                >
+                  {restartBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {t("auto.ServerBookmarkSettingsModal_tsx.50")}
+                </button>
+                <button
+                  type="button"
+                  disabled={restartBusy || stopBusy}
+                  onClick={() => void stopProcess()}
+                  className={`${btnBase} border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10 disabled:opacity-40`}
+                >
+                  {stopBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {tr("Остановить", "Stop")}
+                </button>
+              </div>
               <CopyablePre
                 value={restartOut}
                 placeholder="—"
                 className="rounded-xl border border-white/10 bg-black/40 p-3 text-xs text-slate-200"
                 maxHeightClass="max-h-48"
               />
+              <React.Suspense fallback={tabPanelFallback}>
+                <ProcessListenersPanel
+                  projectId={projectId}
+                  controlBase={controlBase}
+                  sessionOk={sessionOk}
+                  language={language === "ru" ? "ru" : "en"}
+                />
+              </React.Suspense>
             </div>
           ) : null}
 
@@ -2058,131 +2330,17 @@ export function ServerBookmarkSettingsModal({
                           </td>
                         </tr>
                       ) : null}
-                      {nginxSitesPayload.sites.map((row) => {
-                        const vhost = row.entry_kind === "vhost";
-                        const activeLabel = vhost
-                          ? row.active
-                            ? tr("да (sites-enabled)", "yes (enabled)")
-                            : tr("нет", "no")
-                          : tr("вкл. в main", "via main");
-                        return (
-                          <tr
-                            key={row.site_id}
-                            className={`border-b border-white/5 hover:bg-white/[0.03] ${
-                              nginxFileEditor?.path === row.path
-                                ? "bg-cyan-950/20 ring-1 ring-inset ring-cyan-700/30"
-                                : ""
-                            }`}
-                          >
-                            <td className="px-2 py-1.5 align-top">
-                              <button
-                                type="button"
-                                disabled={nginxSiteBusy}
-                                onClick={() => openNginxFileEditor(row.path)}
-                                title={tr("Открыть содержимое файла", "Open file contents")}
-                                className="w-full max-w-[240px] rounded-lg border border-transparent px-1 py-0.5 text-left transition-colors hover:border-white/15 hover:bg-white/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-600/50 disabled:opacity-50"
-                              >
-                                <div className="font-mono text-[10px] text-amber-100/80 break-all">
-                                  {row.file_name}
-                                </div>
-                                <div className="mt-0.5 break-all text-[9px] text-slate-500">{row.path}</div>
-                              </button>
-                            </td>
-                            <td className="px-2 py-1.5 align-top text-slate-400">{row.entry_kind}</td>
-                            <td className="px-2 py-1.5 align-top text-slate-300">{activeLabel}</td>
-                            <td className="px-2 py-1.5 align-top">
-                              <span
-                                className={
-                                  row.managed_by === "pirate"
-                                    ? "rounded border border-cyan-700/50 bg-cyan-950/40 px-1.5 py-0.5 text-cyan-200"
-                                    : "text-slate-500"
-                                }
-                              >
-                                {row.managed_by}
-                              </span>
-                            </td>
-                            <td className="px-2 py-1.5 align-top">
-                              {row.ssl_enabled ? (
-                                <span className="text-emerald-300">on</span>
-                              ) : (
-                                <span className="text-slate-500">off</span>
-                              )}
-                            </td>
-                            <td className="px-2 py-1.5 align-top">
-                              {row.is_ui_stack ? (
-                                <span className="text-violet-300">UI</span>
-                              ) : (
-                                "—"
-                              )}
-                            </td>
-                            <td className="px-2 py-1.5 align-top break-all text-slate-400">
-                              {row.domains.join(", ")}
-                            </td>
-                            <td className="px-2 py-1.5 align-top">
-                              <div className="flex max-w-[280px] flex-wrap gap-1">
-                                {vhost && !row.active ? (
-                                  <button
-                                    type="button"
-                                    disabled={nginxSiteBusy}
-                                    onClick={() =>
-                                      void runNginxAction({ action: "enable_site", available_path: row.path })
-                                    }
-                                    className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
-                                  >
-                                    {tr("Вкл.", "Enable")}
-                                  </button>
-                                ) : null}
-                                {vhost && row.active ? (
-                                  <button
-                                    type="button"
-                                    disabled={nginxSiteBusy}
-                                    onClick={() => {
-                                      const ep =
-                                        row.enabled_path && row.enabled_path.length > 0
-                                          ? row.enabled_path
-                                          : `/etc/nginx/sites-enabled/${row.file_name}`;
-                                      void runNginxAction({ action: "disable_site", enabled_path: ep });
-                                    }}
-                                    className="rounded border border-rose-800/30 bg-rose-950/30 px-1.5 py-0.5 text-[10px] text-rose-100"
-                                  >
-                                    {tr("Выкл.", "Disable")}
-                                  </button>
-                                ) : null}
-                                <button
-                                  type="button"
-                                  disabled={nginxSiteBusy}
-                                  onClick={() => {
-                                    const initial =
-                                      row.domains[0] && row.domains[0] !== "_" ? row.domains[0] : "";
-                                    setNginxMiniDialog({
-                                      kind: "domain",
-                                      path: row.path,
-                                      draft: initial,
-                                    });
-                                  }}
-                                  className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
-                                >
-                                  {tr("Домен", "Domain")}
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={nginxSiteBusy}
-                                  onClick={() => {
-                                    setNginxMiniDialog({
-                                      kind: "ssl",
-                                      path: row.path,
-                                      enable: !row.ssl_enabled,
-                                    });
-                                  }}
-                                  className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] hover:bg-white/10"
-                                >
-                                  SSL {row.ssl_enabled ? tr("off", "off") : tr("on", "on")}
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
+                      {nginxSitesPayload.sites.map((row) => (
+                        <NginxSiteTableRow
+                          key={row.site_id}
+                          row={row}
+                          highlighted={nginxFileEditor?.path === row.path}
+                          busy={nginxSiteBusy}
+                          onOpenFile={openNginxFileEditor}
+                          onAction={runNginxAction}
+                          onMiniDialog={setNginxMiniDialog}
+                        />
+                      ))}
                     </tbody>
                   </table>
                 </div>

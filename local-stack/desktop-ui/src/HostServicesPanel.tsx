@@ -35,7 +35,7 @@ type HostServicesView = {
 };
 
 /** Preferred column order in filter chips; unknown ids follow alphabetically. */
-const CATEGORY_ORDER = ["runtime", "web", "database", "storage", "search", "mail"] as const;
+const CATEGORY_ORDER = ["runtime", "web", "database", "storage", "search", "tunnel", "mail"] as const;
 
 function sortCategoryIds(ids: string[]): string[] {
   const rank = (id: string) => {
@@ -91,6 +91,24 @@ function mergeWithUiServicePlaceholders(
       runtime_configurable: false,
     });
   }
+  if (!have.has("stack_tun_api")) {
+    list.push({
+      id: "stack_tun_api",
+      display_name: "Stack tunnel API",
+      category: "tunnel",
+      installed: false,
+      version: null,
+      running: null,
+      systemd_unit: null,
+      actions: "none",
+      notes: t(
+        "В ответе API нет stack-tun-api: обновите server-stack (control-api/deploy-control) на хосте.",
+        "Stack tunnel API is missing from host-services — update server-stack (control-api/deploy-control) on the host.",
+      ),
+      synthetic: true,
+      runtime_configurable: false,
+    });
+  }
   return list;
 }
 
@@ -121,6 +139,7 @@ export function HostServicesPanel({ sessionOk }: { sessionOk: boolean }) {
       database: tr("Базы данных", "Databases"),
       storage: tr("Хранилище (SMB, MinIO…)", "Storage (SMB, MinIO…)"),
       search: tr("Поиск (Meilisearch)", "Search (Meilisearch)"),
+      tunnel: tr("Туннели (stack-tun-api)", "Tunnels (stack-tun-api)"),
       mail: tr("Почта", "Mail"),
     };
     return m[c] ?? cat;
@@ -324,7 +343,7 @@ export function HostServicesPanel({ sessionOk }: { sessionOk: boolean }) {
               type="search"
               value={nameFilter}
               onChange={(e) => setNameFilter(e.target.value)}
-              placeholder={tr("redis, minio, postgres…", "redis, minio, postgres…")}
+              placeholder={tr("redis, minio, stack_tun_api…", "redis, minio, stack_tun_api…")}
               className="w-full max-w-md rounded-lg border border-white/10 bg-black/35 px-3 py-1.5 font-mono text-xs text-slate-200 placeholder:text-slate-600 focus:border-amber-600/40 focus:outline-none"
             />
           </div>
@@ -416,7 +435,9 @@ export function HostServicesPanel({ sessionOk }: { sessionOk: boolean }) {
                         className={`${btnSm} border border-emerald-800/40 bg-emerald-950/30 text-emerald-100`}
                       >
                         {busyId === row.id ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-                        {tr("Установить", "Install")}
+                        {row.id === "stack_tun_api"
+                          ? tr("Включить", "Enable")
+                          : tr("Установить", "Install")}
                       </button>
                     ) : null}
                     {row.actions === "remove" && data?.dispatch_script_present ? (
@@ -427,7 +448,9 @@ export function HostServicesPanel({ sessionOk }: { sessionOk: boolean }) {
                         className={`${btnSm} border border-red-800/40 bg-red-950/30 text-red-100`}
                       >
                         {busyId === row.id ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-                        {tr("Удалить", "Remove")}
+                        {row.id === "stack_tun_api"
+                          ? tr("Выключить", "Disable")
+                          : tr("Удалить", "Remove")}
                       </button>
                     ) : null}
                     {row.actions === "none" ? (
@@ -471,10 +494,15 @@ export function HostServicesPanel({ sessionOk }: { sessionOk: boolean }) {
         <div className="fixed inset-0 z-modalNestedHigh flex items-center justify-center bg-black/60 p-4">
           <div className="max-w-md rounded-xl border border-red-900/40 bg-[#120808] p-4 shadow-xl">
             <p className="text-sm text-slate-200">
-              {tr(
-                "Удалить пакеты этого сервиса на хосте? Для баз данных это может уничтожить данные.",
-                "Remove this service’s packages on the host? For databases this may destroy data.",
-              )}
+              {confirmRemoveId === "stack_tun_api"
+                ? tr(
+                    "Выключить systemd-сервис stack-tun-api на хосте (оставит бинарь и unit на месте)?",
+                    "Disable the stack-tun-api systemd unit on the host (binary and unit files stay installed)?",
+                  )
+                : tr(
+                    "Удалить пакеты этого сервиса на хосте? Для баз данных это может уничтожить данные.",
+                    "Remove this service’s packages on the host? For databases this may destroy data.",
+                  )}
             </p>
             <p className="mt-2 font-mono text-xs text-amber-200/90">{confirmRemoveId}</p>
             <div className="mt-4 flex flex-wrap gap-2">
@@ -483,7 +511,9 @@ export function HostServicesPanel({ sessionOk }: { sessionOk: boolean }) {
                 className={`${btnSm} border border-red-700/50 bg-red-950/40 text-red-100`}
                 onClick={() => void runRemove(confirmRemoveId)}
               >
-                {tr("Подтвердить удаление", "Confirm remove")}
+                {confirmRemoveId === "stack_tun_api"
+                  ? tr("Выключить", "Disable")
+                  : tr("Подтвердить удаление", "Confirm remove")}
               </button>
               <button type="button" className={`${btnSm} border border-white/10 bg-white/5`} onClick={() => setConfirmRemoveId(null)}>
                 {tr("Отмена", "Cancel")}

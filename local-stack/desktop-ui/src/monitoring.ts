@@ -68,12 +68,33 @@ export async function fetchOverview(base: string): Promise<MonitoringOverview> {
   return r.json() as Promise<MonitoringOverview>;
 }
 
+function startPollingFallback(
+  base: string,
+  onOverview: (o: MonitoringOverview) => void,
+  onErr: (e: string) => void,
+): void {
+  if (pollTimer) return;
+  pollTimer = setInterval(() => {
+    void fetchOverview(base).then(onOverview).catch((e: unknown) => onErr(String(e)));
+  }, 3000);
+}
+
 export function startMonitoringStreams(
   base: string,
   onOverview: (o: MonitoringOverview) => void,
   onErr: (e: string) => void,
 ): void {
   stopMonitoringStreams();
+
+  const stopPoll = () => {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  };
+
+  void fetchOverview(base).then(onOverview).catch((e: unknown) => onErr(String(e)));
+
   const url = `${httpToWs(base)}/api/v1/monitoring/stream`;
   try {
     const ws = new WebSocket(url);
@@ -91,19 +112,19 @@ export function startMonitoringStreams(
         /* ignore */
       }
     };
+    ws.onopen = () => stopPoll();
     ws.onerror = () => {
-      onErr("WebSocket error; using polling");
+      onErr("WebSocket error; using polling fallback");
+      startPollingFallback(base, onOverview, onErr);
     };
     ws.onclose = () => {
       wsRef = null;
+      startPollingFallback(base, onOverview, onErr);
     };
   } catch {
-    onErr("WebSocket unavailable");
+    onErr("WebSocket unavailable; using polling");
+    startPollingFallback(base, onOverview, onErr);
   }
-  pollTimer = setInterval(() => {
-    void fetchOverview(base).then(onOverview).catch((e: unknown) => onErr(String(e)));
-  }, 3000);
-  void fetchOverview(base).then(onOverview).catch((e: unknown) => onErr(String(e)));
 }
 
 export function monitoringDashboardHtml(

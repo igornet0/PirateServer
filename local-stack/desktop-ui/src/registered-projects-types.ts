@@ -7,4 +7,8 @@ export type RegisteredProject = {
   serverProjectVersion: string;
   connected: boolean;
   needsDeploy: boolean;
+  /** Unix ms — last desktop deploy recorded for this folder */
+  lastDeployAtMs?: number | null;
+  /** Server-reported deployed version after last desktop deploy */
+  lastDeployedVersion?: string | null;
 };

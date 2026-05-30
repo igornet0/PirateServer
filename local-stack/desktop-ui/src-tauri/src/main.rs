@@ -884,18 +884,25 @@ async fn deploy_from_directory(
     chunk_size: Option<u32>,
 ) -> Result<pirate_desktop::DeployOutcome, String> {
     let chunk = chunk_size.unwrap_or(64 * 1024) as usize;
-    let dir = PathBuf::from(directory);
+    let dir = PathBuf::from(directory.clone());
+    let registry_version = version.clone();
     let app2 = app.clone();
     tokio::task::spawn_blocking(move || {
         let rt = pirate_desktop::deploy::runtime().map_err(|e| e.to_string())?;
-        rt.block_on(pirate_desktop::deploy::run_deploy_with_progress_events(
-            dir,
+        let out = rt.block_on(pirate_desktop::deploy::run_deploy_with_progress_events(
+            dir.clone(),
             version,
             chunk,
             move |ev| {
                 let _ = app2.emit("deploy-progress", &ev);
             },
-        ))
+        ))?;
+        let _ = pirate_desktop::record_deploy_for_directory(
+            dir.as_path(),
+            &out.deployed_version,
+            Some(registry_version.trim()),
+        );
+        Ok(out)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -946,8 +953,28 @@ fn save_project_network_manifest(
 }
 
 #[tauri::command]
+fn load_project_network_manifest(directory: String) -> Result<pirate_desktop::LoadProjectNetworkManifestView, String> {
+    pirate_desktop::load_project_network_manifest(PathBuf::from(directory))
+}
+
+#[tauri::command]
+fn read_project_local_env(directory: String) -> Result<pirate_desktop::LocalEnvView, String> {
+    pirate_desktop::read_project_local_env(PathBuf::from(directory))
+}
+
+#[tauri::command]
+fn write_project_local_env(directory: String, content: String) -> Result<(), String> {
+    pirate_desktop::write_project_local_env(PathBuf::from(directory), content)
+}
+
+#[tauri::command]
 fn control_api_apply_project_nginx(directory: String) -> Result<String, String> {
     pirate_desktop::control_api_apply_project_nginx(&PathBuf::from(directory))
+}
+
+#[tauri::command]
+fn apply_manifest_fix(directory: String, fix_id: String) -> Result<String, String> {
+    pirate_desktop::apply_manifest_fix(&PathBuf::from(directory), &fix_id)
 }
 
 #[tauri::command]
@@ -972,13 +999,18 @@ fn remove_registered_project(name: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn local_dev_start(app: tauri::AppHandle, path: String) -> Result<(), String> {
+fn local_dev_start(
+    app: tauri::AppHandle,
+    path: String,
+    cmd_vars: Option<std::collections::HashMap<String, String>>,
+) -> Result<(), String> {
     let app = app.clone();
     let emit: std::sync::Arc<dyn Fn(pirate_desktop::LocalDevLogLine) + Send + Sync> =
         std::sync::Arc::new(move |line: pirate_desktop::LocalDevLogLine| {
             let _ = app.emit("local-dev-log", &line);
         });
-    pirate_desktop::start_local_dev_stack(PathBuf::from(path), Some(emit))
+    let vars = pirate_desktop::cmd_vars_map_from_json(cmd_vars);
+    pirate_desktop::start_local_dev_stack(PathBuf::from(path), Some(emit), vars)
 }
 
 #[tauri::command]
@@ -1043,8 +1075,11 @@ fn control_api_bearer_token() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn control_api_fetch_status_json(project_id: String) -> Result<String, String> {
-    pirate_desktop::control_api_fetch_status_json(&project_id)
+async fn control_api_fetch_status_json(project_id: String) -> Result<String, String> {
+    let pid = project_id;
+    tauri::async_runtime::spawn_blocking(move || pirate_desktop::control_api_fetch_status_json(&pid))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1592,6 +1627,90 @@ fn db_tunnel_ssh_stop(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn stack_tun_health(base_url: String, bearer: Option<String>) -> Result<String, String> {
+    pirate_desktop::stack_tun_health(&base_url, bearer.as_deref())
+}
+
+#[tauri::command]
+fn stack_tun_get_config(base_url: String, bearer: Option<String>) -> Result<String, String> {
+    pirate_desktop::stack_tun_get_config_json(&base_url, bearer.as_deref())
+}
+
+#[tauri::command]
+fn stack_tun_put_config(
+    base_url: String,
+    bearer: Option<String>,
+    json_body: String,
+) -> Result<String, String> {
+    pirate_desktop::stack_tun_put_config_json(&base_url, bearer.as_deref(), &json_body)
+}
+
+#[tauri::command]
+fn stack_tun_reload_peers(base_url: String, bearer: Option<String>) -> Result<String, String> {
+    pirate_desktop::stack_tun_reload_peers(&base_url, bearer.as_deref())
+}
+
+#[tauri::command]
+fn stack_tun_stats(base_url: String, bearer: Option<String>) -> Result<String, String> {
+    pirate_desktop::stack_tun_stats_json(&base_url, bearer.as_deref())
+}
+
+#[tauri::command]
+fn stack_tun_identity_public_key(base_url: String, bearer: Option<String>) -> Result<String, String> {
+    pirate_desktop::stack_tun_identity_public_key_json(&base_url, bearer.as_deref())
+}
+
+#[tauri::command]
+fn stack_tun_authorize_peer(
+    base_url: String,
+    bearer: Option<String>,
+    public_key_b64: String,
+) -> Result<String, String> {
+    pirate_desktop::stack_tun_authorize_peer_json(
+        &base_url,
+        bearer.as_deref(),
+        &public_key_b64,
+    )
+}
+
+#[tauri::command]
+fn stack_tun_list_peers(base_url: String, bearer: Option<String>) -> Result<String, String> {
+    pirate_desktop::stack_tun_list_peers_json(&base_url, bearer.as_deref())
+}
+
+#[tauri::command]
+fn stack_tun_get_routes(base_url: String, bearer: Option<String>) -> Result<String, String> {
+    pirate_desktop::stack_tun_get_routes_json(&base_url, bearer.as_deref())
+}
+
+#[tauri::command]
+fn stack_tun_put_routes(
+    base_url: String,
+    bearer: Option<String>,
+    json_body: String,
+) -> Result<String, String> {
+    pirate_desktop::stack_tun_put_routes_json(&base_url, bearer.as_deref(), &json_body)
+}
+
+#[tauri::command]
+fn stack_tun_requests_json(
+    base_url: String,
+    bearer: Option<String>,
+    query: Option<String>,
+) -> Result<String, String> {
+    pirate_desktop::stack_tun_requests_json(&base_url, bearer.as_deref(), query.as_deref())
+}
+
+#[tauri::command]
+fn stack_tun_request_bus_invoke(
+    base_url: String,
+    bearer: Option<String>,
+    json_body: String,
+) -> Result<String, String> {
+    pirate_desktop::stack_tun_request_bus_invoke_json(&base_url, bearer.as_deref(), &json_body)
+}
+
+#[tauri::command]
 async fn db_direct_test(
     req: pirate_desktop::DirectTestRequest,
 ) -> Result<pirate_desktop::DirectTestResponse, String> {
@@ -1831,6 +1950,30 @@ fn control_api_stop_process_json(project_id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn control_api_fetch_process_listeners_json(project_id: String, scope: String) -> Result<String, String> {
+    pirate_desktop::control_api_fetch_process_listeners_json(&project_id, &scope)
+}
+
+#[tauri::command]
+fn control_api_kill_process_listener_json(
+    project_id: String,
+    pid: u32,
+    signal: String,
+    port: Option<u16>,
+    root_password: Option<String>,
+    allow_foreign: bool,
+) -> Result<String, String> {
+    pirate_desktop::control_api_kill_process_listener_json(
+        &project_id,
+        pid,
+        &signal,
+        port,
+        root_password.as_deref(),
+        allow_foreign,
+    )
+}
+
+#[tauri::command]
 fn control_api_antiddos_get_json() -> Result<String, String> {
     pirate_desktop::control_api_antiddos_get_json()
 }
@@ -1874,8 +2017,18 @@ fn control_api_antiddos_project_delete(project_id: String) -> Result<String, Str
 }
 
 #[tauri::command]
-fn fetch_server_projects_overview() -> Result<pirate_desktop::ServerProjectsOverview, String> {
-    pirate_desktop::fetch_server_projects_overview()
+async fn fetch_server_projects_overview(
+) -> Result<pirate_desktop::ServerProjectsOverview, String> {
+    tauri::async_runtime::spawn_blocking(pirate_desktop::fetch_server_projects_overview)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn desktop_perf_snapshot() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(pirate_desktop::desktop_perf_snapshot_json)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2119,14 +2272,29 @@ fn paas_scan_project(path: String, dry_run: bool) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn paas_project_build(path: String) -> Result<String, String> {
-    let r = pirate_desktop::run_project_build(PathBuf::from(path))?;
+fn project_cmd_placeholders(path: String, phases: Vec<String>) -> Result<String, String> {
+    let phase_refs: Vec<&str> = phases.iter().map(String::as_str).collect();
+    let list = pirate_desktop::project_cmd_placeholders(&PathBuf::from(path), &phase_refs)?;
+    serde_json::to_string(&list).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn paas_project_build(
+    path: String,
+    cmd_vars: Option<std::collections::HashMap<String, String>>,
+) -> Result<String, String> {
+    let vars = pirate_desktop::cmd_vars_map_from_json(cmd_vars);
+    let r = pirate_desktop::run_project_build(PathBuf::from(path), vars)?;
     serde_json::to_string(&r).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn paas_project_test(path: String) -> Result<String, String> {
-    let r = pirate_desktop::run_project_test(PathBuf::from(path))?;
+fn paas_project_test(
+    path: String,
+    cmd_vars: Option<std::collections::HashMap<String, String>>,
+) -> Result<String, String> {
+    let vars = pirate_desktop::cmd_vars_map_from_json(cmd_vars);
+    let r = pirate_desktop::run_project_test(PathBuf::from(path), vars)?;
     serde_json::to_string(&r).map_err(|e| e.to_string())
 }
 
@@ -2152,7 +2320,9 @@ fn paas_pipeline(
     skip_test_local: bool,
     version: Option<String>,
     chunk_size: Option<u32>,
+    cmd_vars: Option<std::collections::HashMap<String, String>>,
 ) -> Result<String, String> {
+    let vars = pirate_desktop::cmd_vars_map_from_json(cmd_vars);
     let r = pirate_desktop::run_pipeline(
         PathBuf::from(path),
         do_init,
@@ -2160,6 +2330,7 @@ fn paas_pipeline(
         skip_test_local,
         version,
         chunk_size.unwrap_or(64 * 1024) as usize,
+        vars,
     )?;
     serde_json::to_string(&r).map_err(|e| e.to_string())
 }
@@ -2235,7 +2406,11 @@ fn main() {
             analyze_network_access, // local detect services + nginx preview from manifest
             validate_network_access, // server-side deploy validation blockers/warnings
             save_project_network_manifest,
+            load_project_network_manifest,
+            read_project_local_env,   // read env file path from pirate.toml and return content
+            write_project_local_env,  // write content to env file path from pirate.toml
             control_api_apply_project_nginx,
+            apply_manifest_fix,                  // preflight auto-fix pirate.toml
             projects_preflight,    // projects preflight
             list_registered_projects, // list registered projects
             register_project_from_directory, // register project from directory
@@ -2303,6 +2478,18 @@ fn main() {
             db_tunnel_tcp_stop,
             db_tunnel_ssh_start,
             db_tunnel_ssh_stop,
+            stack_tun_health,
+            stack_tun_get_config,
+            stack_tun_put_config,
+            stack_tun_reload_peers,
+            stack_tun_stats,
+            stack_tun_identity_public_key,
+            stack_tun_authorize_peer,
+            stack_tun_list_peers,
+            stack_tun_get_routes,
+            stack_tun_put_routes,
+            stack_tun_requests_json,
+            stack_tun_request_bus_invoke,
             db_direct_test,
             db_direct_open,
             db_direct_close,
@@ -2344,6 +2531,8 @@ fn main() {
             control_api_nginx_action_json, // POST /api/v1/nginx/action (JWT)
             control_api_restart_process_json, // POST /api/v1/process/restart (JWT)
             control_api_stop_process_json, // POST /api/v1/process/stop (JWT)
+            control_api_fetch_process_listeners_json,
+            control_api_kill_process_listener_json,
             control_api_antiddos_get_json,
             control_api_antiddos_put_json,
             control_api_antiddos_enable,
@@ -2353,6 +2542,7 @@ fn main() {
             control_api_antiddos_project_put_json,
             control_api_antiddos_project_delete,
             fetch_server_projects_overview, // projects list + per-project status
+            desktop_perf_snapshot,          // baseline metrics JSON (samples count, HTTP pool)
             ensure_deploy_project_id_for_deploy, // resolve deploy slot (default vs allocate) before deploy
             open_project_folder,                 // reveal project folder in file manager
             deploy_upload_cancel,                // cancel deploy upload
@@ -2399,6 +2589,7 @@ fn main() {
             apply_server_stack_update,             // apply server stack update
             paas_init_project,                     // paas init project
             paas_scan_project,                     // paas scan project
+            project_cmd_placeholders,              // ${VAR} placeholders in pirate.toml cmds
             paas_project_build,                    // paas project build
             paas_project_test,                     // paas project test
             paas_test_local,                       // paas test local

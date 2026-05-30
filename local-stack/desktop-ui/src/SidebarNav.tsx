@@ -1,13 +1,20 @@
-import { FolderOpen, Globe, HardDrive, LayoutDashboard, Link2 } from "lucide-react";
+import { Cable, FolderOpen, Globe, HardDrive, LayoutDashboard, Link2, Plug } from "lucide-react";
 import React from "react";
 import { useI18n } from "./i18n";
 
-export type MainTab = "overview" | "projects" | "connection" | "internet" | "storage";
+export type MainTab =
+  | "overview"
+  | "projects"
+  | "connection"
+  | "connections"
+  | "internet"
+  | "storage"
+  | "tunnels";
 
 const navBtn =
   "flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/60";
 
-export function SidebarNav({
+export const SidebarNav = React.memo(function SidebarNav({
   mainTab,
   onTab,
 }: {
@@ -20,7 +27,9 @@ export function SidebarNav({
     { id: "projects", label: t("sidebar.projects"), icon: <FolderOpen className="h-4 w-4 shrink-0 text-red-400/90" /> },
     { id: "overview", label: t("sidebar.overview"), icon: <LayoutDashboard className="h-4 w-4 shrink-0 text-red-400/90" /> },
     { id: "connection", label: t("sidebar.connection"), icon: <Link2 className="h-4 w-4 shrink-0 text-red-400/90" /> },
+    { id: "connections", label: t("sidebar.connections"), icon: <Plug className="h-4 w-4 shrink-0 text-red-400/90" /> },
     { id: "internet", label: t("sidebar.internet"), icon: <Globe className="h-4 w-4 shrink-0 text-red-400/90" /> },
+    { id: "tunnels", label: t("sidebar.tunnels"), icon: <Cable className="h-4 w-4 shrink-0 text-red-400/90" /> },
     { id: "storage", label: t("sidebar.storage"), icon: <HardDrive className="h-4 w-4 shrink-0 text-red-400/90" /> },
   ];
 
@@ -46,4 +55,4 @@ export function SidebarNav({
       })}
     </nav>
   );
-}
+});

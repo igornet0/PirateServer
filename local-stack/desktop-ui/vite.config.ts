@@ -30,5 +30,30 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    // Heavy editors/charts are split into their own chunks so they are only
+    // fetched/parsed when a panel that needs them is opened, and so a change
+    // in app code does not invalidate the cached vendor chunks.
+    chunkSizeWarningLimit: 1500,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return;
+          if (id.includes("@xyflow")) return "xyflow";
+          if (id.includes("monaco-editor") || id.includes("@monaco-editor"))
+            return "monaco";
+          if (id.includes("@xterm")) return "xterm";
+          if (id.includes("uplot")) return "uplot";
+          if (id.includes("@tanstack")) return "tanstack";
+          if (
+            id.includes("/react-dom/") ||
+            id.includes("/react/") ||
+            id.includes("/scheduler/") ||
+            id.includes("react-resizable-panels")
+          )
+            return "react-vendor";
+          return "vendor";
+        },
+      },
+    },
   },
 });

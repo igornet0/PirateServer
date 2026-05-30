@@ -5,6 +5,9 @@ export type PreflightItem = {
   title: string;
   detail: string;
   hint?: string;
+  field?: string;
+  fixId?: string;
+  fixLabel?: string;
 };
 
 /** Matches `HostServicesCompatSummary` from desktop `host_services_compat.rs`. */

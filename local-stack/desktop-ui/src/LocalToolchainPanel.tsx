@@ -3,7 +3,7 @@
  * Отчёт открывается модальным окном по кнопке «Локальное окружение».
  */
 import { Check, ChevronDown, ChevronRight, Loader2, RefreshCw, Terminal, X, XCircle } from "lucide-react";
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import type { ToolchainItem, ToolchainReport } from "./toolchain-types";
 import { useI18n } from "./i18n";
 
@@ -57,6 +57,8 @@ export function LocalToolchainPanel({
   void _defaultExpanded;
   const [modalOpen, setModalOpen] = useState(false);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  /** Avoid startup probe — first scan runs when the user opens this panel. */
+  const didKickoffProbeRef = useRef(false);
 
   const stats = useMemo(() => reportStats(report), [report]);
 
@@ -80,8 +82,8 @@ export function LocalToolchainPanel({
               </h2>
               <p className="mt-1 max-w-prose text-xs leading-relaxed text-slate-500">
                 {tr(
-                  "Что нашлось в PATH: Docker, рантаймы и прочие инструменты. Первый запуск — при старте, дальше — по кнопке «Обновить». Автоустановки нет, только подсказки.",
-                  "What was found in PATH: Docker, runtimes, and related tools. Initial probe runs at startup, then only via Refresh. No auto-install, only hints.",
+                  "Что нашлось в PATH: Docker, рантаймы и прочие инструменты. Первый опрос — при первом открытии этого окна, дальше — по кнопке «Обновить». Автоустановки нет, только подсказки.",
+                  "What was found in PATH: Docker, runtimes, and related tools. The first scan runs when you open this dialog; after that only via Refresh. No auto-install, only hints.",
                 )}
               </p>
               {stats ? (
@@ -211,7 +213,13 @@ export function LocalToolchainPanel({
       <div className="overflow-hidden rounded-xl border border-border-subtle bg-panel shadow-card">
         <button
           type="button"
-          onClick={() => setModalOpen(true)}
+          onClick={() => {
+            setModalOpen(true);
+            if (!didKickoffProbeRef.current) {
+              didKickoffProbeRef.current = true;
+              onRefresh();
+            }
+          }}
           className="flex w-full items-center gap-3 px-3 py-3 text-left transition hover:bg-red-950/25"
           aria-haspopup="dialog"
           aria-expanded={modalOpen}

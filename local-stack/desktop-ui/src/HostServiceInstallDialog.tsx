@@ -72,6 +72,12 @@ export function HostServiceInstallDialog({ serviceId, displayName, onClose, onCo
     if (id === "cifs_utils") {
       return tr("Утилиты mount.cifs из apt.", "CIFS client utilities from apt.");
     }
+    if (id === "stack_tun_api") {
+      return tr(
+        "Будет создан /etc/pirate-stack-tun-api.env (0.0.0.0:9380/9381 + bearer) и systemctl enable --now pirate-stack-tun-api.",
+        "Creates /etc/pirate-stack-tun-api.env (0.0.0.0:9380/9381 + bearer) and runs systemctl enable --now pirate-stack-tun-api.",
+      );
+    }
     return tr(
       "Будет выполнён install-скрипт на сервере (root, sudo). Убедитесь, что это подходит для вашей среды.",
       "The host install script will run as root via sudo. Confirm this matches your environment.",

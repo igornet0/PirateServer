@@ -2,7 +2,7 @@
  * Guided project flow: folder → scan/preflight → build/test → deploy.
  * Main column = linear pipeline; right column = logs, rollback, toolchain.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertCircle,
@@ -27,8 +27,10 @@ import {
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import type { HostServicesCompatSummary, ProjectsPreflightReport } from "./projects-preflight-types";
+import { useCmdVarsPrompt } from "./useCmdVarsPrompt";
 import type { ToolchainReport } from "./toolchain-types";
 import { LocalToolchainPanel } from "./LocalToolchainPanel";
+import { useIntervalWhenVisible } from "./hooks/useIntervalWhenVisible";
 import { useI18n } from "./i18n";
 
 const btnBase =
@@ -62,14 +64,31 @@ type NetworkAccessAnalysis = {
   detection: { services: DetectedService[]; warnings: string[] };
   nginxPreview?: string | null;
   hostServices: HostServicesCompatSummary;
+  localNginxTemplateSha256?: string | null;
 };
 type DeployValidationReport = {
   allow: boolean;
   blockers: string[];
   warnings: string[];
+  nginxState?: {
+    serverTemplateSha256: string;
+    appliedContentSha256: string;
+    appliedSitePath: string;
+    lastAppliedAtMs: number;
+    needsUpdate: boolean;
+  } | null;
 };
 type AccessMode = "local" | "lan" | "public";
-type RouteRow = { path: string; target: string };
+type RouteRow = { path: string; target: string; websocket: boolean };
+
+type LoadProjectNetworkManifestView = {
+  accessMode: string;
+  domain: string;
+  domains: string[];
+  routes: { path: string; target: string; websocket?: boolean }[];
+  httpsEnabled: boolean;
+  staticNginxFront: boolean;
+};
 
 function formatServerNginxFetchErr(raw: string, language: string): string {
   const m = raw.toLowerCase();
@@ -139,6 +158,98 @@ function StepDot({
 
 const DEPLOY_PHASE_ORDER = ["prepare", "archive", "upload", "apply"] as const;
 
+/**
+ * One editable "public domain" input row. Memoized so typing in row N only
+ * re-renders row N — not the whole 2k-line ProjectsPanel and every other row.
+ * All handlers passed in are stable `useCallback`s keyed by index.
+ */
+const PublicDomainRow = React.memo(function PublicDomainRow({
+  value,
+  index,
+  canRemove,
+  onChange,
+  onRemove,
+}: {
+  value: string;
+  index: number;
+  canRemove: boolean;
+  onChange: (index: number, value: string) => void;
+  onRemove: (index: number) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="flex gap-2">
+      <input
+        value={value}
+        onChange={(e) => onChange(index, e.target.value)}
+        placeholder={index === 0 ? "shop.example.com" : "api.example.com"}
+        className="min-w-0 flex-1 rounded border border-border-subtle bg-black/30 px-2 py-1.5 text-xs text-slate-100"
+      />
+      <button
+        type="button"
+        className="shrink-0 text-xs text-rose-300 hover:text-rose-200 disabled:opacity-40"
+        disabled={!canRemove}
+        onClick={() => onRemove(index)}
+      >
+        {t("auto.ProjectsPanel_tsx.83")}
+      </button>
+    </div>
+  );
+});
+
+/** One editable route row (path / upstream / WS). Memoized — see above. */
+const RouteEditorRow = React.memo(function RouteEditorRow({
+  route,
+  index,
+  onPatch,
+  onRemove,
+}: {
+  route: RouteRow;
+  index: number;
+  onPatch: (index: number, patch: Partial<RouteRow>) => void;
+  onRemove: (index: number) => void;
+}) {
+  const { t, language } = useI18n();
+  const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
+  return (
+    <div className="grid gap-2 rounded border border-border-subtle bg-black/25 p-2 sm:grid-cols-[1fr_1fr_auto_auto]">
+      <label className="block text-[11px] text-slate-500">
+        {tr("Путь", "Path")}
+        <input
+          value={route.path}
+          onChange={(e) => onPatch(index, { path: e.target.value })}
+          placeholder="/api"
+          className="mt-0.5 w-full rounded border border-border-subtle bg-black/30 px-2 py-1 text-xs text-slate-100"
+        />
+      </label>
+      <label className="block text-[11px] text-slate-500">
+        {tr("Upstream", "Upstream")}
+        <input
+          value={route.target}
+          onChange={(e) => onPatch(index, { target: e.target.value })}
+          placeholder="api:8080"
+          className="mt-0.5 w-full rounded border border-border-subtle bg-black/30 px-2 py-1 text-xs text-slate-100"
+        />
+      </label>
+      <label className="flex items-end gap-1.5 pb-1 text-xs text-slate-300">
+        <input
+          type="checkbox"
+          checked={route.websocket}
+          onChange={(e) => onPatch(index, { websocket: e.target.checked })}
+        />
+        WS
+      </label>
+      <button
+        type="button"
+        className="self-end pb-1 text-xs text-rose-300 hover:text-rose-200"
+        onClick={() => onRemove(index)}
+      >
+        {t("auto.ProjectsPanel_tsx.83")}
+      </button>
+    </div>
+  );
+});
+
 export function ProjectsPanel({
   deployDir,
   deployVersion,
@@ -201,6 +312,7 @@ export function ProjectsPanel({
   const { language, t } = useI18n();
   const tr = (ru: string, en: string) => (language === "ru" ? ru : en);
   const paasPath = deployDir;
+  const { promptCmdVars, cmdVarsModal } = useCmdVarsPrompt(paasPath, language);
   const [guidedStep, setGuidedStep] = useState<GuidedStep>(1);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [preflight, setPreflight] = useState<ProjectsPreflightReport | null>(null);
@@ -218,6 +330,11 @@ export function ProjectsPanel({
   const [networkMsg, setNetworkMsg] = useState<string | null>(null);
   const [hostSvcInstallBusyId, setHostSvcInstallBusyId] = useState<string | null>(null);
   const [nginxConfigModalOpen, setNginxConfigModalOpen] = useState(false);
+  const [envEditorOpen, setEnvEditorOpen] = useState(false);
+  const [envFileContent, setEnvFileContent] = useState("");
+  const [envFilePath, setEnvFilePath] = useState("");
+  const [envSaving, setEnvSaving] = useState(false);
+  const [envError, setEnvError] = useState<string | null>(null);
   const [controlApiBase, setControlApiBase] = useState<string | null>(null);
   const nginxModalLocalRefreshDoneRef = useRef(false);
   const [serverNginxContent, setServerNginxContent] = useState<string | null>(null);
@@ -226,7 +343,7 @@ export function ProjectsPanel({
   const [serverNginxErr, setServerNginxErr] = useState<string | null>(null);
   const [accessMode, setAccessMode] = useState<AccessMode>("local");
   const [restrictAccess, setRestrictAccess] = useState(false);
-  const [domain, setDomain] = useState("");
+  const [publicDomains, setPublicDomains] = useState<string[]>([""]);
   const [httpsEnabled, setHttpsEnabled] = useState(false);
   const [basicProtection, setBasicProtection] = useState(true);
   const [firewallOnlyRequired, setFirewallOnlyRequired] = useState(true);
@@ -236,6 +353,29 @@ export function ProjectsPanel({
   const [stripPrefix, setStripPrefix] = useState(false);
   const [routeTimeout, setRouteTimeout] = useState("60");
   const [routeRows, setRouteRows] = useState<RouteRow[]>([]);
+  const [staticNginxFront, setStaticNginxFront] = useState(false);
+
+  // Stable index-keyed mutators so the memoized row components are not
+  // invalidated on every parent re-render (state setters are stable → []).
+  const updatePublicDomain = useCallback((index: number, value: string) => {
+    setPublicDomains((prev) => prev.map((row, i) => (i === index ? value : row)));
+  }, []);
+  const removePublicDomain = useCallback((index: number) => {
+    setPublicDomains((prev) =>
+      prev.length <= 1 ? prev : prev.filter((_, i) => i !== index),
+    );
+  }, []);
+  const patchRouteRow = useCallback(
+    (index: number, patch: Partial<RouteRow>) => {
+      setRouteRows((prev) =>
+        prev.map((row, i) => (i === index ? { ...row, ...patch } : row)),
+      );
+    },
+    [],
+  );
+  const removeRouteRow = useCallback((index: number) => {
+    setRouteRows((prev) => prev.filter((_, i) => i !== index));
+  }, []);
 
   const [localDevRunning, setLocalDevRunning] = useState(false);
   const [localDevPath, setLocalDevPath] = useState<string | null>(null);
@@ -259,13 +399,10 @@ export function ProjectsPanel({
     void refreshLocalDev();
   }, [refreshLocalDev, deployDir, guidedStep]);
 
-  useEffect(() => {
-    if (guidedStep !== 3) return;
-    const t = window.setInterval(() => void refreshLocalDev(), 4000);
-    return () => window.clearInterval(t);
-  }, [guidedStep, refreshLocalDev]);
+  useIntervalWhenVisible(() => void refreshLocalDev(), 4000, guidedStep === 3);
 
   useEffect(() => {
+    if (!isTauri()) return;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listen<LocalDevLogEntry>("local-dev-log", (event) => {
@@ -315,7 +452,30 @@ export function ProjectsPanel({
     } finally {
       setPreflightLoading(false);
     }
-  }, [deployDir, deployVersion]);
+  }, [deployDir, deployVersion, t]);
+
+  const applyPreflightFix = useCallback(
+    async (fixId: string) => {
+      if (!deployDir?.trim()) return;
+      try {
+        const msg = await invoke<string>("apply_manifest_fix", {
+          directory: deployDir,
+          fixId,
+        });
+        toast.success(tr("Исправление применено", "Fix applied"), { description: msg });
+        await runPreflight();
+        const v = await invoke<LoadProjectNetworkManifestView>("load_project_network_manifest", {
+          directory: deployDir,
+        });
+        setStaticNginxFront(Boolean(v.staticNginxFront));
+      } catch (e) {
+        toast.error(tr("Не удалось применить исправление", "Failed to apply fix"), {
+          description: String(e),
+        });
+      }
+    },
+    [deployDir, runPreflight, tr],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -353,14 +513,26 @@ export function ProjectsPanel({
     setNetworkBusy(true);
     setNetworkMsg(null);
     try {
-      const overrides: { domain?: string; routes?: { path: string; target: string }[] } = {};
-      if (accessMode === "public" && domain.trim()) {
-        overrides.domain = domain.trim();
+      const overrides: {
+        domains?: string[];
+        routes?: { path: string; target: string; websocket: boolean }[];
+      } = {};
+      const hosts =
+        accessMode === "public" ? publicDomains.map((d) => d.trim()).filter(Boolean) : [];
+      if (hosts.length > 0) {
+        overrides.domains = hosts;
       }
       if (routeRows.length > 0) {
-        overrides.routes = routeRows.map((r) => ({ path: r.path, target: r.target }));
+        overrides.routes = routeRows.map((r) => ({
+          path: r.path,
+          target: r.target,
+          websocket: r.websocket,
+        }));
       }
-      const hasOverrides = Boolean(overrides.domain || (overrides.routes && overrides.routes.length > 0));
+      const hasOverrides = Boolean(
+        (overrides.domains && overrides.domains.length > 0) ||
+          (overrides.routes && overrides.routes.length > 0),
+      );
       const analysis = await invoke<NetworkAccessAnalysis>("analyze_network_access", {
         directory: deployDir,
         ...(hasOverrides ? { overrides } : {}),
@@ -383,7 +555,44 @@ export function ProjectsPanel({
     } finally {
       setNetworkBusy(false);
     }
-  }, [deployDir, endpoint, accessMode, domain, routeRows]);
+  }, [deployDir, endpoint, accessMode, publicDomains, routeRows]);
+
+  useEffect(() => {
+    if (!deployDir?.trim()) {
+      setPublicDomains([""]);
+      return;
+    }
+    let cancelled = false;
+    void invoke<LoadProjectNetworkManifestView>("load_project_network_manifest", {
+      directory: deployDir,
+    })
+      .then((v) => {
+        if (cancelled) return;
+        const mode = v.accessMode;
+        if (mode === "public" || mode === "lan" || mode === "local") {
+          setAccessMode(mode);
+        }
+        const hosts = [v.domain, ...(v.domains ?? [])].map((d) => d.trim()).filter(Boolean);
+        setPublicDomains(hosts.length > 0 ? hosts : [""]);
+        if (v.routes.length > 0) {
+          setRouteRows(
+            v.routes.map((r) => ({
+              path: r.path,
+              target: r.target,
+              websocket: Boolean(r.websocket),
+            })),
+          );
+        }
+        setHttpsEnabled(v.httpsEnabled);
+        setStaticNginxFront(Boolean(v.staticNginxFront));
+      })
+      .catch(() => {
+        /* pirate.toml may be missing until first save */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deployDir]);
 
   useEffect(() => {
     void invoke<string | null>("get_control_api_base")
@@ -495,12 +704,13 @@ export function ProjectsPanel({
   }, [deployDir, endpoint]);
 
   useEffect(() => {
+    if (routeRows.length > 0) return;
     const services = networkAnalysis?.detection.services ?? [];
     const web = services.find((s) => s.name === "web");
     const api = services.find((s) => s.name === "api");
     const nextRoutes: RouteRow[] = [];
-    if (web) nextRoutes.push({ path: "/", target: `web:${web.port}` });
-    if (api) nextRoutes.push({ path: "/api", target: `api:${api.port}` });
+    if (web) nextRoutes.push({ path: "/", target: `web:${web.port}`, websocket: false });
+    if (api) nextRoutes.push({ path: "/api", target: `api:${api.port}`, websocket: true });
     setRouteRows((prev) => {
       if (
         prev.length === nextRoutes.length &&
@@ -510,7 +720,7 @@ export function ProjectsPanel({
       }
       return nextRoutes;
     });
-  }, [networkAnalysis]);
+  }, [networkAnalysis, routeRows.length]);
 
   useEffect(() => {
     // Secure defaults for WAN/Public mode.
@@ -520,6 +730,33 @@ export function ProjectsPanel({
       setFirewallOnlyRequired(true);
     }
   }, [accessMode]);
+
+  useEffect(() => {
+    if (!envEditorOpen || !deployDir?.trim()) return;
+    setEnvError(null);
+    invoke<{ env_path: string; content: string; exists: boolean }>("read_project_local_env", {
+      directory: deployDir,
+    })
+      .then((v) => {
+        setEnvFilePath(v.env_path);
+        setEnvFileContent(v.content);
+      })
+      .catch((e) => setEnvError(String(e)));
+  }, [envEditorOpen, deployDir]);
+
+  async function saveEnvFile() {
+    if (!deployDir?.trim()) return;
+    setEnvSaving(true);
+    setEnvError(null);
+    try {
+      await invoke("write_project_local_env", { directory: deployDir, content: envFileContent });
+      setEnvEditorOpen(false);
+    } catch (e) {
+      setEnvError(String(e));
+    } finally {
+      setEnvSaving(false);
+    }
+  }
 
   const onDeleteServerProject = async () => {
     if (!deleteCheck?.uploaded) return;
@@ -568,25 +805,35 @@ export function ProjectsPanel({
     }
   };
 
-  const networkManifestInput = useCallback(
-    () => ({
-      accessMode,
-      domain: domain.trim(),
-      routes: routeRows.map((r) => ({ path: r.path, target: r.target })),
-      httpsEnabled,
-    }),
-    [accessMode, domain, routeRows, httpsEnabled],
+  const publicHosts = useCallback(
+    () => publicDomains.map((d) => d.trim()).filter(Boolean),
+    [publicDomains],
   );
+
+  const networkManifestInput = useCallback(() => {
+    const hosts = publicHosts();
+    return {
+      accessMode,
+      domain: hosts[0] ?? "",
+      domains: hosts,
+      routes: routeRows.map((r) => ({
+        path: r.path,
+        target: r.target,
+        websocket: r.websocket,
+      })),
+      httpsEnabled,
+    };
+  }, [accessMode, publicHosts, routeRows, httpsEnabled]);
 
   const onApplyProjectNginx = async () => {
     if (!deployDir?.trim()) return;
-    if (accessMode === "public" && !domain.trim()) {
+    if (accessMode === "public" && publicHosts().length === 0) {
       toast.error(
-        language === "ru" ? "Укажите домен для публичного доступа." : "Set a domain for public access.",
+        language === "ru" ? "Укажите хотя бы один домен." : "Add at least one public domain.",
       );
       return;
     }
-    if (routeRows.length === 0) {
+    if (!staticNginxFront && routeRows.length === 0) {
       toast.error(
         language === "ru"
           ? "Добавьте хотя бы один маршрут (web/api)."
@@ -721,18 +968,34 @@ export function ProjectsPanel({
             {t("auto.ProjectsPanel_tsx.22")}
           </p>
         ) : preflight ? (
-          <ul className="mt-2 max-h-40 space-y-1.5 overflow-y-auto text-xs">
-            {preflight.checks.map((c) => (
+          <ul className="mt-2 max-h-52 space-y-1.5 overflow-y-auto text-xs">
+            {preflight.checks.map((c, idx) => (
               <li
-                key={c.id + c.title}
-                className={`flex gap-2 ${c.ok ? "text-slate-300" : "text-rose-300"}`}
+                key={`${c.id}-${c.field ?? ""}-${c.fixId ?? ""}-${idx}`}
+                className={`flex flex-col gap-1 ${c.ok ? "text-slate-300" : "text-rose-300"}`}
               >
-                <span className="shrink-0">{c.ok ? "✓" : "✗"}</span>
-                <span>
-                  <span className="font-medium text-slate-200">{c.title}</span>
-                  <span className="text-slate-500"> — {c.detail}</span>
-                  {c.hint ? <span className="block text-[10px] text-orange-200/90">↳ {c.hint}</span> : null}
-                </span>
+                <div className="flex gap-2">
+                  <span className="shrink-0">{c.ok ? "✓" : "✗"}</span>
+                  <span>
+                    <span className="font-medium text-slate-200">{c.title}</span>
+                    {c.field ? (
+                      <span className="ml-1 font-mono text-[10px] text-slate-500">{c.field}</span>
+                    ) : null}
+                    <span className="text-slate-500"> — {c.detail}</span>
+                    {c.hint ? (
+                      <span className="block text-[10px] text-orange-200/90">↳ {c.hint}</span>
+                    ) : null}
+                  </span>
+                </div>
+                {c.fixId && c.fixLabel ? (
+                  <button
+                    type="button"
+                    onClick={() => void applyPreflightFix(c.fixId!)}
+                    className="ml-5 w-fit rounded border border-amber-700/50 bg-amber-950/30 px-2 py-0.5 text-[10px] text-amber-100 hover:bg-amber-900/40"
+                  >
+                    {tr("Применить исправление", "Apply fix")}: {c.fixLabel}
+                  </button>
+                ) : null}
               </li>
             ))}
           </ul>
@@ -1069,7 +1332,12 @@ export function ProjectsPanel({
                         setLocalDevMsg(null);
                         setLocalDevLogs([]);
                         try {
-                          await invoke("local_dev_start", { path: paasPath });
+                          const vars = await promptCmdVars(
+                            ["start"],
+                            tr("Параметры запуска", "Start parameters"),
+                          );
+                          if (vars === null) return;
+                          await invoke("local_dev_start", { path: paasPath, cmdVars: vars });
                           await refreshLocalDev();
                         } catch (e) {
                           setLocalDevMsg(String(e));
@@ -1091,7 +1359,11 @@ export function ProjectsPanel({
                 type="button"
                 disabled={paasBusy || !paasPath}
                 onClick={() =>
-                  void runPaas("Build", () => invoke<string>("paas_project_build", { path: paasPath! }))
+                  void runPaas("Build", async () => {
+                    const vars = await promptCmdVars(["build"], tr("Параметры сборки", "Build parameters"));
+                    if (vars === null) return tr("Отменено", "Cancelled");
+                    return invoke<string>("paas_project_build", { path: paasPath!, cmdVars: vars });
+                  })
                 }
                 className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200`}
               >
@@ -1102,7 +1374,11 @@ export function ProjectsPanel({
                 type="button"
                 disabled={paasBusy || !paasPath}
                 onClick={() =>
-                  void runPaas("Test", () => invoke<string>("paas_project_test", { path: paasPath! }))
+                  void runPaas("Test", async () => {
+                    const vars = await promptCmdVars(["test"], tr("Параметры теста", "Test parameters"));
+                    if (vars === null) return tr("Отменено", "Cancelled");
+                    return invoke<string>("paas_project_test", { path: paasPath!, cmdVars: vars });
+                  })
                 }
                 className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200`}
               >
@@ -1454,17 +1730,73 @@ export function ProjectsPanel({
                   </div>
                 ) : null}
                 {accessMode === "public" ? (
-                  <div className="mt-3 space-y-2 rounded-md border border-red-900/40 bg-red-950/15 p-3">
+                  <div className="mt-3 space-y-3 rounded-md border border-red-900/40 bg-red-950/15 p-3">
                     <p className="text-xs font-semibold text-orange-100">{t("auto.ProjectsPanel_tsx.78")}</p>
-                    <label className="block text-xs text-slate-300">
-                      {t("auto.ProjectsPanel_tsx.79")}
-                      <input
-                        value={domain}
-                        onChange={(e) => setDomain(e.target.value)}
-                        placeholder="example.com"
-                        className="mt-1 w-full rounded border border-border-subtle bg-black/30 px-2 py-1.5 text-xs text-slate-100"
-                      />
-                    </label>
+                    <div>
+                      <p className="text-xs font-medium text-slate-400">
+                        {tr("Домены (nginx server_name)", "Domains (nginx server_name)")}
+                      </p>
+                      <div className="mt-2 space-y-2">
+                        {publicDomains.map((d, idx) => (
+                          <PublicDomainRow
+                            key={`pub-dom-${idx}`}
+                            value={d}
+                            index={idx}
+                            canRemove={publicDomains.length > 1}
+                            onChange={updatePublicDomain}
+                            onRemove={removePublicDomain}
+                          />
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        className={`${btnBase} mt-2 border border-border-subtle bg-panel-raised text-slate-200`}
+                        onClick={() => setPublicDomains((prev) => [...prev, ""])}
+                      >
+                        {tr("Добавить домен", "Add domain")}
+                      </button>
+                    </div>
+                    {staticNginxFront ? (
+                      <p className="text-[11px] text-slate-400">
+                        {tr(
+                          "Static SPA — nginx отдаёт dist из релиза; маршруты proxy не нужны (шаблон pirate-nginx-snippet.conf).",
+                          "Static SPA — nginx serves dist from the release; proxy routes are not required (pirate-nginx-snippet.conf template).",
+                        )}
+                      </p>
+                    ) : (
+                    <div>
+                      <p className="text-xs font-medium text-slate-400">{t("auto.ProjectsPanel_tsx.82")}</p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {tr(
+                          "Путь → upstream (web:3000, api:8080). WS — WebSocket для /api, /ws и т.п.",
+                          "Path → upstream (web:3000, api:8080). WS — WebSocket for /api, /ws, etc.",
+                        )}
+                      </p>
+                      <div className="mt-2 space-y-2">
+                        {routeRows.map((r, idx) => (
+                          <RouteEditorRow
+                            key={`route-${idx}`}
+                            route={r}
+                            index={idx}
+                            onPatch={patchRouteRow}
+                            onRemove={removeRouteRow}
+                          />
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        className={`${btnBase} mt-2 border border-border-subtle bg-panel-raised text-slate-200`}
+                        onClick={() =>
+                          setRouteRows((prev) => [
+                            ...prev,
+                            { path: "/api", target: "api:8080", websocket: true },
+                          ])
+                        }
+                      >
+                        {t("auto.ProjectsPanel_tsx.84")}
+                      </button>
+                    </div>
+                    )}
                     <label className="inline-flex items-center gap-2 text-xs text-slate-300">
                       <input type="checkbox" checked={httpsEnabled} onChange={(e) => setHttpsEnabled(e.target.checked)} />
                       {t("auto.ProjectsPanel_tsx.80")}
@@ -1476,7 +1808,7 @@ export function ProjectsPanel({
                   </div>
                 ) : null}
               </div>
-              {(accessMode === "public" || routeRows.length > 0) && (
+              {accessMode !== "public" && routeRows.length > 0 ? (
                 <div className="rounded-lg border border-border-subtle bg-black/20 p-3">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("auto.ProjectsPanel_tsx.82")}</p>
                   <div className="mt-2 space-y-1 text-xs text-slate-300">
@@ -1499,7 +1831,7 @@ export function ProjectsPanel({
                     <button
                       type="button"
                       className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200`}
-                      onClick={() => setRouteRows((prev) => [...prev, { path: "/new", target: "web:3000" }])}
+                      onClick={() => setRouteRows((prev) => [...prev, { path: "/new", target: "web:3000", websocket: false }])}
                     >
                       {t("auto.ProjectsPanel_tsx.84")}
                     </button>
@@ -1531,7 +1863,7 @@ export function ProjectsPanel({
                     </div>
                   </details>
                 </div>
-              )}
+              ) : null}
               <div className="rounded-lg border border-border-subtle bg-black/20 p-3">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("auto.ProjectsPanel_tsx.89")}</p>
                 <ul className="mt-2 space-y-1 text-xs text-slate-300">
@@ -1547,13 +1879,20 @@ export function ProjectsPanel({
                     </>
                   ) : null}
                 </ul>
-                {accessMode === "public" && !routeRows.length ? (
+                {accessMode === "public" && !staticNginxFront && !routeRows.length ? (
                   <p className="mt-2 text-xs text-rose-300">{t("auto.ProjectsPanel_tsx.91")}</p>
                 ) : null}
               </div>
               <div className="rounded-lg border border-border-subtle bg-black/20 p-3">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{t("auto.ProjectsPanel_tsx.92")}</p>
-                {routeRows.length === 0 ? (
+                {staticNginxFront ? (
+                  <p className="mt-2 text-xs text-slate-400">
+                    {tr(
+                      "Static nginx-front: vhost из pirate-nginx-snippet.conf (auto-apply при деплое).",
+                      "Static nginx-front: vhost from pirate-nginx-snippet.conf (auto-apply on deploy).",
+                    )}
+                  </p>
+                ) : routeRows.length === 0 ? (
                   <p className="mt-2 text-xs text-slate-400">{t("auto.ProjectsPanel_tsx.93")}</p>
                 ) : (
                   <div className="mt-2 space-y-1 text-xs text-slate-300">
@@ -1596,6 +1935,14 @@ export function ProjectsPanel({
                   </button>
                   <button
                     type="button"
+                    disabled={!deployDir}
+                    onClick={() => setEnvEditorOpen(true)}
+                    className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200`}
+                  >
+                    {tr("Редактировать env файл", "Edit env file")}
+                  </button>
+                  <button
+                    type="button"
                     disabled={networkBusy || !deployDir}
                     onClick={() => void onRegenerateNetworkConfig()}
                     className={`${btnBase} border border-border-subtle bg-panel-raised text-slate-200`}
@@ -1629,6 +1976,18 @@ export function ProjectsPanel({
                   </label>
                 </div>
               </div>
+              {networkValidation?.nginxState?.needsUpdate ||
+              (networkValidation?.nginxState?.serverTemplateSha256 &&
+                networkAnalysis?.localNginxTemplateSha256 &&
+                networkValidation.nginxState.serverTemplateSha256 !==
+                  networkAnalysis.localNginxTemplateSha256) ? (
+                <div className="rounded-lg border border-amber-900/50 bg-amber-950/30 p-3 text-xs text-amber-100">
+                  {tr(
+                    "Nginx conf изменён — будет обновлён при деплое",
+                    "Nginx conf changed — will be updated on deploy",
+                  )}
+                </div>
+              ) : null}
               {networkValidation?.blockers?.length ? (
                 <div className="rounded-lg border border-rose-900/50 bg-rose-950/30 p-3 text-xs text-rose-200">
                   <p className="font-semibold">{t("auto.ProjectsPanel_tsx.107")}</p>
@@ -1659,7 +2018,7 @@ export function ProjectsPanel({
                       <Lock className="h-3.5 w-3.5" /> {t("auto.ProjectsPanel_tsx.112")}
                     </p>
                   ) : null}
-                  {accessMode === "public" && !domain.trim() ? (
+                  {accessMode === "public" && publicHosts().length === 0 ? (
                     <p className="flex items-center gap-2 text-orange-200">
                       <AlertCircle className="h-3.5 w-3.5" /> {t("auto.ProjectsPanel_tsx.113")}
                     </p>
@@ -1879,8 +2238,8 @@ export function ProjectsPanel({
                 </h4>
                 <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
                   {tr(
-                    "Файл /etc/nginx/sites-available/pirate — дашборд Pirate. Vhost UI проекта: /etc/nginx/sites-available/pirate-project-<id> (кнопка «Применить nginx проекта»). Snippet в releases/…/pirate-nginx-snippet.conf на nginx не подключается автоматически.",
-                    "File /etc/nginx/sites-available/pirate is the Pirate dashboard. Project UI vhost: /etc/nginx/sites-available/pirate-project-<id> (use “Apply project nginx on server”). The release snippet under releases/…/pirate-nginx-snippet.conf is not auto-enabled in nginx.",
+                    "Файл /etc/nginx/sites-available/pirate — дашборд Pirate. Vhost проекта: /etc/nginx/sites-available/pirate-project-<id>. При [proxy].nginx_auto_apply vhost применяется автоматически после деплоя; иначе — кнопка «Применить nginx проекта». Шаблон: releases/…/pirate-nginx-snippet.conf (<PATH_PROJECT>, <VERSION>).",
+                    "File /etc/nginx/sites-available/pirate is the Pirate dashboard. Project vhost: /etc/nginx/sites-available/pirate-project-<id>. With [proxy].nginx_auto_apply the vhost is applied automatically after deploy; otherwise use “Apply project nginx on server”. Template: releases/…/pirate-nginx-snippet.conf (<PATH_PROJECT>, <VERSION>).",
                   )}
                 </p>
                 {!controlApiBase?.trim() ? (
@@ -1911,6 +2270,61 @@ export function ProjectsPanel({
           </div>
         </div>
       ) : null}
+      {envEditorOpen ? (
+        <div className="fixed inset-0 z-modalNestedHigh flex items-center justify-center bg-black/70 p-4">
+          <div
+            className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-white/15 bg-[#050204] shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="env-editor-modal-title"
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
+              <div className="flex items-center gap-2">
+                <FileCode className="h-5 w-5 text-amber-200/80" />
+                <h3 id="env-editor-modal-title" className="text-sm font-semibold text-slate-100">
+                  {tr("Env файл: ", "Env file: ")}
+                  <span className="font-mono text-amber-200/90">{envFilePath}</span>
+                </h3>
+              </div>
+              <button
+                type="button"
+                className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-slate-400 hover:text-slate-200"
+                onClick={() => setEnvEditorOpen(false)}
+                aria-label={tr("Закрыть", "Close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto px-5 py-4">
+              <textarea
+                className="h-96 w-full rounded-lg border border-white/10 bg-black/40 p-3 font-mono text-xs leading-relaxed text-slate-200 focus:outline-none focus:ring-1 focus:ring-amber-400/40"
+                value={envFileContent}
+                onChange={(e) => setEnvFileContent(e.target.value)}
+                spellCheck={false}
+              />
+              {envError && <p className="mt-2 text-sm text-rose-300/90">{envError}</p>}
+            </div>
+            <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
+              <button
+                type="button"
+                className={`${btnBase} border border-white/10 bg-white/5 text-slate-300 hover:text-slate-100`}
+                onClick={() => setEnvEditorOpen(false)}
+              >
+                {tr("Закрыть", "Close")}
+              </button>
+              <button
+                type="button"
+                disabled={envSaving}
+                className={`${btnBase} border border-amber-500/30 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 disabled:opacity-50`}
+                onClick={() => void saveEnvFile()}
+              >
+                {envSaving ? tr("Сохраняем...", "Saving...") : tr("Сохранить", "Save")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {cmdVarsModal}
     </div>
   );
 }
