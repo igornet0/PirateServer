@@ -1,0 +1,17 @@
+[Unit]
+Description=Pirate Stack tunnel relay API (HTTP control + queued TCP relays)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pirate
+Group=pirate
+EnvironmentFile=-/etc/pirate-stack-tun-api.env
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/stack-tun-api
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

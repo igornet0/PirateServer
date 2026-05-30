@@ -4,7 +4,6 @@ mod admin_seed;
 mod auth;
 mod benchmark;
 mod deploy_service;
-mod listen_port_owner;
 mod tunnel_admission;
 mod tunnel_flush;
 mod tunnel_registry;
@@ -140,6 +139,22 @@ struct Args {
     /// PEM private key path for QUIC TLS (optional).
     #[arg(long, env = "DEPLOY_QUIC_TLS_KEY")]
     quic_tls_key: Option<PathBuf>,
+
+    /// Privileged helper to apply per-project nginx vhost.
+    #[arg(
+        long,
+        env = "DEPLOY_NGINX_APPLY_SITE_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-nginx-apply-site.sh"
+    )]
+    nginx_apply_site_script: PathBuf,
+
+    /// Privileged nginx ops helper.
+    #[arg(
+        long,
+        env = "DEPLOY_NGINX_OPS_SCRIPT",
+        default_value = "/usr/local/lib/pirate/pirate-nginx-ops.sh"
+    )]
+    nginx_ops_script: PathBuf,
 }
 
 #[cfg(unix)]
@@ -529,6 +544,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tunnel_admission,
         tunnel_redis,
         quic_dataplane,
+        args.nginx_apply_site_script,
+        args.nginx_ops_script,
     ));
 
     let listener = TcpListener::bind(addr).await?;

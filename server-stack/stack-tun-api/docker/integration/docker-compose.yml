@@ -1,0 +1,51 @@
+# Integration: two containers — listener (stack-tun-api) + runner (pirate tunnel + upstream + curl).
+#
+# Usage (from PirateServer repo root):
+#   docker compose -f server-stack/stack-tun-api/docker/integration/docker-compose.yml up --build --abort-on-container-exit
+#
+# Only the runner exits with a non‑zero status on failure.
+
+services:
+  listener:
+    build:
+      context: ../../../..
+      dockerfile: server-stack/stack-tun-api/docker/integration/Dockerfile
+    command: ["/opt/scripts/listener-entrypoint.sh"]
+    environment:
+      STACK_TUN_REST_BEARER: e2e-bearer-token
+      STACK_TUN_HTTP_BIND: 0.0.0.0:9380
+      STACK_TUN_GRPC_BIND: 0.0.0.0:9381
+      STACK_TUN_ALLOW_UNAUTHENTICATED: "false"
+      STACK_TUN_STATE_DIR: /var/lib/pirate/stack-tun-api
+    volumes:
+      - listener-state:/var/lib/pirate/stack-tun-api
+    networks:
+      - tun_net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9380/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 8s
+
+  runner:
+    build:
+      context: ../../../..
+      dockerfile: server-stack/stack-tun-api/docker/integration/Dockerfile
+    command: ["/opt/scripts/runner-tests.sh"]
+    environment:
+      LISTENER_HTTP: http://listener:9380
+      LISTENER_GRPC: http://listener:9381
+      STACK_TUN_REST_BEARER: e2e-bearer-token
+      IDENTITY_JSON: /tmp/e2e/identity.json
+    depends_on:
+      listener:
+        condition: service_healthy
+    networks:
+      - tun_net
+
+volumes:
+  listener-state:
+
+networks:
+  tun_net:

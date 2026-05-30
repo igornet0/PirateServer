@@ -44,7 +44,8 @@ use deploy_control::{
     HostStatsHistory, MemoryDetail, NginxActionBody, NginxActionResponseView, NginxConfigPut,
     NginxConfigView, NginxEnsureView, NginxEnvUpdateView, NginxEnvVarUpdateView, NginxFilePut,
     NginxPreflightProposed, NginxPreflightView, NginxPutResponseView, NginxSitesView, NginxStatusView,
-    NetworkDetail, ProcessControlView, ProcessesDetail, ProjectNginxApplyBody, ProjectNginxApplyView,
+    KillListenerResultView, NetworkDetail, ProcessControlView, ProcessListenersView, ProcessesDetail,
+    ProjectNginxApplyBody, ProjectNginxApplyView,
     ProjectsView, RollbackBody, RollbackView,
     SeriesResponse,
 };
@@ -1815,6 +1816,71 @@ async fn api_process_restart(
 }
 
 #[derive(serde::Deserialize)]
+struct ProcessListenersQuery {
+    #[serde(default)]
+    project: String,
+    /// `project` (default) or `all`
+    #[serde(default)]
+    scope: String,
+}
+
+async fn api_process_listeners(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<ProcessListenersQuery>,
+) -> Result<Json<ProcessListenersView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let scope = if q.scope.trim().is_empty() {
+        "project"
+    } else {
+        q.scope.trim()
+    };
+    s.plane
+        .list_process_listeners(&project_or_default(&q.project), scope)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[derive(serde::Deserialize)]
+struct KillListenerBody {
+    pid: u32,
+    #[serde(default)]
+    signal: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    root_password: Option<String>,
+    #[serde(default)]
+    allow_foreign: bool,
+    #[serde(default)]
+    project: String,
+}
+
+async fn api_process_kill_listener(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<KillListenerBody>,
+) -> Result<Json<KillListenerResultView>, ApiError> {
+    check_api_bearer(&s, &headers)?;
+    let sig = if body.signal.trim().is_empty() {
+        "TERM"
+    } else {
+        body.signal.trim()
+    };
+    s.plane
+        .kill_process_listener(
+            &project_or_default(&body.project),
+            body.pid,
+            sig,
+            body.port,
+            body.root_password.as_deref(),
+            body.allow_foreign,
+        )
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[derive(serde::Deserialize)]
 struct AppEnvPutBody {
     content: String,
 }
@@ -2171,12 +2237,17 @@ async fn api_project_nginx_apply(
         .nginx_site_path
         .parent()
         .ok_or_else(|| ApiError::internal("nginx_site_path has no parent"))?;
+    let project_root = deploy_core::project_deploy_root(s.plane.deploy_root(), &project_id);
+    let version = deploy_core::read_current_version_from_symlink(&project_root)
+        .ok_or_else(|| ApiError::bad_request("no active release; deploy first"))?;
     let v = apply_project_nginx_vhost(
         &project_id,
         body.manifest_toml.trim(),
         sites_dir,
         &s.nginx_apply_site_script,
         &s.nginx_ops_script,
+        Some(&project_root),
+        Some(&version),
     )?;
     Ok(Json(v))
 }
@@ -3158,6 +3229,8 @@ async fn run_serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/rollback", post(api_rollback))
         .route("/api/v1/process/stop", post(api_process_stop))
         .route("/api/v1/process/restart", post(api_process_restart))
+        .route("/api/v1/process/listeners", get(api_process_listeners))
+        .route("/api/v1/process/kill-listener", post(api_process_kill_listener))
         .route(
             "/api/v1/app-env",
             get(api_app_env_get).put(api_app_env_put),

@@ -72,6 +72,22 @@ fn tail_file_lines(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
 
 const MAX_PROJECT_NGINX_SNIPPET: usize = 512 * 1024;
 
+fn nginx_snippet_state_fields(project_root: &Path) -> (Option<String>, Option<String>, Option<bool>, Option<i64>, Option<String>) {
+    let state = deploy_core::nginx_vhost_state::read_nginx_vhost_state(project_root)
+        .unwrap_or_default();
+    let has_state = !state.template_sha256.is_empty() || !state.applied_content_sha256.is_empty();
+    if !has_state {
+        return (None, None, None, None, None);
+    }
+    (
+        Some(state.template_sha256).filter(|s| !s.is_empty()),
+        Some(state.applied_content_sha256).filter(|s| !s.is_empty()),
+        None,
+        Some(state.applied_at_ms).filter(|ms| *ms > 0),
+        Some(state.applied_site_path).filter(|s| !s.is_empty()),
+    )
+}
+
 /// `releases/<ver>/pirate-nginx-snippet.conf` after deploy when the manifest requests a nginx release snippet.
 fn project_nginx_snippet_view(project_root: &Path, current_version: &str) -> ProjectNginxSnippetView {
     let mut ver = current_version.trim().to_string();
@@ -84,6 +100,8 @@ fn project_nginx_snippet_view(project_root: &Path, current_version: &str) -> Pro
         .join("<version>")
         .join("pirate-nginx-snippet.conf");
     if ver.is_empty() {
+        let (template_sha256, applied_content_sha256, needs_update, last_applied_at_ms, applied_site_path) =
+            nginx_snippet_state_fields(project_root);
         return ProjectNginxSnippetView {
             path: placeholder.to_string_lossy().to_string(),
             configured: false,
@@ -94,6 +112,11 @@ fn project_nginx_snippet_view(project_root: &Path, current_version: &str) -> Pro
                     .to_string(),
             ),
             content: None,
+            template_sha256,
+            applied_content_sha256,
+            needs_update,
+            last_applied_at_ms,
+            applied_site_path,
         };
     }
     let release_dir = release_dir_for_version(project_root, ver);
@@ -102,13 +125,22 @@ fn project_nginx_snippet_view(project_root: &Path, current_version: &str) -> Pro
     let path_str = snippet_path.to_string_lossy().to_string();
     let manifest_opt = PirateManifest::read_file(&manifest_path).ok();
 
-    let absent = |reason_code: &str, hint: String| ProjectNginxSnippetView {
-        path: path_str.clone(),
-        configured: false,
-        status: Some("absent".to_string()),
-        reason_code: Some(reason_code.to_string()),
-        hint: Some(hint),
-        content: None,
+    let absent = |reason_code: &str, hint: String| {
+        let (template_sha256, applied_content_sha256, needs_update, last_applied_at_ms, applied_site_path) =
+            nginx_snippet_state_fields(project_root);
+        ProjectNginxSnippetView {
+            path: path_str.clone(),
+            configured: false,
+            status: Some("absent".to_string()),
+            reason_code: Some(reason_code.to_string()),
+            hint: Some(hint),
+            content: None,
+            template_sha256,
+            applied_content_sha256,
+            needs_update,
+            last_applied_at_ms,
+            applied_site_path,
+        }
     };
 
     match fs::read_to_string(&snippet_path) {
@@ -122,6 +154,8 @@ fn project_nginx_snippet_view(project_root: &Path, current_version: &str) -> Pro
             } else {
                 Some(s)
             };
+            let (template_sha256, applied_content_sha256, needs_update, last_applied_at_ms, applied_site_path) =
+                nginx_snippet_state_fields(project_root);
             ProjectNginxSnippetView {
                 path: path_str,
                 configured: true,
@@ -129,10 +163,22 @@ fn project_nginx_snippet_view(project_root: &Path, current_version: &str) -> Pro
                 reason_code: None,
                 hint: None,
                 content,
+                template_sha256,
+                applied_content_sha256,
+                needs_update,
+                last_applied_at_ms,
+                applied_site_path,
             }
         }
         _ => {
             if let Some(ref m) = manifest_opt {
+                if m.proxy.has_custom_nginx_template() {
+                    return absent(
+                        "custom_template_missing",
+                        "Custom nginx template configured but snippet file is missing; redeploy."
+                            .to_string(),
+                    );
+                }
                 if let Some(skip) = nginx_snippet::nginx_release_skip(m) {
                     return absent(skip.reason_code(), skip.hint_en().to_string());
                 }
@@ -163,6 +209,12 @@ pub enum ControlError {
     HostServiceOp(String),
     #[error("antiddos: {0}")]
     Antiddos(String),
+    #[error("process_listeners: {0}")]
+    ProcessListeners(String),
+    #[error("elevation_required: {0}")]
+    ElevationRequired(String),
+    #[error("elevation_failed: {0}")]
+    ElevationFailed(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -541,6 +593,34 @@ impl ControlPlane {
             current_version: r.current_version,
             state: r.state,
         })
+    }
+
+    pub fn list_process_listeners(
+        &self,
+        project_id: &str,
+        scope: &str,
+    ) -> Result<crate::types::ProcessListenersView, ControlError> {
+        crate::process_listeners::list_process_listeners(&self.deploy_root, project_id, scope)
+    }
+
+    pub fn kill_process_listener(
+        &self,
+        project_id: &str,
+        pid: u32,
+        signal: &str,
+        port: Option<u16>,
+        root_password: Option<&str>,
+        allow_foreign: bool,
+    ) -> Result<crate::types::KillListenerResultView, ControlError> {
+        crate::process_listeners::kill_process_listener(
+            &self.deploy_root,
+            project_id,
+            pid,
+            signal,
+            port,
+            root_password,
+            allow_foreign,
+        )
     }
 
     /// `app.env` in the project deploy root (same layout as `releases/`).

@@ -113,6 +113,25 @@ pub fn resolve_project_env_join(project_root: &Path, manifest: &PirateManifest) 
     Ok(project_root.join(&rel))
 }
 
+/// Join `project_root` with `[proxy].nginx_conf_path`. Fails on absolute paths or `..`.
+pub fn resolve_nginx_conf_join(project_root: &Path, manifest: &PirateManifest) -> Result<PathBuf, String> {
+    let rel = manifest.proxy.nginx_conf_path.trim();
+    if rel.is_empty() {
+        return Err("proxy.nginx_conf_path is empty".to_string());
+    }
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        return Err("proxy.nginx_conf_path must be a relative path".to_string());
+    }
+    for c in p.components() {
+        use std::path::Component;
+        if matches!(c, Component::ParentDir) {
+            return Err("proxy.nginx_conf_path must not contain '..'".to_string());
+        }
+    }
+    Ok(project_root.join(rel))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeSection {
     #[serde(default = "default_runtime_type")]
@@ -254,6 +273,26 @@ pub struct ProxySection {
     pub backend: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, String>,
+    /// Location paths (e.g. `/api`, `/ws`) that need WebSocket upgrade headers in nginx.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub websocket_paths: Vec<String>,
+    /// Relative path to a custom nginx template (placeholders `<PATH_PROJECT>`, `<VERSION>`, `<RELEASE_ROOT>`).
+    #[serde(default)]
+    pub nginx_conf_path: String,
+    /// Apply vhost to nginx after deploy. When unset in TOML, defaults to true if `nginx_conf_path` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nginx_auto_apply: Option<bool>,
+}
+
+impl ProxySection {
+    pub fn has_custom_nginx_template(&self) -> bool {
+        !self.nginx_conf_path.trim().is_empty()
+    }
+
+    pub fn effective_nginx_auto_apply(&self) -> bool {
+        self.nginx_auto_apply
+            .unwrap_or_else(|| self.has_custom_nginx_template())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +322,40 @@ fn default_network_mode() -> String {
     "private".to_string()
 }
 
+/// Normalize `[network].mode`: `public` → `wan`, `local` → `private`.
+pub fn normalize_network_mode(mode: &str) -> &str {
+    let m = mode.trim();
+    if m.eq_ignore_ascii_case("public") {
+        "wan"
+    } else if m.eq_ignore_ascii_case("local") || m.eq_ignore_ascii_case("private") {
+        "private"
+    } else if m.eq_ignore_ascii_case("lan") {
+        "lan"
+    } else if m.eq_ignore_ascii_case("wan") {
+        "wan"
+    } else {
+        m
+    }
+}
+
+/// Static SPA served by nginx from release `dist` (custom template required).
+pub fn is_static_nginx_edge(m: &PirateManifest) -> bool {
+    let t = m.proxy.r#type.trim().to_ascii_lowercase();
+    (t == "nginx-front" || t == "nginx-static") && m.proxy.has_custom_nginx_template()
+}
+
+/// Public hostnames: `[network.access]` first, else `[proxy].domain`.
+pub fn manifest_public_domain_names(m: &PirateManifest) -> Vec<String> {
+    let mut out = network_access_server_names(&m.network.access);
+    if out.is_empty() {
+        let d = m.proxy.domain.trim();
+        if !d.is_empty() {
+            out.push(d.to_string());
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkAccessSection {
     #[serde(default)]
@@ -291,6 +364,28 @@ pub struct NetworkAccessSection {
     pub public: bool,
     #[serde(default)]
     pub domain: String,
+    /// Extra `server_name` hosts for WAN (primary remains in `domain` when set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+}
+
+/// Unique non-empty hostnames for nginx `server_name` (primary `domain` first, then `domains`).
+pub fn network_access_server_names(access: &NetworkAccessSection) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    let primary = access.domain.trim();
+    if !primary.is_empty() {
+        out.push(primary.to_string());
+    }
+    for d in &access.domains {
+        let t = d.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +506,9 @@ impl PirateManifest {
                 enabled: false,
                 backend: default_proxy_backend(),
                 routes: BTreeMap::new(),
+                websocket_paths: Vec::new(),
+                nginx_conf_path: String::new(),
+                nginx_auto_apply: None,
             },
             network: NetworkSection::default(),
             process: ProcessSection::default(),
@@ -439,11 +537,15 @@ impl PirateManifest {
         Ok(Self::parse(&raw)?)
     }
 
+    pub fn effective_nginx_auto_apply(&self) -> bool {
+        self.proxy.effective_nginx_auto_apply()
+    }
+
     pub fn validate_network_proxy(&self) -> Result<(), String> {
-        let mode = self.network.mode.trim().to_ascii_lowercase();
-        if mode != "private" && mode != "lan" && mode != "wan" {
+        let normalized = normalize_network_mode(&self.network.mode);
+        if normalized != "private" && normalized != "lan" && normalized != "wan" {
             return Err(format!(
-                "invalid [network].mode `{}` (expected private|lan|wan)",
+                "invalid [network].mode `{}` (expected private|lan|wan|public)",
                 self.network.mode
             ));
         }
@@ -462,10 +564,19 @@ impl PirateManifest {
                 return Err("services.api.port conflicts with services.web.port".to_string());
             }
         }
-        if mode == "wan" && self.network.access.public {
-            if self.network.access.domain.trim().is_empty() {
+        if normalized == "wan" && is_static_nginx_edge(self) {
+            if manifest_public_domain_names(self).is_empty() {
                 return Err(
-                    "network.access.domain is required when network.mode=wan and public=true"
+                    "domain required for static nginx-front: set [proxy].domain or [network.access].domain"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        }
+        if normalized == "wan" && self.network.access.public {
+            if network_access_server_names(&self.network.access).is_empty() {
+                return Err(
+                    "network.access.domain or network.access.domains is required when network.mode=wan and public=true"
                         .to_string(),
                 );
             }
@@ -651,6 +762,24 @@ output_paths = ["dist", "public"]
         )
         .expect("parse");
         assert_eq!(m.release_output_paths(), vec!["dist", "public"]);
+    }
+
+    #[test]
+    fn validate_network_proxy_accepts_public_mode_alias() {
+        let m = PirateManifest::parse(
+            r#"
+[project]
+name = "x"
+[network]
+mode = "public"
+[proxy]
+type = "nginx-front"
+domain = "app.example.com"
+nginx_conf_path = "./pirate-nginx-snippet.conf"
+"#,
+        )
+        .expect("parse");
+        assert!(m.validate_network_proxy().is_ok());
     }
 
     #[test]

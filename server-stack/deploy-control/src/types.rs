@@ -354,6 +354,37 @@ pub struct ProcessControlView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ListenerRowView {
+    pub port: u16,
+    pub protocol: String,
+    pub bind: String,
+    pub pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
+    pub user: String,
+    pub cmdline: String,
+    /// `project` | `all`
+    pub scope: String,
+    pub managed_by_project: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessListenersView {
+    pub project_id: String,
+    pub scope: String,
+    pub rows: Vec<ListenerRowView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KillListenerResultView {
+    pub ok: bool,
+    pub pid: u32,
+    pub signal: String,
+    pub elevated: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProjectTelemetryLogLine {
     pub ts_ms: i64,
     pub level: String,
@@ -376,6 +407,16 @@ pub struct ProjectNginxSnippetView {
     pub hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_content_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_update: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_applied_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_site_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -435,6 +476,13 @@ pub struct ProjectNginxApplyView {
     pub test_output: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// `updated` | `unchanged` | `skipped` when set by auto-apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
 }
 
 // --- Nginx inventory / universal API (pirate-nginx-ops) ---

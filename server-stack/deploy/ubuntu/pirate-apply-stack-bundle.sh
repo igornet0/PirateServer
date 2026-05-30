@@ -79,6 +79,14 @@ if [[ -f "$BIN_DIR/pirate-host-agent" ]]; then
   echo "==> install pirate-host-agent -> /usr/local/bin"
   install -m 0755 "$BIN_DIR/pirate-host-agent" /usr/local/bin/pirate-host-agent
 fi
+# Stack tunnel API (HTTP control + gRPC relay); must match install.sh — OTA previously skipped this binary/unit.
+if [[ -f "$BIN_DIR/stack-tun-api" ]]; then
+  echo "==> install stack-tun-api (tunnel relay) -> /usr/local/bin"
+  install -m 0755 "$BIN_DIR/stack-tun-api" /usr/local/bin/stack-tun-api
+  mkdir -p /var/lib/pirate/stack-tun-api
+  chown pirate:pirate /var/lib/pirate/stack-tun-api
+  chmod 0750 /var/lib/pirate/stack-tun-api
+fi
 
 UI_SRC="$BUNDLE_ROOT/share/ui/dist"
 if [[ -f "$UI_SRC/index.html" ]]; then
@@ -94,10 +102,14 @@ fi
 
 SYSTEMD_SRC="$BUNDLE_ROOT/systemd"
 if [[ -d "$SYSTEMD_SRC" ]]; then
-  for u in deploy-server.service control-api.service pirate-host-agent.service; do
-    if [[ -f "$SYSTEMD_SRC/$u" ]]; then
-      install -m 0644 "$SYSTEMD_SRC/$u" "/etc/systemd/system/$u"
+  for u in deploy-server.service control-api.service pirate-host-agent.service pirate-stack-tun-api.service; do
+    if [[ ! -f "$SYSTEMD_SRC/$u" ]]; then
+      continue
     fi
+    if [[ "$u" == "pirate-stack-tun-api.service" ]] && [[ ! -f /usr/local/bin/stack-tun-api ]]; then
+      continue
+    fi
+    install -m 0644 "$SYSTEMD_SRC/$u" "/etc/systemd/system/$u"
   done
   systemctl daemon-reload
 fi
@@ -151,6 +163,21 @@ if [[ -d "$LIB_SRC" ]]; then
   shopt -u nullglob
   if [[ -f "$LIB_SRC/$SUDOERS_FRAG_NAME" ]]; then
     install -m 0644 "$LIB_SRC/$SUDOERS_FRAG_NAME" "/usr/local/lib/pirate/$SUDOERS_FRAG_NAME"
+  fi
+fi
+
+if [[ -f /usr/local/bin/stack-tun-api ]] && [[ -f /etc/systemd/system/pirate-stack-tun-api.service ]]; then
+  ENSURE=/usr/local/lib/pirate/pirate-ensure-stack-tun-env.sh
+  if [[ ! -f "$ENSURE" ]] && [[ -f "$BUNDLE_ROOT/lib/pirate/pirate-ensure-stack-tun-env.sh" ]]; then
+    ENSURE="$BUNDLE_ROOT/lib/pirate/pirate-ensure-stack-tun-env.sh"
+  fi
+  if [[ -f "$ENSURE" ]]; then
+    echo "==> stack-tun-api env (/etc/pirate-stack-tun-api.env)"
+    bash "$ENSURE"
+    systemctl daemon-reload
+    if systemctl is-active --quiet pirate-stack-tun-api.service 2>/dev/null; then
+      systemctl restart pirate-stack-tun-api.service || true
+    fi
   fi
 fi
 

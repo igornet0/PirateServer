@@ -3,6 +3,10 @@ use crate::types::{
 };
 use crate::ControlError;
 use deploy_core::nginx_snippet;
+use deploy_core::nginx_vhost_state::{
+    nginx_vhost_content_changed, read_nginx_vhost_state, sha256_str, write_nginx_vhost_state,
+    NginxVhostState,
+};
 use deploy_core::pirate_project::PirateManifest;
 use std::fs;
 use std::io::Write;
@@ -30,11 +34,7 @@ pub fn nginx_route_conflicts(manifest: &PirateManifest) -> Vec<String> {
 }
 
 pub fn generate_nginx_server_config(manifest: &PirateManifest) -> Result<String, ControlError> {
-    let server_name = if manifest.network.access.domain.trim().is_empty() {
-        "_".to_string()
-    } else {
-        manifest.network.access.domain.trim().to_string()
-    };
+    let server_name = deploy_core::nginx_snippet::nginx_server_name_line(manifest);
     let routes = deploy_core::nginx_snippet::resolve_nginx_upstream_routes(manifest);
     if routes.is_empty() {
         return Err(ControlError::NginxOp(
@@ -43,16 +43,9 @@ pub fn generate_nginx_server_config(manifest: &PirateManifest) -> Result<String,
     }
     let mut blocks = String::new();
     for (path, target) in routes {
-        blocks.push_str(&format!(
-            r#"
-    location {} {{
-        proxy_pass http://{};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }}
-"#,
-            path, target
+        let ws = deploy_core::nginx_snippet::nginx_route_websocket(manifest, &path);
+        blocks.push_str(&deploy_core::nginx_snippet::nginx_proxy_location_block(
+            &path, &target, ws, "",
         ));
     }
     let listen_port = if manifest.proxy.port > 0 && manifest.proxy.port < 1024 {
@@ -80,6 +73,32 @@ pub fn project_nginx_site_path(sites_available_dir: &Path, project_id: &str) -> 
     sites_available_dir.join(format!("pirate-project-{id}"))
 }
 
+/// Vhost body: custom release snippet when `[proxy].nginx_conf_path` is set, else generated proxy config.
+pub fn resolve_project_nginx_vhost_content(
+    manifest: &PirateManifest,
+    deploy_root: &Path,
+    version: &str,
+) -> Result<String, ControlError> {
+    if manifest.proxy.has_custom_nginx_template() {
+        let snippet_path = deploy_core::release_dir_for_version(deploy_root, version)
+            .join("pirate-nginx-snippet.conf");
+        let content = fs::read_to_string(&snippet_path).map_err(|e| {
+            ControlError::NginxOp(format!(
+                "release nginx snippet {}: {e}",
+                snippet_path.display()
+            ))
+        })?;
+        if content.trim().is_empty() {
+            return Err(ControlError::NginxOp(format!(
+                "release nginx snippet is empty: {}",
+                snippet_path.display()
+            )));
+        }
+        return Ok(content);
+    }
+    generate_nginx_server_config(manifest)
+}
+
 /// Write project vhost, enable site symlink, validate and reload nginx.
 pub fn apply_project_nginx_vhost(
     project_id: &str,
@@ -87,6 +106,8 @@ pub fn apply_project_nginx_vhost(
     sites_available_dir: &Path,
     apply_site_script: &Path,
     ops_script: &Path,
+    deploy_root: Option<&Path>,
+    version: Option<&str>,
 ) -> Result<crate::types::ProjectNginxApplyView, ControlError> {
     use crate::nginx_universal::apply_nginx_universal_action;
     use crate::types::{NginxActionBody, ProjectNginxApplyView};
@@ -105,13 +126,27 @@ pub fn apply_project_nginx_vhost(
     }
 
     let mut warnings = nginx_route_conflicts(&manifest);
-    if !nginx_snippet::nginx_edge_intended(&manifest) {
+    if manifest.proxy.has_custom_nginx_template() {
+        if deploy_root.is_none() || version.is_none() {
+            return Err(ControlError::NginxOp(
+                "custom nginx template requires deploy_root and active release version".into(),
+            ));
+        }
+    } else if !nginx_snippet::nginx_edge_intended(&manifest) {
         warnings.push(
             "proxy is not configured as nginx edge; vhost will still be written".to_string(),
         );
     }
 
-    let content = generate_nginx_server_config(&manifest)?;
+    let content = if manifest.proxy.has_custom_nginx_template() {
+        resolve_project_nginx_vhost_content(
+            &manifest,
+            deploy_root.expect("checked above"),
+            version.expect("checked above"),
+        )?
+    } else {
+        generate_nginx_server_config(&manifest)?
+    };
     let site_path = project_nginx_site_path(sites_available_dir, project_id);
 
     let put = apply_nginx_site_via_sudo(&site_path, &content, apply_site_script)?;
@@ -123,6 +158,9 @@ pub fn apply_project_nginx_vhost(
             message: put.message,
             test_output: put.test_output,
             warnings,
+            action: None,
+            template_changed: None,
+            content_sha256: None,
         });
     }
 
@@ -165,16 +203,197 @@ pub fn apply_project_nginx_vhost(
         )
     };
 
+    let ok = put.ok && enabled;
+    if ok {
+        if let (Some(deploy_root), Some(version)) = (deploy_root, version) {
+            if let Ok(content) =
+                resolve_project_nginx_vhost_content(&manifest, deploy_root, version)
+            {
+                let content_sha256 = sha256_str(&content);
+                let template_sha256 = if manifest.proxy.has_custom_nginx_template() {
+                    if let Ok(joined) = deploy_core::pirate_project::resolve_nginx_conf_join(
+                        deploy_root,
+                        &manifest,
+                    ) {
+                        deploy_core::nginx_vhost_state::sha256_file(&joined).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                let _ = persist_nginx_vhost_state(
+                    deploy_root,
+                    &template_sha256,
+                    &content_sha256,
+                    version,
+                    &site_path,
+                );
+            }
+        }
+    }
+
     Ok(ProjectNginxApplyView {
-        ok: put.ok && enabled,
+        ok,
         path: site_path.display().to_string(),
         enabled,
         message,
-        test_output: put
-            .test_output
-            .or(enable.detail),
+        test_output: put.test_output.or(enable.detail),
         warnings,
+        action: None,
+        template_changed: None,
+        content_sha256: None,
     })
+}
+
+fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn persist_nginx_vhost_state(
+    deploy_root: &Path,
+    template_sha256: &str,
+    content_sha256: &str,
+    version: &str,
+    site_path: &Path,
+) -> Result<(), ControlError> {
+    write_nginx_vhost_state(
+        deploy_root,
+        &NginxVhostState {
+            template_sha256: template_sha256.to_string(),
+            applied_content_sha256: content_sha256.to_string(),
+            applied_version: version.to_string(),
+            applied_site_path: site_path.display().to_string(),
+            applied_at_ms: now_unix_ms(),
+        },
+    )
+    .map_err(|e| ControlError::NginxOp(format!("write nginx vhost state: {e}")))
+}
+
+/// Auto-apply project vhost after deploy when `[proxy].nginx_auto_apply` is set.
+/// Skips sudo/reload when processed content matches persisted state and sites-available file.
+pub fn maybe_auto_apply_project_nginx_vhost(
+    project_id: &str,
+    manifest: &PirateManifest,
+    deploy_root: &Path,
+    version: &str,
+    sites_available_dir: &Path,
+    apply_site_script: &Path,
+    ops_script: &Path,
+    snippet: &deploy_core::process_manager::NginxSnippetWriteResult,
+) -> crate::types::ProjectNginxApplyView {
+    use crate::types::ProjectNginxApplyView;
+    let site_path = project_nginx_site_path(sites_available_dir, project_id);
+    let site_path_str = site_path.display().to_string();
+
+    if !manifest.effective_nginx_auto_apply() {
+        return ProjectNginxApplyView {
+            ok: true,
+            path: site_path_str,
+            enabled: false,
+            message: "nginx auto-apply disabled".into(),
+            test_output: None,
+            warnings: Vec::new(),
+            action: Some("skipped".into()),
+            template_changed: None,
+            content_sha256: Some(snippet.content_sha256.clone()),
+        };
+    }
+
+    let state = read_nginx_vhost_state(deploy_root);
+    let template_changed = state
+        .as_ref()
+        .map(|s| s.template_sha256 != snippet.template_sha256)
+        .unwrap_or(true);
+
+    if !nginx_vhost_content_changed(
+        &snippet.content,
+        &snippet.content_sha256,
+        state.as_ref(),
+        &site_path,
+    ) {
+        return ProjectNginxApplyView {
+            ok: true,
+            path: site_path_str,
+            enabled: true,
+            message: format!(
+                "nginx vhost unchanged at {}; reload skipped",
+                site_path.display()
+            ),
+            test_output: None,
+            warnings: Vec::new(),
+            action: Some("unchanged".into()),
+            template_changed: Some(template_changed),
+            content_sha256: Some(snippet.content_sha256.clone()),
+        };
+    }
+
+    let manifest_toml = manifest.to_toml_string().unwrap_or_default();
+    match apply_project_nginx_vhost(
+        project_id,
+        &manifest_toml,
+        sites_available_dir,
+        apply_site_script,
+        ops_script,
+        Some(deploy_root),
+        Some(version),
+    ) {
+        Ok(mut view) => {
+            if view.ok {
+                let _ = persist_nginx_vhost_state(
+                    deploy_root,
+                    &snippet.template_sha256,
+                    &snippet.content_sha256,
+                    version,
+                    &site_path,
+                );
+            }
+            view.action = Some(if view.ok {
+                "updated".into()
+            } else {
+                "failed".into()
+            });
+            view.template_changed = Some(template_changed);
+            view.content_sha256 = Some(snippet.content_sha256.clone());
+            view
+        }
+        Err(e) => ProjectNginxApplyView {
+            ok: false,
+            path: site_path_str,
+            enabled: false,
+            message: e.to_string(),
+            test_output: None,
+            warnings: Vec::new(),
+            action: Some("failed".into()),
+            template_changed: Some(template_changed),
+            content_sha256: Some(snippet.content_sha256.clone()),
+        },
+    }
+}
+
+pub fn nginx_deploy_state_view(
+    deploy_root: &Path,
+    client_template_sha256: &str,
+) -> (String, String, String, i64, bool) {
+    let state = read_nginx_vhost_state(deploy_root).unwrap_or_default();
+    let needs_update = if client_template_sha256.is_empty() {
+        false
+    } else if state.template_sha256.is_empty() {
+        true
+    } else {
+        state.template_sha256 != client_template_sha256
+    };
+    (
+        state.template_sha256,
+        state.applied_content_sha256,
+        state.applied_site_path,
+        state.applied_at_ms,
+        needs_update,
+    )
 }
 
 /// Read nginx config file for API response.
@@ -617,6 +836,37 @@ domain = "app.example.com"
         assert!(cfg.contains("server_name app.example.com"), "{cfg}");
         assert!(cfg.contains("proxy_pass http://127.0.0.1:3000"), "{cfg}");
         assert!(cfg.contains("# Pirate: project vhost"), "{cfg}");
+    }
+
+    #[test]
+    fn resolve_project_nginx_vhost_content_reads_release_snippet() {
+        let pid = std::process::id();
+        let deploy_root =
+            std::env::temp_dir().join(format!("deploy-control-nginx-resolve-{pid}"));
+        let _ = fs::remove_dir_all(&deploy_root);
+        let release_dir = deploy_root.join("releases").join("1.0.0");
+        fs::create_dir_all(&release_dir).unwrap();
+        fs::write(
+            release_dir.join("pirate-nginx-snippet.conf"),
+            "server { listen 443 ssl; }",
+        )
+        .unwrap();
+        let m = PirateManifest::parse(
+            r#"
+[project]
+name = "x"
+version = "1"
+deploy_project_id = "p-testnginx01"
+
+[proxy]
+type = "nginx-front"
+nginx_conf_path = "./pirate-nginx-snippet.conf"
+"#,
+        )
+        .expect("parse");
+        let cfg = resolve_project_nginx_vhost_content(&m, &deploy_root, "1.0.0").expect("content");
+        assert!(cfg.contains("listen 443 ssl"));
+        let _ = fs::remove_dir_all(&deploy_root);
     }
 
     #[test]

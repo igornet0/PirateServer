@@ -33,6 +33,16 @@ install)
   clickhouse) bash "$DIR/install-clickhouse.sh" ;;
   minio) bash "$DIR/install-minio.sh" ;;
   meilisearch) bash "$DIR/install-meilisearch.sh" ;;
+  stack_tun_api)
+    [[ -f /usr/local/bin/stack-tun-api ]] || die "stack-tun-api binary missing (/usr/local/bin/stack-tun-api)"
+    [[ -f /etc/systemd/system/pirate-stack-tun-api.service ]] || die "pirate-stack-tun-api.service missing"
+    mkdir -p /var/lib/pirate/stack-tun-api
+    chown pirate:pirate /var/lib/pirate/stack-tun-api
+    chmod 0750 /var/lib/pirate/stack-tun-api
+    bash "$DIR/pirate-ensure-stack-tun-env.sh"
+    systemctl daemon-reload
+    systemctl enable --now pirate-stack-tun-api.service
+    ;;
   cifs_utils)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
@@ -54,6 +64,9 @@ remove)
   clickhouse) bash "$DIR/remove-clickhouse.sh" ;;
   minio) bash "$DIR/remove-minio.sh" ;;
   meilisearch) bash "$DIR/remove-meilisearch.sh" ;;
+  stack_tun_api)
+    systemctl disable --now pirate-stack-tun-api.service 2>/dev/null || true
+    ;;
   cifs_utils) bash "$DIR/remove-cifs-utils.sh" ;;
   *) die "unknown id: $ID" ;;
   esac

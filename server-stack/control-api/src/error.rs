@@ -156,6 +156,42 @@ impl ApiError {
         }
     }
 
+    pub fn precondition_failed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: "precondition_failed",
+            message: message.into(),
+            configured_limit: None,
+            grpc_limit: None,
+            effective_limit: None,
+            conflict_path: None,
+        }
+    }
+
+    pub fn elevation_required(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "elevation_required",
+            message: message.into(),
+            configured_limit: None,
+            grpc_limit: None,
+            effective_limit: None,
+            conflict_path: None,
+        }
+    }
+
+    pub fn elevation_failed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "elevation_failed",
+            message: message.into(),
+            configured_limit: None,
+            grpc_limit: None,
+            effective_limit: None,
+            conflict_path: None,
+        }
+    }
+
     pub fn not_implemented(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
@@ -242,10 +278,24 @@ impl From<StorageBindError> for ApiError {
     }
 }
 
+fn map_grpc_control_error(msg: String) -> ApiError {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("failed precondition")
+        || lower.contains("no active release")
+        || lower.contains("ports still listening")
+        || lower.contains("release directory")
+        || lower.contains("neither run.sh")
+    {
+        ApiError::precondition_failed(msg)
+    } else {
+        ApiError::bad_gateway(msg)
+    }
+}
+
 impl From<ControlError> for ApiError {
     fn from(e: ControlError) -> Self {
         match e {
-            ControlError::Grpc(msg) => ApiError::bad_gateway(msg),
+            ControlError::Grpc(msg) => map_grpc_control_error(msg),
             ControlError::HostDeployEnv(msg) => {
                 if msg.contains("exceeds") || msg.contains("NUL bytes") {
                     ApiError::bad_request(msg)
@@ -279,6 +329,17 @@ impl From<ControlError> for ApiError {
                 }
             }
             ControlError::HostDb(msg) => ApiError::bad_request(msg),
+            ControlError::ProcessListeners(msg) => {
+                if msg.contains("scope must be") || msg.contains("signal must be") || msg.contains("invalid pid") {
+                    ApiError::bad_request(msg)
+                } else if msg.contains("only supported on Linux") {
+                    ApiError::not_implemented(msg)
+                } else {
+                    ApiError::bad_gateway(msg)
+                }
+            }
+            ControlError::ElevationRequired(msg) => ApiError::elevation_required(msg),
+            ControlError::ElevationFailed(msg) => ApiError::elevation_failed(msg),
             ControlError::Io(err) => ApiError::internal(err.to_string()),
             ControlError::Db(err) => match err {
                 DbError::InvalidIdentifier(msg) => ApiError::bad_request(msg),

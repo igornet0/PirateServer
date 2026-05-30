@@ -6,7 +6,7 @@ description = "Build Xray client JSON from grpc_proxy_session rows (public ingre
 
 [dependencies]
 deploy-db = { path = "../deploy-db" }
-serde_json = "1"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 chrono = { version = "0.4", features = ["clock"] }

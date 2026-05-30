@@ -17,7 +17,7 @@
 # Статистика хостов в дашборде: CONTROL_API_HOST_STATS_SERIES / CONTROL_API_HOST_STATS_STREAM; см. pirate_CONTROL_API_HOST_STATS_* в usage.
 # Явно задать домен: sudo pirate_DOMAIN=deploy.example.com ./install.sh  или  --domain deploy.example.com
 # Каталог: распакованный pirate-linux-amd64/ (рядом с bin/, share/, install.sh).
-# Состав бандла (см. scripts/linux-bundle-build.sh): bin/{deploy-server,control-api,client,pirate},
+# Состав бандла (см. scripts/linux-bundle-build.sh): bin/{deploy-server,control-api,client,pirate,stack-tun-api},
 #   systemd/*.service, nginx/*.conf*, lib/pirate/*.sh и 99-pirate-smb.sudoers.fragment, bin/pirate-host-agent (если есть в архиве), share/ui/dist (если не .bundle-no-ui),
 #   server-stack-manifest.json, env.example.
 # Блок «GUI / трансляция»: сначала bin/pirate (или bin/client) gui-check из бандла, иначе pirate-gui-probe.sh;
@@ -519,6 +519,13 @@ if [[ -f "$BIN_LOCAL/pirate-host-agent" ]]; then
   echo "==> pirate-host-agent -> /usr/local/bin (out-of-band OTA / reboot)"
   install -m 0755 "$BIN_LOCAL/pirate-host-agent" /usr/local/bin/pirate-host-agent
 fi
+if [[ -f "$BIN_LOCAL/stack-tun-api" ]]; then
+  echo "==> stack-tun-api — бинарь и unit (по умолчанию выключен; включение — в дашборде «Сервисы» или: pirate-host-service install stack_tun_api)"
+  install -m 0755 "$BIN_LOCAL/stack-tun-api" /usr/local/bin/stack-tun-api
+  mkdir -p /var/lib/pirate/stack-tun-api
+  chown pirate:pirate /var/lib/pirate/stack-tun-api
+  chmod 0750 /var/lib/pirate/stack-tun-api
+fi
 
 if [[ -f "$SCRIPT_DIR/server-stack-manifest.json" ]]; then
   echo "==> server-stack manifest -> /var/lib/pirate (release metadata for GetServerStackInfo)"
@@ -609,6 +616,12 @@ chown root:pirate /etc/pirate-deploy.env
 echo "==> systemd"
 install -m 0644 "$SYSTEMD_SRC/deploy-server.service" /etc/systemd/system/deploy-server.service
 install -m 0644 "$SYSTEMD_SRC/control-api.service" /etc/systemd/system/control-api.service
+if [[ -f "$SYSTEMD_SRC/pirate-stack-tun-api.service" ]] && [[ -f /usr/local/bin/stack-tun-api ]]; then
+  install -m 0644 "$SYSTEMD_SRC/pirate-stack-tun-api.service" /etc/systemd/system/pirate-stack-tun-api.service
+  if [[ -f "$SCRIPT_DIR/pirate-ensure-stack-tun-env.sh" ]]; then
+    bash "$SCRIPT_DIR/pirate-ensure-stack-tun-env.sh"
+  fi
+fi
 if [[ -f /usr/local/bin/pirate-host-agent ]] && [[ -f "$SYSTEMD_SRC/pirate-host-agent.service" ]]; then
   install -m 0644 "$SYSTEMD_SRC/pirate-host-agent.service" /etc/systemd/system/pirate-host-agent.service
   if [[ ! -f /etc/pirate-host-agent.env ]]; then
@@ -633,6 +646,10 @@ systemctl daemon-reload
 systemctl enable deploy-server.service control-api.service
 if [[ -f /etc/systemd/system/pirate-host-agent.service ]]; then
   systemctl enable pirate-host-agent.service
+fi
+if [[ -f /etc/systemd/system/pirate-stack-tun-api.service ]] && [[ -f /usr/local/bin/stack-tun-api ]]; then
+  echo "==> pirate-stack-tun-api: по умолчанию выключен (остановить, если было включено ранее)"
+  systemctl disable --now pirate-stack-tun-api.service 2>/dev/null || true
 fi
 
 if [[ "$pirate_NGINX" == "1" ]]; then

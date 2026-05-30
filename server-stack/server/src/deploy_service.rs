@@ -1,6 +1,6 @@
 //! Deploy: stream → temp file, SHA-256, tar unpack, symlink, process control.
 
-use crate::listen_port_owner;
+use deploy_core::listen_port_owner;
 use crate::metrics_http::ProxyTunnelMetrics;
 use crate::proxy_session;
 use crate::tunnel_admission::{self, TunnelAdmission};
@@ -25,8 +25,9 @@ use deploy_auth::{
     verify_upload_server_stack_metadata, META_PROJECT, META_STACK_APPLY_SHA256, META_VERSION,
 };
 use deploy_control::{
-    collect_cpu_detail, collect_disk_detail, collect_host_stats, collect_memory_detail,
-    collect_network_detail, collect_processes_list,
+    apply_project_nginx_vhost, collect_cpu_detail, collect_disk_detail, collect_host_stats,
+    collect_memory_detail, collect_network_detail, collect_processes_list,
+    maybe_auto_apply_project_nginx_vhost, nginx_deploy_state_view,
     CpuDetail, CpuTimes, DiskDetail, DiskIoSummary, HostLogLine, HostMountStats, HostNetInterface,
     HostStatsView, LoadAvg, MemoryDetail, MemoryOverview, NetworkDetail, ProcessCpu, ProcessDisk,
     ProcessMem, ProcessRow, ProcessesDetail, SeriesHint, NetCounters,
@@ -38,7 +39,7 @@ use deploy_proto::deploy::{
     proxy_client_msg, proxy_server_msg,
     CloseConnectionRequest, CloseConnectionResponse, ConnectionProbeChunk, ConnectionProbeResult,
     CpuDetailProto, CpuTimesProto, CreateConnectionRequest, CreateConnectionResponse,
-    DeployChunk, DeployResponse, DiskDetailProto, DiskIoSummaryProto,
+    DeployChunk, DeployNginxApply, DeployResponse, DiskDetailProto, DiskIoSummaryProto,
     GetStatsRequest, GetStatsResponse,
     HostLogLineProto, HostMountStatsProto, HostNetInterfaceProto, HostStatsDetailKind,
     HostStatsDetailRequest, HostStatsDetailResponse, HostStatsRequest, HostStatsResponse, LoadAvgProto,
@@ -49,6 +50,7 @@ use deploy_proto::deploy::{
     ReportResourceUsageRequest, ReportResourceUsageResponse,
     RemoveProjectRequest, RemoveProjectResponse, RestartProcessRequest, RollbackRequest,
     RollbackResponse, SeriesHintProto, StackApplyMode, ValidateDeployRequest, ValidateDeployResponse,
+    NginxDeployState,
     StackApplyOptions, ServerStackChunk, ServerStackInfo, ServerStackInfoRequest, ServerStackResponse,
     StatusRequest, StatusResponse,
     StopProcessRequest,
@@ -603,6 +605,10 @@ pub struct DeployServiceImpl {
     pub tunnel_redis: Option<Arc<TunnelRedis>>,
     /// QUIC UDP data-plane (optional; tickets issued from raw `ProxyTunnel` when enabled).
     pub quic_dataplane: Option<crate::quic::QuicDataplaneState>,
+    /// Privileged helper to apply per-project nginx vhost (`pirate-nginx-apply-site.sh`).
+    pub nginx_apply_site_script: PathBuf,
+    /// Privileged nginx ops (`pirate-nginx-ops.sh`).
+    pub nginx_ops_script: PathBuf,
 }
 
 impl DeployServiceImpl {
@@ -625,6 +631,8 @@ impl DeployServiceImpl {
         tunnel_admission: Arc<TunnelAdmission>,
         tunnel_redis: Option<Arc<TunnelRedis>>,
         quic_dataplane: Option<crate::quic::QuicDataplaneState>,
+        nginx_apply_site_script: PathBuf,
+        nginx_ops_script: PathBuf,
     ) -> Self {
         Self {
             base_root,
@@ -645,6 +653,8 @@ impl DeployServiceImpl {
             tunnel_admission,
             tunnel_redis,
             quic_dataplane,
+            nginx_apply_site_script,
+            nginx_ops_script,
         }
     }
 
@@ -711,6 +721,18 @@ impl DeployServiceImpl {
                 error!(%e, "deploy_db upsert_snapshot");
             }
         });
+    }
+}
+
+fn project_nginx_apply_view_to_proto(view: &deploy_control::ProjectNginxApplyView) -> DeployNginxApply {
+    DeployNginxApply {
+        ok: view.ok,
+        path: view.path.clone(),
+        message: view.message.clone(),
+        action: view.action.clone().unwrap_or_default(),
+        template_changed: view.template_changed.unwrap_or(false),
+        content_sha256: view.content_sha256.clone().unwrap_or_default(),
+        test_output: view.test_output.clone().unwrap_or_default(),
     }
 }
 
@@ -1343,46 +1365,63 @@ impl DeployService for DeployServiceImpl {
 
         let rd_apply = release_dir.clone();
         let sidecar2 = manifest_toml_from_stream;
-        let manifest_opt: Option<PirateManifest> = tokio::task::spawn_blocking(move || -> Result<Option<PirateManifest>, String> {
-            if let Some(raw) = sidecar2 {
-                if !raw.trim().is_empty() {
-                    let m = PirateManifest::parse(&raw).map_err(|e| e.to_string())?;
-                    process_manager::apply_sidecar_manifest(&rd_apply, &m)
-                        .map_err(|e| e.to_string())?;
-                    return Ok(Some(m));
+        let sidecar_result = tokio::task::spawn_blocking(
+            move || -> Result<(Option<PirateManifest>, Option<process_manager::NginxSnippetWriteResult>), String> {
+                let apply = |m: &PirateManifest| -> Result<Option<process_manager::NginxSnippetWriteResult>, String> {
+                    process_manager::apply_sidecar_manifest(&rd_apply, m).map_err(|e| e.to_string())
+                };
+                if let Some(raw) = sidecar2 {
+                    if !raw.trim().is_empty() {
+                        let m = PirateManifest::parse(&raw).map_err(|e| e.to_string())?;
+                        let snippet = apply(&m)?;
+                        return Ok((Some(m), snippet));
+                    }
                 }
-            }
-            let p = rd_apply.join("pirate.toml");
-            if p.is_file() {
-                let m = PirateManifest::read_file(&p).map_err(|e| e.to_string())?;
-                process_manager::apply_sidecar_manifest(&rd_apply, &m)
-                    .map_err(|e| e.to_string())?;
-                return Ok(Some(m));
-            }
-            Ok(None)
-        })
+                let p = rd_apply.join("pirate.toml");
+                if p.is_file() {
+                    let m = PirateManifest::read_file(&p).map_err(|e| e.to_string())?;
+                    let snippet = apply(&m)?;
+                    return Ok((Some(m), snippet));
+                }
+                Ok((None, None))
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(Status::internal)?;
 
+        let manifest_opt = sidecar_result.0;
+        let nginx_snippet = sidecar_result.1;
+
         if let Some(ref man) = manifest_opt {
-            match deploy_core::nginx_snippet::nginx_release_skip(man) {
-                None => {
-                    info!(
-                        project = %project_key,
-                        version = %version,
-                        nginx_snippet = "written",
-                        "release sidecar"
-                    );
-                }
-                Some(skip) => {
-                    info!(
-                        project = %project_key,
-                        version = %version,
-                        nginx_snippet = "skipped",
-                        reason = skip.reason_code(),
-                        "release sidecar"
-                    );
+            if man.proxy.has_custom_nginx_template() {
+                info!(
+                    project = %project_key,
+                    version = %version,
+                    nginx_snippet = "written",
+                    source = "custom_template",
+                    "release sidecar"
+                );
+            } else {
+                match deploy_core::nginx_snippet::nginx_release_skip(man) {
+                    None => {
+                        info!(
+                            project = %project_key,
+                            version = %version,
+                            nginx_snippet = "written",
+                            source = "generated",
+                            "release sidecar"
+                        );
+                    }
+                    Some(skip) => {
+                        info!(
+                            project = %project_key,
+                            version = %version,
+                            nginx_snippet = "skipped",
+                            reason = skip.reason_code(),
+                            "release sidecar"
+                        );
+                    }
                 }
             }
         } else {
@@ -1412,6 +1451,108 @@ impl DeployService for DeployServiceImpl {
             st.state = "error".to_string();
             st.last_error = Some(e.to_string());
             return Err(Status::internal(format!("symlink: {e}")));
+        }
+
+        let nginx_apply_site_script = self.nginx_apply_site_script.clone();
+        let nginx_ops_script = self.nginx_ops_script.clone();
+        let nginx_apply_result = if let Some(ref man) = manifest_opt {
+            let project_id = project_key.clone();
+            let ver = version.clone();
+            let deploy_root = root.clone();
+            if let Some(ref snippet) = nginx_snippet {
+                let man_clone = man.clone();
+                let snippet_clone = snippet.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || -> Result<deploy_control::ProjectNginxApplyView, String> {
+                        Ok(maybe_auto_apply_project_nginx_vhost(
+                            &project_id,
+                            &man_clone,
+                            deploy_root.as_path(),
+                            &ver,
+                            Path::new("/etc/nginx/sites-available"),
+                            &nginx_apply_site_script,
+                            &nginx_ops_script,
+                            &snippet_clone,
+                        ))
+                    })
+                    .await,
+                )
+            } else if man.effective_nginx_auto_apply() {
+                let manifest_toml = man.to_toml_string().unwrap_or_default();
+                Some(
+                    tokio::task::spawn_blocking(move || -> Result<deploy_control::ProjectNginxApplyView, String> {
+                        apply_project_nginx_vhost(
+                            &project_id,
+                            &manifest_toml,
+                            Path::new("/etc/nginx/sites-available"),
+                            &nginx_apply_site_script,
+                            &nginx_ops_script,
+                            Some(deploy_root.as_path()),
+                            Some(ver.as_str()),
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .await,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut nginx_apply_proto: Option<DeployNginxApply> = None;
+        if let Some(task) = nginx_apply_result {
+            match task {
+                Ok(Ok(view)) => {
+                    if view.ok {
+                        info!(
+                            project = %project_key,
+                            version = %version,
+                            path = %view.path,
+                            action = ?view.action,
+                            "nginx auto-apply succeeded"
+                        );
+                    } else {
+                        warn!(
+                            project = %project_key,
+                            version = %version,
+                            message = %view.message,
+                            action = ?view.action,
+                            "nginx auto-apply failed"
+                        );
+                    }
+                    nginx_apply_proto = Some(project_nginx_apply_view_to_proto(&view));
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        project = %project_key,
+                        version = %version,
+                        error = %e,
+                        "nginx auto-apply error"
+                    );
+                    nginx_apply_proto = Some(DeployNginxApply {
+                        ok: false,
+                        message: e,
+                        action: "failed".into(),
+                        ..Default::default()
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        project = %project_key,
+                        version = %version,
+                        error = %e,
+                        "nginx auto-apply task failed"
+                    );
+                    nginx_apply_proto = Some(DeployNginxApply {
+                        ok: false,
+                        message: e.to_string(),
+                        action: "failed".into(),
+                        ..Default::default()
+                    });
+                }
+            }
         }
 
         match spawn_release(&root, &version, &bf).await {
@@ -1456,6 +1597,7 @@ impl DeployService for DeployServiceImpl {
         Ok(Response::new(DeployResponse {
             status: "ok".to_string(),
             deployed_version: version,
+            nginx_apply: nginx_apply_proto,
         }))
     }
 
@@ -1638,10 +1780,28 @@ impl DeployService for DeployServiceImpl {
             blockers.push(conflict);
         }
 
+        let deploy_root = project_deploy_root(&self.base_root, &inner.project_id);
+        let client_template_sha = inner.client_nginx_template_sha256.trim();
+        let (server_template_sha, applied_content_sha, applied_site_path, last_applied_at_ms, needs_update) =
+            nginx_deploy_state_view(deploy_root.as_path(), client_template_sha);
+        if needs_update {
+            warnings.push(
+                "nginx template changed since last deploy; vhost will be updated on next deploy"
+                    .to_string(),
+            );
+        }
+
         Ok(Response::new(ValidateDeployResponse {
             allow: blockers.is_empty(),
             blockers,
             warnings,
+            nginx_state: Some(NginxDeployState {
+                server_template_sha256: server_template_sha,
+                applied_content_sha256: applied_content_sha,
+                applied_site_path,
+                last_applied_at_ms,
+                needs_update,
+            }),
         }))
     }
 
@@ -1878,6 +2038,40 @@ impl DeployService for DeployServiceImpl {
         if let Some(ref mut c) = st.child {
             stop_child(c).await;
             st.child = None;
+        }
+
+        let ports_to_check = collect_ports_for_remove_project(&root);
+        if !ports_to_check.is_empty() {
+            let mut still_busy = wait_until_listen_ports_free(&ports_to_check).await;
+            still_busy =
+                filter_still_busy_ports_excluding_same_project_remove(&root, &key, &still_busy);
+            if !still_busy.is_empty() {
+                try_sigkill_project_listeners_matching_deploy(&root, &key, &still_busy).await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                still_busy = wait_until_listen_ports_free(&ports_to_check).await;
+                still_busy =
+                    filter_still_busy_ports_excluding_same_project_remove(&root, &key, &still_busy);
+            }
+            if !still_busy.is_empty() {
+                let pids: Vec<String> = still_busy
+                    .iter()
+                    .flat_map(|&port| {
+                        listen_port_owner::listener_pids_for_port(port)
+                            .into_iter()
+                            .map(move |pid| format!("{port}:pid{pid}"))
+                    })
+                    .collect();
+                st.state = "error".to_string();
+                st.last_error = Some(format!(
+                    "ports still listening after stop: {:?} ({})",
+                    still_busy, pids.join(", ")
+                ));
+                return Err(Status::failed_precondition(format!(
+                    "ports still listening after stop: {:?}; free them or kill listeners ({})",
+                    still_busy,
+                    pids.join(", ")
+                )));
+            }
         }
 
         match spawn_release(&root, &ver, &bf).await {

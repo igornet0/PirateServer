@@ -6,33 +6,33 @@ edition = "2021"
 [dependencies]
 deploy-auth = { path = "../deploy-auth" }
 ed25519-dalek = "2"
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 deploy-core = { path = "../deploy-core" }
 deploy-control = { path = "../deploy-control" }
 deploy-db = { path = "../deploy-db" }
 deploy-proto = { path = "../../proto" }
 wire-protocol = { path = "../../wire-protocol" }
-prost = "0.13"
+prost = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "process", "sync", "net", "time"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["transport"] }
 clap = { version = "4", features = ["derive", "env"] }
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2 = "0.10"
-flate2 = "1"
-tar = "0.4"
-hex = "0.4"
-futures-util = "0.3"
-libc = "0.2"
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+hex = { workspace = true }
+futures-util = { workspace = true }
+libc = { workspace = true }
 argon2 = "0.5"
 password-hash = "0.5"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 chrono = { version = "0.4", features = ["clock"] }
 chrono-tz = "0.9"
-sysinfo = "0.32"
-rand = "0.8"
+sysinfo = { workspace = true }
+rand = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 redis = { version = "0.27", features = ["tokio-comp"] }
 quinn = "0.11"

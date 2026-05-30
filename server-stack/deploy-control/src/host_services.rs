@@ -26,6 +26,7 @@ pub const HOST_SERVICE_IDS: &[&str] = &[
     "cifs_utils",
     "minio",
     "meilisearch",
+    "stack_tun_api",
 ];
 
 pub fn host_service_id_allowed(id: &str) -> bool {
@@ -129,6 +130,15 @@ fn systemctl_is_active(unit: &str) -> Option<bool> {
     let line = String::from_utf8_lossy(&out.stdout);
     let s = line.trim();
     Some(s == "active")
+}
+
+/// Whether the unit is enabled to start at boot (`systemctl is-enabled --quiet`).
+fn systemctl_is_enabled(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-enabled", "--quiet", unit])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn dpkg_installed(pkg: &str) -> bool {
@@ -268,6 +278,17 @@ pub fn collect_host_services(
             .or_else(|| cmd_stdout_trim("meilisearch", &["--version"]))
     };
     let meili_run = systemctl_is_active("pirate-meilisearch");
+
+    let st_bin = Path::new("/usr/local/bin/stack-tun-api");
+    let st_unit = Path::new("/etc/systemd/system/pirate-stack-tun-api.service");
+    let st_deployed = st_bin.is_file() && st_unit.is_file();
+    let st_enabled = st_deployed && systemctl_is_enabled("pirate-stack-tun-api");
+    let st_v = if st_bin.is_file() {
+        cmd_stdout_trim("/usr/local/bin/stack-tun-api", &["--version"]).or_else(|| Some("present".into()))
+    } else {
+        None
+    };
+    let st_run = systemctl_is_active("pirate-stack-tun-api");
 
     let oracle_notes = Some(
         "Oracle Database is not installed via this stack; use Oracle XE, container images, or Instant Client. See install-oracle-notes.sh."
@@ -439,6 +460,42 @@ pub fn collect_host_services(
             actions: actions_for("meilisearch", meili_inst, dispatch_script_present, false),
             notes: Some("HTTP 127.0.0.1:7700. Master key: /etc/pirate-meilisearch.env.".to_string()),
             runtime_configurable: true,
+        },
+        HostServiceRow {
+            id: "stack_tun_api".to_string(),
+            display_name: "Stack tunnel API".to_string(),
+            category: "tunnel".to_string(),
+            // `installed` here means the unit is **enabled** (UI: Install → enable & start, Remove → disable & stop).
+            installed: st_enabled,
+            version: st_v,
+            running: st_run,
+            systemd_unit: Some("pirate-stack-tun-api".to_string()),
+            actions: if st_deployed {
+                actions_for("stack_tun_api", st_enabled, dispatch_script_present, false)
+            } else {
+                "none".to_string()
+            },
+            notes: Some(if st_deployed {
+                "HTTP 0.0.0.0:9380, gRPC 0.0.0.0:9381 (LAN; /etc/pirate-stack-tun-api.env). Disabled by default after stack install; use Install to enable."
+                    .to_string()
+            } else {
+                let mut parts = vec![
+                    "No Enable button until both files exist: /usr/local/bin/stack-tun-api and /etc/systemd/system/pirate-stack-tun-api.service."
+                        .to_string(),
+                ];
+                if !st_bin.is_file() {
+                    parts.push("Missing: stack-tun-api binary.".to_string());
+                }
+                if !st_unit.is_file() {
+                    parts.push("Missing: pirate-stack-tun-api.service unit.".to_string());
+                }
+                parts.push(
+                    "Apply install.sh from a recent Linux bundle or upload a server-stack OTA tarball that installs these; then refresh this list."
+                        .to_string(),
+                );
+                parts.join(" ")
+            }),
+            runtime_configurable: false,
         },
     ];
 
@@ -885,6 +942,7 @@ mod tests {
         assert!(host_service_id_allowed("redis"));
         assert!(host_service_id_allowed("minio"));
         assert!(host_service_id_allowed("meilisearch"));
+        assert!(host_service_id_allowed("stack_tun_api"));
         assert!(!host_service_id_allowed("rm"));
     }
 

@@ -1,9 +1,19 @@
 //! Shared deployment root layout, version validation, and [`AppState`] for the deploy service.
 
+pub mod cmd_template;
 pub mod display_stream;
 pub mod host_service_requirements;
+pub mod listen_port_inspect;
+pub mod listen_port_owner;
+pub use cmd_template::{
+    merge_cmd_placeholders, parse_cmd_placeholders, resolve_cmd_template, substitute_cmd,
+    CmdPlaceholder,
+};
 pub use host_service_requirements::required_host_service_ids;
+pub mod manifest_diagnose;
 pub mod nginx_snippet;
+pub mod nginx_template;
+pub mod nginx_vhost_state;
 pub mod pirate_project;
 pub mod process_manager;
 pub mod sandbox;

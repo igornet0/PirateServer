@@ -331,6 +331,12 @@ pub fn signing_payload(method: &str, project_id: &str, secondary: &str) -> Strin
                 p
             }
         }
+        // stack-tun-api TunnelStream client auth: canonical payload is the listener-side profile UUID.
+        "StackTunTunnel" => secondary.trim().to_string(),
+        // stack-tun-api RequestBusStream client auth: same payload shape as TunnelStream.
+        "StackTunRequestBus" => secondary.trim().to_string(),
+        // stack-tun-api TaskQueueStream client auth: canonical payload is the listener-side profile UUID.
+        "StackTunTaskQueue" => secondary.trim().to_string(),
         _ => {
             if is_default {
                 String::new()

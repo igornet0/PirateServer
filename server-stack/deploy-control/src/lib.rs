@@ -13,6 +13,7 @@ mod host_services;
 mod nginx;
 mod nginx_probe;
 mod nginx_universal;
+mod process_listeners;
 mod pirate_storage;
 mod storage_bind;
 mod service;
@@ -37,9 +38,10 @@ pub use host_services::{
 pub use nginx::{
     apply_nginx_inventory_file_put, apply_nginx_put, apply_nginx_site_via_sudo,
     apply_project_nginx_vhost, collect_nginx_status, ensure_nginx_via_sudo,
-    generate_nginx_server_config, nginx_route_conflicts, parse_nginx_inventory_path,
+    generate_nginx_server_config, maybe_auto_apply_project_nginx_vhost,
+    nginx_deploy_state_view, nginx_route_conflicts, parse_nginx_inventory_path,
     project_nginx_site_path, read_nginx_config, read_nginx_inventory_file, read_nginx_site_file,
-    NginxPutOutcome,
+    resolve_project_nginx_vhost_content, NginxPutOutcome,
 };
 pub use nginx_probe::{
     https_probe_failure_warrants_rollback, https_probe_localhost_resolve,
@@ -83,7 +85,7 @@ pub use types::{
     NginxEnvUpdateView, NginxEnvVarUpdateView, NginxPreflightProposed, NginxPreflightView,
     NginxFilePut, NginxProblemView, NginxPutResponseView, NginxSiteEntryView, NginxSitesView,
     NginxStatusView, ProjectNginxApplyBody, ProjectNginxApplyView,
-    ProcessControlView,
+    KillListenerResultView, ListenerRowView, ProcessControlView, ProcessListenersView,
     ProcessCpu, ProcessDisk, ProcessMem, ProcessRow, ProcessesDetail, ProjectNginxSnippetView,
     ProjectTelemetryLogLine, ProjectTelemetryView, ProjectView, ProjectsView, ReleasesView,
     RollbackBody, RollbackView,

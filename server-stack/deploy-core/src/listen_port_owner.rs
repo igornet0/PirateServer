@@ -6,9 +6,9 @@ mod proc_tcp {
     use std::collections::HashSet;
 
     /// `127.0.0.1` in `/proc/net/tcp` local_address hex form.
-    const LOCALHOST_HEX: &str = "0100007F";
+    pub const LOCALHOST_HEX: &str = "0100007F";
     /// `0.0.0.0` — process often listens here; `TcpListener::bind(127.0.0.1:p)` still fails.
-    const ANY_HEX: &str = "00000000";
+    pub const ANY_HEX: &str = "00000000";
 
     /// Parse `/proc/net/tcp` content and return inode numbers for LISTEN rows matching localhost or any on `port`.
     pub fn tcp_listen_inodes_for_port_from_text(raw: &str, port: u16) -> HashSet<u64> {
@@ -68,7 +68,7 @@ mod proc_tcp {
             };
             if st != "0A" {
                 continue;
-            }
+            };
             let Some((_, p_hex)) = local.rsplit_once(':') else {
                 continue;
             };
@@ -115,7 +115,7 @@ mod linux {
         set
     }
 
-    fn socket_inodes_for_pid(pid: u32) -> std::io::Result<HashSet<u64>> {
+    pub fn socket_inodes_for_pid(pid: u32) -> std::io::Result<HashSet<u64>> {
         let mut set = HashSet::new();
         let fd_dir = Path::new("/proc").join(pid.to_string()).join("fd");
         let rd = match fs::read_dir(&fd_dir) {
@@ -147,6 +147,10 @@ mod linux {
         if want_inodes.is_empty() {
             return Vec::new();
         }
+        pids_holding_inodes(&want_inodes)
+    }
+
+    pub fn pids_holding_inodes(want_inodes: &HashSet<u64>) -> Vec<u32> {
         let mut out = Vec::new();
         let Ok(rd) = fs::read_dir("/proc") else {
             return out;
@@ -269,7 +273,8 @@ pub use linux::pid_listens_on_deploy_port;
 #[cfg(target_os = "linux")]
 pub use linux::{
     listener_pids_for_port, pid_cmdline_or_exe_contains_deploy_root, pid_cwd_starts_with_deploy_root,
-    pid_has_open_file_under_deploy_root, pid_is_descendant_of,
+    pid_has_open_file_under_deploy_root, pid_is_descendant_of, pids_holding_inodes,
+    socket_inodes_for_pid,
 };
 
 #[cfg(not(target_os = "linux"))]
